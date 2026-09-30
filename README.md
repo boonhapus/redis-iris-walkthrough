@@ -260,6 +260,27 @@ flowchart LR
 
 A LangCache entry this kernel has forgotten is reached only by its 15-minute TTL. A Context Retriever surface has no TTL and keeps your database password until you delete it.
 
+## Run the tests
+
+```sh
+uv run pytest
+```
+
+The suite runs offline with no credentials. It covers `marimo check --strict`, a run of the
+notebook with no configuration, the safety and voice rules over the source, and the sample-data
+package.
+
+A live pass runs every cell in file order with every button pressed, and ends each column with
+its Clean up:
+
+```sh
+uv run --env-file .env python tests/live_smoke.py
+```
+
+It prints one line per cell and never prints a configured value. Run it once against your own
+services before you present, and read the result against the checklist in
+`.agents/plans/iris-basics-mvp-plan.md`, section 18.
+
 ## Troubleshooting
 
 ### A column says "not configured"
