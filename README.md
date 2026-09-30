@@ -78,13 +78,99 @@ uv run marimo run iris_basics.py
 
 marimo loads `.env` when the kernel starts, and each configured column connects read-only: Redis answers `PONG`, and each hosted service answers `200`.
 
-<!-- column 0 -->
+## Step 4. Search the help centre
 
-<!-- column 1 -->
+In the Redis Search column, press **Load the help centre: 1 FT.CREATE, 36 HSET, 36 EXPIRE**.
 
-<!-- column 2 -->
+Redis returns `OK` for the `FT.CREATE` and indexes each hash as it lands. `FT.INFO` reports `num_docs` 36 and `hash_indexing_failures` 0, and the cell prints the index, the first hash, and its expiry as Redis received them:
 
-<!-- column 3 -->
+```
+FT.CREATE idx:cairn:<run>:help ON HASH PREFIX 1 cairn:<run>:help: SCORE 1.0 SCHEMA title TEXT WEIGHT 2.0 body TEXT WEIGHT 1.0 category TAG SEPARATOR , year NUMERIC SORTABLE embedding VECTOR HNSW 6 TYPE FLOAT32 DIM 256 DISTANCE_METRIC COSINE
+HSET cairn:<run>:help:ship-times title "How long does delivery take?" body "Standard orders leave our Denver warehouse within one busine...<127 chars>" category shipping year 2025 embedding <1024 bytes>
+EXPIRE cairn:<run>:help:ship-times 3600
+```
+
+The cells below it run as soon as the load finishes:
+
+1. `FT.SEARCH ... "hiking boots" SCORER BM25STD WITHSCORES` returns the match count and the top five rows with their scores. A title match counts double because `title` has weight 2.
+2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. Ask *best pizza near me* and the range returns 0 articles, which the cell marks as a miss.
+3. The pre-filtered query `(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 ...]` returns five rows that all match the filter, above the same `KNN 5` over every article.
+4. Choose a question under **Question**. The table shows the rank each engine gave every article, with the article that answers it starred. In a live run on 2026-09-30, `BM25STD` ranked nothing for *trail shoes feel cramped*, the vector search ranked the boot guide first, and `FT.HYBRID` kept it first.
+
+Every key expires after one hour. Step 8 removes them sooner.
+
+## Step 5. Turn the similarity threshold
+
+In the LangCache column, press **Store 5 gear-care answers with ttlMillis 900000**. LangCache answers `201` with an `entryId` for each of the five prompts, and the table lists the five ids.
+
+The next cell searches for *My rain jacket stopped beading water. How do I fix that?* at `similarityThreshold` 0.85:
+
+```json
+{"prompt": "My rain jacket stopped beading water. How do I fix that?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
+```
+
+LangCache answers `200` with the rain-shell entry in `data`, its stored answer, and its `similarity`, 0.896 in a live run on 2026-09-30.
+
+Drag the `similarityThreshold` slider. The table re-scores six labelled questions from one search each at 0.50. In that live run, at 0.85 most paraphrases read `HIT`, the synthetic sleeping bag read `WRONG ANSWER`, and the capital of Australia read `MISS`. Above the worst wrong answer, 0.950 in that run, the red rows go, and most paraphrases turn grey.
+
+The strategies table sends two spellings of the stored down-bag prompt through `exact` and `semantic`. `exact` reports `similarity` 1 for the all-caps copy and misses the copy without its question mark. In a live run on 2026-09-30, `semantic` did the reverse.
+
+Press **Run the cache-aside loop: miss, store for 10 s, hit, expire, 404**. The table shows five requests:
+
+- `POST /entries/search` for the question: `200` with an empty `data`
+- `POST /entries` with `ttlMillis` 10000: `201` with an `entryId`
+- `POST /entries/search` for the question in other words: `200` with the taught entry and its `similarity`
+- the same search after a 12-second wait: `200` with an empty `data`
+- `DELETE /entries/{entryId}`: `404` with type `/errors/resource-not-found` in a live run on 2026-09-30
+
+## Step 6. Generate tools from a data model
+
+The Context Retriever column declares three `ContextModel` classes, `Customer`, `Product`, and `Order`, and shows the `export_data_model` output before anything is sent. Press **Create the surface, an agent key, and load 20 records (sends your database password)**.
+
+The service answers `201` with the surface id and the status `provisioning_indices`, and the column reports `imported 6 + 6 + 8 records, 20 keys set to expire in 1 h`. The create request is shown as sent, with the password masked.
+
+The next cell sends one JSON-RPC `tools/list` over MCP, and the service lists every tool it generated from the data model. In a live run on 2026-09-30 that was 21 tools. The cell after it calls `get_customer_by_id` with `{"id": "C001"}`, and the service returns the record for Ada Lovelace with a `_retrieval` stamp naming the surface that served it.
+
+The column then sends two calls an agent should not get away with. For `filter_customer` with no condition, the service answered `isError` with `at least one condition is required` in a live run on 2026-09-30. Its answer to a tag condition on the numeric field `lifetime_value` is printed as it arrives.
+
+Last, the column reads your own database. `JSON.GET cairn:<run>:customer:C001` returns the document the service wrote, and `FT.INFO` on each index the service built reports `num_docs` 6, 6, and 8.
+
+## Step 7. Recall a memory by meaning
+
+In the Redis Agent Memory column, press **Write 5 memories about Dana in one POST**.
+
+Agent Memory answers `201` with `created` naming the five ids `cairn-<run>-m1` to `cairn-<run>-m5`. The cell shows the request as sent, with the credential masked:
+
+```json
+{"memories": [{"id": "cairn-<run>-m1", "text": "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.", "ownerId": "cairn-<run>", "namespace": "iris-basics-notebook", "memoryType": "semantic", "topics": ["food", "allergy"]}]}
+```
+
+Leave the question at *What should the kitchen avoid serving me?* and the `similarityThreshold` slider at 0.3. Agent Memory should return the allergy memory alone, ranked first with 0 words in common with the question. Move the slider to 0.0 and it should return all five in rank order, and at 0.5 the cell should read `0 memories at or above 0.5`.
+
+The reply carries no score. `similarityThreshold` is the only cut, and the request body under the table changes with the slider:
+
+```json
+{"text": "What should the kitchen avoid serving me?", "filter": {"ownerId": {"eq": "cairn-<run>"}, "namespace": {"eq": "iris-basics-notebook"}}, "filterOp": "all", "similarityThreshold": 0.3, "limit": 5}
+```
+
+The scope lens below it runs the same question at 0.0 under three filters and should return 5, 0, and 0 memories: this owner in this namespace, an owner that does not exist, and a namespace that does not exist. More than 5 in the first row means extraction has already added memories under this owner, which Clean up removes.
+
+Press **Send 4 session events and assemble the prompt**. Agent Memory answers `201` for each event, and the session read-back shows `ownerId` `cairn-<run>` and `namespace` `iris-basics-notebook`, both taken from the first event. The cell prints the prompt an agent would receive for the last turn:
+
+```
+Retrieved memory context:
+Session summary:
+(none yet: this store summarizes only when that is switched on and the session is long enough)
+Short-term memory:
+USER: I am training for a 50 kilometre trail race in April.
+ASSISTANT: Noted: a 50 km race in April. Do steep descents give you any trouble?
+USER: My left knee complains on steep downhills, so I always carry trekking poles.
+Long-term memory:
+- Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.
+- ...
+```
+
+Under it, the top memory should read `#1 of 3 · 0 words in common`.
 
 ## Step 8. Clean up
 
