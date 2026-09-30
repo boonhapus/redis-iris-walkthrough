@@ -1,0 +1,426 @@
+[
+ {
+  "lens": "correctness",
+  "verdict": "Not safe to build as written. The biggest problem is the cleanup design in §3.7. Its \"*_done token\" ordering does not just fail to guarantee order: it makes cleanup impossible to run in many ordinary situations. I confirmed this on marimo 0.25.0 with an export and a Playwright click-through; the files are in %TEMP%\\ibrev\\e1. The AUTORUN test hook and the live footprint report are too loosely specified to run as written. Several safety specs have gaps: body redaction, FT.CREATE PREFIX checking and DD denial, cross-column prefixes, and leftovers from background Agent Memory extraction. Most fixes change the setup block, so they must land before it is frozen at the end of Phase 2. Checks that passed: @app.function(column=N) passes check --strict, imports, and can call other @app.function; cells in any column can call these functions; GuardedTracedRedis.from_url with protocol=2 is sound; the dependency set resolves on Windows for Python 3.11 (111 packages) and 3.13 (107 packages); run-mode rendering is unaffected by column gaps or file order.",
+  "issues": [
+   {
+    "severity": "blocker",
+    "plan_section": "§3.7 'Cleanup ordering under AUTORUN: each cleanup cell takes a *_done token from its column's wow and bite-size cells as a parameter'",
+    "problem": "A cleanup cell that takes tokens from gated cells is cancelled whenever any of those cells stopped or raised. This happens in export and interactively. It is not a matter of order: cleanup never runs at all. Clicking Cleanup does nothing until every token cell has run successfully. Re-running an upstream seed cell, for example after editing a config input, cancels cleanup again. If the tracked-id list lives in that seed cell, the ids are also reset and the entries leak.",
+    "evidence": "I built the plan's pattern in %TEMP%\\ibrev\\e1\\nb.py on marimo 0.25.0. In the no-creds export the cleanup cell renders nothing, not even its 'press cleanup' prompt. With AUTORUN=1 it runs. In `marimo run` driven by Playwright (pw1.py), clicking Cleanup before Wow gave CLEANED=False; after Wow it gave True. Source: marimo/_runtime/runner/cell_runner.py `_find_first_blocked_missing_ref` cancels a cell when a missing ref's defining cell has run_result_status 'exception', and hooks_post_execution._set_run_result_status sets 'exception' for MarimoStopError. Concrete live case: §7 says this LangCache cache has 'probably no' attributes, so the Attributes cell takes its 'disabled card' path. If that uses mo.stop, LangCache cleanup never runs, and seeded or taught entries stay in the shared cache, where §1.10 says they can be served to live demo users for an hour.",
+    "fix": "Cleanup cells depend only on (a) tracker sets or lists defined in cells with no refs, which never re-run, or in the setup block, (b) the client config, and (c) their own button. If a token is needed for AUTORUN ordering, every token-producing cell must always define it: use if/else to render the 'press me' prompt instead of mo.stop, and catch exceptions into callouts instead of raising. Add a test: headless app.run() with AUTORUN, one optional cell forced into its unavailable path, and assert that cleanup still ran."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 AUTORUN / pressed(); §3.6 Context Retriever row; §5 col 2 config (orphan finder), col 3 cell 6",
+    "problem": "AUTORUN turns every gate on but leaves every input at its default, and it fires buttons the plan says must only fire on an explicit click. (1) The LangCache and Agent Memory chat Send buttons submit an empty q. (2) Teach stores an empty answer. (3) The CR tool dropdown has no selection. (4) The orphan-surface delete fires automatically. It matches `created_by = \"iris-basics-notebook\"`, which is the same for every run and every presenter, so verify --live can delete a colleague's live surface. (5) The extraction kick-off posts a conversation that is extracted after cleanup.",
+    "evidence": "langcache.md §2: prompt must be 1-1024 characters, so an empty search returns 400, the cell raises, and export exits 1. §3.6: the orphan finder 'deletes only on explicit click and only those with our created_by', which contradicts §3.4: '**Every** run_button gate uses pressed()'.",
+    "fix": "Specify the AUTORUN script in the plan. Every text input defaults to its first preset. Change the helper to `pressed(btn, autorun=True)` and pass autorun=False for the orphan delete, the extraction kick-off and New session. Limit orphan deletion to surfaces with metadata.run != RUN that are older than N hours, and match on the run id, not only created_by."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.7 verify.py --live footprint report",
+    "problem": "verify.py cannot do what the plan asks of it. RUN is generated inside the kernel (`RUN = uuid.uuid4().hex[:8]`), and the tracked entry, memory and session ids exist only in kernel memory. The parent process therefore cannot SCAN `irisnb_{RUN}_*`, delete tracked LangCache ids to confirm 404s, or list Agent Memory by ownerId. Filtering surfaces on `iris-basics-*` also catches other runs' orphans. And 'must exit 0' proves little, because the plan requires errors such as a 424 to render as callouts, so a failed live call still exits 0.",
+    "evidence": "§3.4 RUN definition has no override. §3.7 lists the footprint items. marimo.md §6: export exits 1 only when a cell raises.",
+    "fix": "In setup: `RUN = os.environ.get(\"IRIS_BASICS_RUN\") or uuid...`. Add `IRIS_BASICS_MANIFEST=<path>`: under AUTORUN each column's cleanup appends JSON {column, created_ids, deleted_ids, errors, ok}. verify.py assert ok for every column and builds the footprint from RUN and the manifest, filtering surfaces on `iris-basics-{RUN}`. This lives in the setup block, so do it before the Phase 2 freeze."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.6 Agent Memory row; §5 col 3 cells 4 and 6, wow, cleanup",
+    "problem": "Agent Memory leftovers are permanent and cleanup misses them. Background extraction runs on every session that has events: cell 4, every Send in the wow, and cell 6. It runs at the store's cadence (default 5 minutes), so it usually finishes after cleanup has run. The server applies no expiry. Namespace is taken only from a session's first event. If the notebook's events omit namespace, extracted memories have none, and the cleanup listing filtered on ownerId plus namespace (eq) can never match them. A kernel restart changes RUN, so the previous run's memories can never be found again.",
+    "evidence": "agent-memory.md: extraction is 'asynchronous ... default 5 min', and runs 'while a session is active'. Namespace is 'taken ONLY from the session's first event; extracted LTM inherits it'. namespace 'eq/in/all never match records with no namespace'. Plan §3.6: 'Expiry: none server-side'. The footprint check runs right after the export, so it passes falsely.",
+    "fix": "Require actorId `ib-{RUN}` and namespace on the first event of every session. Cleanup order: delete sessions, then list LTM by ownerId alone and by ownerId plus namespace, then offer 'Re-sweep (run again after N min)'. Add an Agent Memory orphan finder that lists by namespace, filters ownerId starting with `ib-` and not equal to this run, and deletes only on explicit click. Under AUTORUN, skip cell 6. verify --live re-checks the footprint after the extraction cadence has passed."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 http_call / HTTP_TRACE / wire_view; §2 .gitignore",
+    "problem": "Redaction is specified only for the Authorization and X-API-Key headers. The Context Retriever create-surface request body contains the customer's Redis password in data_source.connection_config.password. The create-agent-key response contains `key`, the agent secret, which is returned only there. Wire views and trace render both into cell output, the exported HTML and `__marimo__/session/*.json`. The .gitignore list omits `__marimo__/`.",
+    "evidence": "context-retriever.md §5 and §10 show the create body with 'password' and the agent-key 201 response with `key`. marimo.md safety: anything rendered 'does end up in exports and in __marimo__/session/*.json. Add ... __marimo__/ to .gitignore'. Plan §2 .gitignore: '.env, __pycache__, *.html exports, .agents/build/'.",
+    "fix": "http_call redacts, recursively in both request JSON and response summaries, every key matching (password|pass|key|secret|token|authorization), and test_shared asserts it. Add `__marimo__/` to .gitignore. The verify.py secret grep also covers `__marimo__/session/*.json`."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 guard, 'Writes (… FT.CREATE, FT.DROPINDEX) are allowed only for keys and index names under PREFIX'",
+    "problem": "The guard checks only the FT.CREATE index name. `FT.CREATE irisnb_x_idx ON HASH SCHEMA …` with no PREFIX clause indexes every key in a shared database: the Iris demo data and the memory:* hashes, on a 30 MB free database. `FT.DROPINDEX irisnb_x_idx DD` would then delete every indexed key, and the plan's guard allows it because the name is under PREFIX. 'No DD' appears only as cleanup prose, not as a guard rule. Also, `all(p.startswith(PREFIX) for p in [])` is True for an empty prefix list, and with decode_responses=False the prefixes are bytes, so `b\"…\".startswith(str)` raises TypeError.",
+    "evidence": "redis-search.md §8: 'Reject FT.CREATE unless PREFIX values start with the session prefix. Reject DD unless the index is ours.' FT.CREATE docs: PREFIX defaults to all keys. legacy-plans.md: the old guard would allow `FT.DROPINDEX memory:{store_id}:ltm DD`.",
+    "fix": "FT.CREATE must carry `PREFIX n p1..pn` with n ≥ 1 and every p a non-empty string starting with PREFIX. Deny DD on FT.DROPINDEX unconditionally. OWNED_INDEXES requires a non-empty, decoded prefix list. Override pipeline() and transaction() to raise Denied. Add a guard test for each case."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.6 'Redis keys + indexes (cols 0, 2) | PREFIX … | SCAN MATCH PREFIX* → UNLINK'; §5 col 2 cleanup",
+    "problem": "Column 0 and column 2 share one PREFIX. The Context Retriever cleanup rule ('FT.DROPINDEX only for indexes whose FT.INFO prefixes all start with PREFIX') also matches column 0's two indexes, whose prefix is PREFIX+\"doc:\". The §3.6 rule 'SCAN MATCH PREFIX* → UNLINK' deletes the other column's keys. Cleaning column 2 first breaks column 0 mid-demo, and column 0's own cleanup then errors with 'Unknown index name'. This contradicts 'each column must stand alone'.",
+    "evidence": "Plan §3.6 table and §5 column 2 cleanup text. Column 0's indexes are over PREFIX+\"doc:\" (§5 col 0 Seed).",
+    "fix": "Before the Phase 2 freeze, add per-column sub-prefixes to setup (RS_PREFIX = PREFIX+\"rs:\", CR_PREFIX = PREFIX+\"cr:\"). Scope every SCAN, UNLINK and ownership check to the column's own sub-prefix. Make FT.DROPINDEX tolerate 'Unknown index'."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.7 verify.py offline steps 2-3 ('deps parsed from the PEP 723 header'; 'marimo -y export html --no-sandbox with no credentials')",
+    "problem": "(1) Parsing the dependencies is not enough; verify.py must also honour requires-python. uv does read PEP 723 deps natively via --with-requirements, but it ignores requires-python. On this machine uv's default Python is 3.14.6, where ContextModel crashes. (2) The export step must run in that same deps environment; a bare `uvx marimo@0.25.0` environment has no redis, httpx or context_surfaces. (3) The 'no credentials' export is not actually credential-free. marimo 0.25.0 auto-loads the .env next to the notebook, and the conftest import runs the setup's fallback loader (IRIS_BASICS_ENV_FILE, then cwd/.env). So Phases 1-4 can make live calls or pull secrets into test processes, breaking the rule of no live calls before Phase 5.",
+    "evidence": "Experiment in %TEMP%\\ibrev\\wr: `uv run --no-project --with-requirements s.py` on a script declaring requires-python '>=3.11,<3.14' ran on (3, 14). `uv python list` shows cpython-3.14.6 installed. Inside redis-iris-basics this only works by accident, because a stale 3.12 .venv is discovered first. marimo.md: 0.25.0 loads <notebook dir>/.env with no pyproject.",
+    "fix": "Use `uv run --no-project --python 3.13 --with-requirements iris_basics.py --with pytest …` for both pytest and `marimo export html --no-sandbox`, and assert sys.version_info < (3, 14). Run the offline tests and export on a temp copy in an empty directory, with the known env vars removed and IRIS_BASICS_ENV_FILE pointing at an empty file. Add a runtime version guard to the Context Retriever column."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 col 2 'SDK usage: … UnifiedClient.import_data / list_tools / query_tool'; wow 'raw JSON-RPC request/response in an accordion'; Break it",
+    "problem": "The SDK calls use the SDK's own httpx client. They bypass http_call, so HTTP_TRACE, the wire views and as_curl show nothing for the column whose wow promises raw JSON-RPC. MCPError is a bare re-wrapped string, so 'Break it' cannot show code -32602 cleanly. The MCP URL defaults to gcp-us-east4 unless CTX_MCP_URL is set, so a customer in another region gets a broken wow. import_data replays failed POSTs up to 3 times. The 'unknown argument' Break-it preset may not break at all: filter_* tools don't declare additionalProperties:false.",
+    "evidence": "context-retriever.md: MCPError is a 'bare string exception … re-wraps'; 'a break it cell … should POST the JSON-RPC itself with httpx'; MCP default `https://gcp-us-east4…/mcp`; AgentKeyListItem.mcp_url is the per-key URL; '_request … retries every exception'; 'filter_* does not' declare additionalProperties:false.",
+    "fix": "Send tools/list and tools/call as raw JSON-RPC through http_call to the agent key's mcp_url (GET agent-keys after creating the key). Import with a raw POST to /api/v1/context-surfaces/{id}/data. Keep the SDK only for ContextModel and export_data_model. Build the Break-it preset from the schema: prefer an out-of-enum value on an allowed_values field, and use an unknown argument only when additionalProperties is false."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.3 naming contract vs §5 col 2 dataset (research §9 classes Customer/Product/Order)",
+    "problem": "Entity names, and so tool names, come from the class __name__. Obeying 'every global starts with cr_' (or using a cell-local _Customer) turns the tools into get_cr_customer_by_id or get__customer_by_id in front of customers. `from context_surfaces import ContextModel` also defines unprefixed globals. And an @app.function can't reference context_surfaces, because the frozen setup block doesn't import it.",
+    "evidence": "context-retriever.md §7: the entity name is lowercased, or snake_cased on the unified surface, straight from the class name. Plan §3.3 and §3.4 import list.",
+    "fix": "Add an explicit rule: define the models inside `@app.function def cr_build_models(prefix)`, which imports context_surfaces locally and returns {\"Customer\": cls, …}, so __name__ stays clean and the models are testable. Use `import context_surfaces as cr_cs` in cells."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§6 Phases 3-4 fragments + assemble.py",
+    "problem": "(1) The title cells for columns 1-3 are built in Phase 1 and live in base.py. The fragments contain only header, setup and their own column=0 items. Plain concatenation leaves each column split in the file, breaking the 'contiguous' rule, and implementers who add their own title create duplicates. (2) Concatenation must strip each fragment's preamble and its `if __name__ == \"__main__\"` footer. (3) A text rewrite of column=0 is fragile; anchor it on the decorators. (4) Saving a fragment from `marimo edit` re-serializes the file, which breaks the byte-identical setup check and collapses the explicit column markers. (5) Column 3 cell 7 ('only if column 0 is connected') raises NameError in the column-3 fragment's export, and check --strict does not flag undefined names. (6) A missing fragment leaves an empty column in edit mode.",
+    "evidence": "marimo.md: 'Keep each column's cells contiguous'; check 'does NOT catch NameError'; edit mode 'allocates max(column)+1 columns, so a gap leaves an empty column'.",
+    "fix": "Either titles move into the fragments or assemble.py splices each fragment directly after its title. Parse on the `@app.cell`/`@app.function` decorators and strip the preamble and footer. Forbid saving fragments from the editor, or compare the setup blocks after AST normalisation. Cell 7 opens its own connection with connect_redis(redis_url_from_env()) instead of referencing column-0 names."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.3 '@app.function … may only reference setup-block names and their own parameters'",
+    "problem": "The rule is correct, but nothing enforces it. check --strict passes a function that references a cell global, and the function then fails only when a test calls it after import. Calling another @app.function is fine.",
+    "evidence": "%TEMP%\\ibrev\\e1\\nb.py: `rs_uses_cell_global` (references cell global rs_other): `marimo check --strict` exit 0. After `import nb`, calling it raised NameError 'rs_other'. rs_helper2 calling rs_helper worked both after import and in export ('WOW RAN 4').",
+    "fix": "In test_shared: for every prefixed function in the module, assert that its referenced global names (co_names) are all setup names, other @app.function names or builtins."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§5 col 0 Embedder 'Apply the Windows force_download=False workaround'",
+    "problem": "The fix is named after the wrong mechanism. force_download=False does nothing on Windows. The real workaround is snapshot_download(local_files_only=True) using the same allow_patterns as the download; otherwise it raises IncompleteSnapshotError on a partial snapshot. The workaround imports huggingface_hub, which arrives only through tokenizers' <2.0 pin, and hf-hub 2.0.0 was released on 2026-09-24. Downloading all files costs 61 MB; the needed files are ~30 MB.",
+    "evidence": "redis-search.md verifier: 'force_download flag is never forwarded … no effect either way'; the allow_patterns 4-file download took 3.2 s for ~30 MB; the IncompleteSnapshotError caveat; 'the snapshot_download workaround depends on that transitive pin'.",
+    "fix": "Specify the loader exactly: allow_patterns=['config.json','model.safetensors','tokenizer.json','README.md'] for both the cache-first and download calls. Add `huggingface-hub>=1,<2` to the PEP 723 header. Update the §0 '61 MB' figure."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§5 col 0 wow 'Calibrate offline (tests assert … that BM25 misses the lexical trap)'",
+    "problem": "BM25 can't run offline; it needs RediSearch. A naive word-overlap proxy ignores RediSearch's default stemming and stopwords, so the 'zero shared words' paraphrase can still match live (e.g. 'returning' vs 'returns').",
+    "evidence": "Default TEXT fields are stemmed; research lists NOSTEM as an option. Plan §7 defers only the scorer name to the live run.",
+    "fix": "The offline test asserts zero overlap after crude stemming and stopword removal. Add a Phase 5 live assertion that BM25 top-k excludes the target document."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.4 setup block / §1 Launch 'edit --sandbox'",
+    "problem": "In edit mode, the primary launch mode, the setup cell sits at the top of column 0. It holds hundreds of lines of guard, HTTP, trace and loader code, and it appears before the intro, which is the customer's first impression.",
+    "evidence": "marimo.md: the setup cell 'shows at the top of column 0, labelled setup cell'; `with app.setup(hide_code=True):` exists.",
+    "fix": "Use `with app.setup(hide_code=True):`."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.1 column width override vs §5 col 0 wow 'three side-by-side tables'",
+    "problem": "Four columns fit a 1920 px screen only at ~380-440 px each. Three tables side by side inside one such column, plus diff tables in column 2, will be unreadable on a projector.",
+    "evidence": "marimo.md: at 380 px the columns measured a 412 px pitch and all four fit 1920 px; 4 × 740 px needs ~3100 px.",
+    "fix": "Show the engines in mo.ui.tabs, or stacked with a compact hit-highlight row, and test at the chosen width in the Phase 4 screenshot."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§4 / §5 col 1 wow Teach; threshold lab",
+    "problem": "Teach stores whatever prompt the user typed, unscoped, for LC_TTL_MS (1 hour) in the shared cache that the live demo searches at 0.82. The Cairn-domain protection therefore does not cover taught entries. Unscoped searches (maxResults defaults to 1) can also return the live demo's entry as the top hit, which puts demo prompts and answers into the notebook's output and skews the lab's false-hit labels.",
+    "evidence": "langcache.md: the demo searches without attributes; maxResults 'Defaults to 1' (SDK-only); the research suggests filtering by `entry.id in MY_IDS`.",
+    "fix": "Taught entries get a short TTL (~120 s) and are deleted by the next cleanup. Label any hit whose id is not in the tracked set as 'foreign entry' and hide its response. Try maxResults>1 and record in §7 whether it is honoured."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.4 env loader + §2 .env.example ('blank, with a comment')",
+    "problem": "marimo loads the notebook-dir .env before setup runs. Lines like `KEY=` set the variable to \"\". Because the fallback loader 'never overrides already-set vars', IRIS_BASICS_ENV_FILE is then silently ignored whenever someone has copied .env.example to .env. Without python-dotenv, an inline comment (`KEY= # console path`) becomes the value.",
+    "evidence": "marimo/_secrets/load_dotenv.py: `_parse_dotenv_bindings` splits on the first '=' and does not strip inline comments; `load_to_environ` sets \"\" values and skips keys that already exist.",
+    "fix": "Treat \"\" as unset in both the fallback loader and env(). In .env.example, put comments on their own lines and ship each variable commented out (`# LANGCACHE_HOST=`). Document the real precedence: local .env first, then IRIS_BASICS_ENV_FILE."
+   }
+  ]
+ },
+ {
+  "lens": "safety",
+  "verdict": "The safety model points the right way: per-run prefix, TTLs, delete-by-id, and no flush or includeAll. It is not safe to run against the shared Iris accounts as written. I checked the claims below against marimo 0.25.0, redis 8.1.0 and httpx 0.28.1 in $TEMP, and against the files in redis-iris-demos. No live services were called and no .env values were read.\n\nThere are three blockers:\n1. Every cleanup cell depends on the *_done tokens of the gated cells, so cleanup never runs if the presenter skips a cell or any cell fails.\n2. The FT.INFO ownership check comes out vacuously true under the plan's own decode_responses=False setting. That lets cleanup FT.DROPINDEX the Agent Memory index `memory:{storeId}:ltm`.\n3. Agent Memory cleanup bulk-deletes whatever the server's filter-only listing returns, with no check on our side of who owns each item.\n\nThe major issues:\n- The Redis guard allows FT.CREATE with no PREFIX clause, or a foreign one.\n- Under AUTORUN the orphan finder deletes other sessions' live surfaces.\n- LangCache \"Teach\" puts free-text prompts into the cache the live demo reads.\n- Context Retriever hands the demo database's default-user password to a hosted service the guard cannot see.\n- Nothing persists RUN or the ledger. verify.py cannot build its footprint, and a kernel restart orphans everything.\n- Background extraction writes new memories after cleanup has run.\n- Four secret-leak paths, all confirmed: exception text, trace and response bodies, the marimo edit Variables panel, and the __marimo__/session cache.\n\nAnswers to the specific questions:\n- **Can Context Retriever write outside PREFIX?** Yes. With the default user it has full rights on the database. The index names it creates are its own choice and sit outside PREFIX. Key templates are not checked on our side, and anyone with the account admin key can PUT a new data_model or import records while our surface exists. The guard sees none of this.\n- **RUN collision:** negligible (32 random bits). The real risks are that RUN is lost on a restart, and that `created_by` and the namespace are shared by every session.\n- **Kernel restart or closed tab:** everything from that run is orphaned. Agent Memory long-term memories last about 365 days. The Context Retriever surface, which holds the database password and a connection pool, and its FT indexes last until someone deletes them. LangCache entries and Redis keys expire after 1 hour.",
+  "issues": [
+   {
+    "severity": "blocker",
+    "plan_section": "§3.7 'Cleanup ordering under AUTORUN' (lines 211-212); §3.2.5 cleanup cell (125-126)",
+    "problem": "Cleanup takes a *_done token from every bite-size and wow cell. In marimo, a cell whose ancestor called mo.stop, or raised, never runs. So the cleanup cell and its button never appear in three cases: the presenter skipped any gated cell; an optional cell stopped itself (Attributes 'only if the cache defines one', Under the hood 'only if column 0 is connected', the experimental access tags, auto-extraction); or any cell errored under AUTORUN. In each case every write that column made is left on the shared resources.",
+    "evidence": "Ran uvx-equivalent marimo 0.25.0 `export html` on a test notebook. Setup: a gated cell sets `wow_done` before `mo.stop(not btn.value)`, a cleanup cell reads `wow_done`, and a second cleanup reads a token from a cell that raises. Result: ename `ancestor-stopped` ('This cell wasn't run because an ancestor was stopped with `mo.stop`') and 'An ancestor raised an exception'. Neither cleanup cell ran, even though the token was assigned before the stop. With the redis-iris-demos .env, LANGCACHE_SCOPE_ATTR is absent (checked names only), so LangCache bite-size 6 is disabled by default. If that cell feeds cleanup, LangCache cleanup never runs in Phase 5.",
+    "fix": "Cleanup cells may depend only on the column's ledger object (defined in a cell that never stops or raises) and their own run_button. Never depend on the *_done tokens of other cells. For AUTORUN ordering, do not rely on the dataflow graph. After the export, verify.py runs the same cleanup helpers in a `finally` (see the ledger issue), whether the export passed or failed. Add a test: stop or raise in every non-cleanup cell, then assert the cleanup cell still renders and runs."
+   },
+   {
+    "severity": "blocker",
+    "plan_section": "§3.4 Redis guard, OWNED_INDEXES exception (lines 162-163); col 2 Cleanup (346-348)",
+    "problem": "FT.DROPINDEX is allowed for any index in OWNED_INDEXES, and an index gets in by 'every prefix starts with PREFIX'. With `decode_responses=False` (mandated in §1.2), redis-py decodes FT.INFO's top-level keys to str but leaves `index_definition` as a list of bytes. The natural parse `dict(zip(d[::2], d[1::2])).get('prefixes', [])` then returns [], and `all(...)` over [] is True. Column 2 cleanup iterates FT._LIST over the whole shared DB, so this would mark every index as owned and drop it. That includes the Agent Memory index `memory:{storeId}:ltm`, which the Memory API will not rebuild. The live demo's memory recall would break.",
+    "evidence": "Ran `SearchCommands._parse_info` (redis 8.1.0) on a fake RESP2 reply. Top-level keys come back as str, but index_definition is `[b'key_type', b'HASH', b'prefixes', [b'memory:STORE:ltm:'], ...]`. `.get('prefixes', [])` gives `[]`, so 'owned?' is True. The DB is shared with Agent Memory: redis-iris-demos/scripts/flush_redis.py docstring says 'The Memory API stores its data (memory:* keys and its search index) in the same Redis database... won't rebuild automatically'.",
+    "fix": "Write one helper, `owned_index(info)`. It decodes bytes explicitly, requires a non-empty prefixes list, requires every prefix to start with the column's own sub-prefix, and fails closed (returns False) on any parse surprise. Restrict column 2 to indexes that appear in an FT._LIST taken after surface create but not in one taken before it, AND that pass owned_index. The guard rejects `DD` on every FT.DROPINDEX. Tests: a bytes-keyed index_definition, empty prefixes, a missing prefixes key, and `memory:X:ltm`. All must be denied."
+   },
+   {
+    "severity": "blocker",
+    "plan_section": "§3.6 Agent Memory row (line 192); col 3 Cleanup (386-387)",
+    "problem": "Cleanup bulk-deletes 'everything a filter-only listing finds for this ownerId + namespace'. It trusts the server to apply the filter. A hand-built raw-httpx filter with a misspelled key (for example the Colab/SDK spelling `owner_id` instead of `ownerId`) could be ignored rather than rejected. The text='' listing would then page through every owner's memories in the shared store, and bulk delete would erase the live demo's long-term memory. MockTransport tests cannot catch this, because the mock returns whatever it is told to. The §3.6 'Never: deleting anything not owned by ib-{RUN}' has no mechanism behind it.",
+    "evidence": "research/agent-memory.md verifier: 'SDK 0.4.1 silently drops unknown or misspelled filter keys... serialized to \"filter\":{}, which is an UNSCOPED search across the whole shared store, with no error or warning'. How the server treats unknown filter keys is not documented anywhere in the research. The store is shared with owners like CUST-DEMO-001 and namespaces like 'radish-bank-workshop' (agent-memory.md safety section).",
+    "fix": "Before adding a listed item to a delete batch, check on our side that `item.ownerId == f'ib-{RUN}'` (and the namespace, when present). Abort the whole cleanup if any returned item fails that check. Enforce it at one choke point in `http_call`: refuse `DELETE /long-term-memory` unless every id is in the ledger or has passed the ownership check, and refuse `DELETE /session-memory/{id}` unless the id is in the ledger (session ids formatted `ib-{RUN}-s{n}`). Build every filter with one helper that asserts `filter.ownerId.eq` is present. Add a test where the mock listing returns a foreign item: no delete call may be issued."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 guard write rules (lines 160-161)",
+    "problem": "The guard only checks that key and index names are under PREFIX. It does not require FT.CREATE to have a PREFIX clause whose values are all under PREFIX. `FT.CREATE irisnb_x_idx ON HASH SCHEMA ...` with no PREFIX clause (default: every key), or with `PREFIX 1 ''`, passes. On the shared DB it would index every demo hash and every `memory:*` hash, backfill-scan the whole keyspace, and make demo data searchable from the notebook. The research asked for this check, and the plan dropped it.",
+    "evidence": "research/redis-search.md §8: 'Reject FT.CREATE unless PREFIX values start with the session prefix'. The Safety section notes the guard 'allows FT.CREATE with an empty or foreign PREFIX (can index the whole keyspace)'. The facts list shows `FT.CREATE x ON HASH PREFIX 1 '' ...` getting through. The plan's text only says '...FT.CREATE, FT.DROPINDEX) are allowed only for keys and index names under PREFIX'.",
+    "fix": "Add to §3.4: FT.CREATE must contain `PREFIX n p1..pn` with n ≥ 1, and every p must start with the column's sub-prefix. Reject FILTER expressions and SKIPINITIALSCAN unless needed. Add guard tests for a missing PREFIX clause, an empty prefix, and a foreign prefix. Also use `TEMPORARY <KEY_TTL_S>` on column 0 indexes when the DB accepts it (feature-detect), so an orphaned index expires on its own."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 AUTORUN (145-148); §3.6 CR row 'orphan finder… deletes only on explicit click' (193); §3.7 footprint 'surface list filtered to iris-basics-*' (209-210)",
+    "problem": "Every run_button uses `pressed()`, which returns True under AUTORUN, so the orphan finder's delete button fires on its own. Its filter, `created_by == 'iris-basics-notebook'`, matches every session of the notebook on the account, not just dead ones. Each `verify.py --live` run in the Phase 5 fix loop would therefore delete surfaces belonging to any presenter or agent running the notebook at the same time, mid-demo. The footprint check on `iris-basics-*` would also fail on other people's live sessions and invite someone to 'clean' them.",
+    "evidence": "Plan line 145: '**Every** run_button gate uses `pressed()`'. Line 193: the finder 'deletes only on explicit click and only those with our created_by'. research/context-retriever.md: 'The admin key is account-wide… Any find-orphans helper must filter on that metadata or name prefix and require a typed confirmation'.",
+    "fix": "Orphan and reclaim buttons use plain `btn.value`, never `pressed()`, and a test asserts it. Candidates must have `metadata.run != RUN`, `created_at` older than 2×KEY_TTL_S, and a typed confirmation. `http_call` refuses `DELETE /api/v1/context-surfaces/{id}` unless the id is in OWNED_SURFACES or in the verified-orphan set picked in that click. The footprint check filters to `iris-basics-{RUN}` only."
+   },
+   {
+    "severity": "major",
+    "plan_section": "Col 1 Wow 'Teach' (lines 294-299); §4 Cairn claim (220-224); §1.10",
+    "problem": "Teach stores whatever prompt a customer or presenter types into the cache the live Iris app searches without attributes. Cairn-only content protects the seeded entries, not free text. A typed on-topic question for a demo domain, such as 'Can I return a laptop I bought last week?', misses, gets taught a Cairn answer, and is then served as a cached HIT to real electrohub or radish-bank demo users for up to LC_TTL_MS = 1 hour. The demo's semantic guardrail only blocks off-topic prompts, so it does not stop this. §4's 'cannot plausibly answer a live demo user's question' is false for Teach.",
+    "evidence": "research/langcache.md: the demo 'searches with no attributes… with threshold 0.82', and 'Worst case: a generic notebook FAQ… hijacks reddash, electrohub or radish-bank answers'. The guardrail runs before the cache (main.py:425-465) but only blocks off-topic prompts. LANGCACHE_THRESHOLD is set in the demo .env (names checked only), so the real threshold may be below 0.82.",
+    "fix": "When the cache is unscoped (no LANGCACHE_SCOPE_ATTR), Teach must: store the prompt with a visible Cairn anchor (e.g. auto-prefix 'At Cairn Outfitters: ' and show the stored prompt); refuse prompts that don't contain a word from a fixed Cairn vocabulary; use ttlMillis ≤ 120 000; and delete the entry right after the paraphrase HIT is shown. Show a red 'shared cache: taught answers are visible to other apps for N s' callout. Lower LC_TTL_MS to ≤ 15 min. The README recommends a dedicated LangCache service for the notebook."
+   },
+   {
+    "severity": "major",
+    "plan_section": "Col 2 Config (311-312), SDK usage (315-320), Optional access tags (343-345); §3.6 rows 1 and 4 (190, 193)",
+    "problem": "By default, column 2 points the hosted Context Retriever service at column 0's REDIS_URL. In Phase 5 that is the live demo's database, the one that also holds `memory:*`. The default-user password is copied into a hosted surface config that has full rights on that database, and the §3.6 claim 'PREFIX via the guard' does not apply there. The service creates indexes under names it chooses, outside PREFIX. Nothing in the plan checks that the data model's key templates are under PREFIX. Any holder of the account-wide admin key can PUT a new data_model or import records through our surface while it exists. Every orphaned surface (from a failed cleanup, a kernel restart, or Phase 5 loop reruns) keeps the password plus a connection pool. pool_size is unspecified, so the default of 10 with min_idle 2 applies, and a 30-connection database would run out quickly. Agent keys are created without an expiry.",
+    "evidence": "research/context-retriever.md verifier: Redis Cloud supports data-access roles with key patterns ('+@all ~app:*'). The index DDL is 'FT.CREATE idx:<surface>:<hash8>:<entity>…'. The Safety section says to 'prefer a dedicated demo database', with a 'Connection budget… pool_size about 5 and min_idle 1'. CreateAgentKeyRequest supports `expires_at` (§5 table). Plan line 403: Phase 5 uses redis-iris-demos/.env.",
+    "fix": "Before create: assert every entity's `redis_key_template` starts with `PREFIX+'cr:'`. Never issue a PUT. Snapshot FT._LIST before create and after cleanup, and report any new index left behind. Send `pool_size: 2, min_idle_conns: 0`, and set agent-key `expires_at` = now + 2h. The consent label states that the DB password will be stored by the hosted service. Config shows a red warning when the username is `default` or the host matches the Agent Memory DB, and recommends a dedicated DB or a restricted data-access role (confirm in Phase 5 whether CR works under `~irisnb_*`). Delete the surface as soon as the wow cell is done. For Phase 5, point CR at a throwaway DB rather than the demo DB."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 RUN (143); §3.3 setup frozen after Phase 2 (133-134); §3.6 Expiry column; §3.7 footprint (205-210)",
+    "problem": "RUN comes from uuid4 inside the kernel and the ledger lives only in memory. verify.py runs in a separate process and has neither, so it cannot compute `SCAN irisnb_{RUN}_*`, the ownerId listing, or 'delete-by-id of tracked ids'. As written, the Phase 5 'footprint report is empty' gate cannot be implemented. A kernel restart, a closed `marimo run` tab, or a failed export orphans everything from that run: long-term memories last about 365 days, CR surfaces and every FT index have no expiry, and LangCache entries and keys last 1 hour. No sweeper exists for Redis or Agent Memory. The research proposed an Agent Memory namespace sweeper and an atexit hook, and the plan dropped both. The setup block (guard included) is frozen after Phase 2, so any sweep mode has to be designed now.",
+    "evidence": "agent-memory.md: 'Long-term TTL (default 365 d)', 'Namespace-wide sweeper for leftovers from crashed runs', 'register a best-effort atexit hook'. redis-search.md: 'Stale indexes from earlier kernel sessions stay behind; use FT.CREATE ... TEMPORARY'. legacy-plans.md: teardown 'does NOT sweep orphaned idx… from earlier runs'. Plan §3.6 AM Expiry: 'none server-side'.",
+    "fix": "Setup honours `IRIS_BASICS_RUN`, validated as `^[0-9a-f]{8}$` so glob characters can't reach SCAN MATCH. Add an append-only JSONL ledger under %LOCALAPPDATA%\\iris-basics\\. It records intent before each create (so a create that timed out can be found again by name) and the id after. It never stores secrets. verify.py sets RUN, reads the ledger, and sweeps in a `finally`. The notebook gets a 'Reclaim previous runs' cell (plain btn.value) covering: `irisnb_*` keys with no TTL; indexes whose non-empty prefixes all start with `irisnb_` and not the current run; an Agent Memory namespace-eq sweep with an ownerId `ib-` check on our side; and CR surfaces by created_by, run and age. The guard gets a sweep scope of `irisnb_`, enabled only inside that cell. Register a best-effort atexit hook."
+   },
+   {
+    "severity": "major",
+    "plan_section": "Col 3 bite-size 4 (370-371), 6 (374-376), Wow (380-385), Cleanup (386-387); §3.7 footprint timing",
+    "problem": "Background extraction runs on every session with events, not only in the 'optional' cell 6. Bite-size 4 and every wow Send append events. Extraction runs minutes later and writes new long-term memories with ids chosen by the server, after cleanup has already run. The footprint check runs straight after the export and passes, and the orphans appear later. Separately, a session's namespace comes only from its first event. If a session's first event (or an ASSISTANT greeting) carries no namespace, its extracted memories have no namespace, and the plan's cleanup filter of ownerId AND namespace can never match them (namespace eq never matches a missing namespace).",
+    "evidence": "agent-memory.md: 'Every session event can trigger LLM-based extraction'. Cadence is 'configurable 60-600 s (blank = 5 min)'. 'Session namespace comes from the first event and values sent with later events are ignored'. NamespaceFilter: 'eq/in/all never match records that have no namespace'. Unknowns: 'whether deleting a session before extraction runs prevents extraction from it'.",
+    "fix": "Every session's first event must be a USER event with actorId=`ib-{RUN}` and namespace=`iris-basics-notebook`. A helper enforces this and tests assert it. The cleanup listing filters on ownerId only (already unique per run), then separately runs the namespace sweep, with the ownership check on our side. verify.py --live waits longer than the maximum cadence (for example 11 min), lists again and deletes, and only then reports the footprint. The notebook cleanup tells the presenter that extracted memories may appear for about 10 minutes and that Reclaim will catch them."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 Env fallback loader (149-152); connect_redis / http_call error handling",
+    "problem": "Exception messages print secrets in cell output, which goes to the projector, the exported HTML and the session cache. (1) The redis-iris-demos .env has CRLF line endings. If the custom fallback loader, or verify.py's parser, keeps the trailing `\\r`, the first call raises an httpx `LocalProtocolError` whose message contains the full key. (2) A REDIS_URL with an unencoded `/` or `#` in the password raises a ValueError containing the part of the password before that character. The plan specifies neither how the loader parses lines nor how errors are cleaned.",
+    "evidence": "`grep -c $'\\r'` on redis-iris-demos/.env: 58 CRLF lines (no values read). httpx 0.28.1 test: `Bearer FAKESECRET123\\n` gives `LocalProtocolError -> Illegal header value b'Bearer FAKESECRET123\\n'`, and `X-API-Key: cs_admin_FAKESECRET\\n` does the same. redis 8.1.0 `from_url('redis://default:FAKE/PW@127.0.0.1:6379')` gives `ValueError: Port could not be cast to integer value as 'FAKE'`. The marimo export HTML stores the error `evalue` as-is (confirmed: 'ERRSEC…' found in the HTML).",
+    "fix": "The loader strips whitespace including `\\r` and surrounding quotes, and verify.py uses the same parser. Validate each secret before use (no whitespace or control characters) and report 'LANGCACHE_API_KEY contains whitespace' without printing the value. `http_call` and `connect_redis` catch every exception and re-raise `ServiceError(component, kind)` whose text has passed through `scrub()`. `scrub()` replaces every known secret, in raw, percent-encoded and JSON-escaped forms, with `****`. Tests: a CRLF .env fixture, a header ending in `\\r`, and a password containing `/` and `#`. Assert the secret appears in neither `str(exc)` nor the rendered output."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 HTTP_TRACE / as_curl (153-158); col 2 raw httpx create surface and agent key (317-320)",
+    "problem": "Redaction as specified covers headers only. The create-surface request body carries the DB password in `data_source.connection_config.password`. The create-agent-key response carries the bearer `key`, the only time it is ever returned. The trace stores a 'response summary', and the wire view promises 'the exact request/response' plus curl. So the password and the agent key are rendered and exported. verify.py greps for values from the env file only, so it can never detect the agent key (created at runtime), and it misses the password when it appears percent-encoded or inside a composed URL.",
+    "evidence": "context-retriever.md §5: the create body includes `\"password\":\"...\"`; the agent-key 201 response includes `key`, which 'is only returned here'. The Safety section says 'mask `password` when showing the create-surface JSON'. Plan line 156: '…never stores `Authorization` / `X-API-Key`'.",
+    "fix": "Redact recursively by key name in requests and responses (`password`, `key`, `api_key`, `token`, `authorization`, `secret`, and all of `connection_config` except `addr`), then apply the value-based `scrub()`. Register every agent key the notebook creates in the runtime secret registry. verify.py adds regex scans for `c[se]_(admin|agent)_[A-Za-z0-9]+`, `Bearer [A-Za-z0-9]`, `\"password\":\\s*\"[^*]` and `rediss?://[^:/]+:[^@*]+@`. It fails on any hit."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§1.5 'never reaches the DOM or the exported HTML' (58-59); §3.2.2 config cell; Launch row (10)",
+    "problem": "In `marimo edit`, which the plan uses as the main launch, marimo sends every global's value to the browser after each cell runs, for the Variables panel. For a UI element it sends `element.value`, which for a prefilled password field is the real secret, cut to 50 characters. A composed `rediss://default:<32-char password>@…` fits the whole password inside those 50 characters. Opening the Variables panel on a projector, or opening devtools, shows the shared keys. §1.5's guarantee only covers the input's initial DOM value.",
+    "evidence": "marimo 0.25.0 source: `_messaging/variables.py::_format_variable_value`: `if isinstance(value, UIElement): resolved = value.value`, with `MAX_STR_LEN = 50`. `runner/hooks_post_execution.py::_broadcast_variables` sends `VariableValuesNotification` for every `cell.defs` when `_should_broadcast_data()` (edit mode). `_impl/input.py` (per research): when masked, `.value` 'returns the real value until the user types'.",
+    "fix": "Don't prefill secret inputs. Leave them empty with a placeholder such as 'using $LANGCACHE_API_KEY (••••1234)', and resolve `field.value.strip() or env(NAME)` inside helpers at call time. Never assign a secret to a global str. A `str` subclass does not help, because slicing returns the raw text; use a non-str `Secret` holder with a masked repr. The README says to present to customers with `marimo run`, which does not broadcast variables."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§2 .gitignore (line 82); §3.7 'greps the exported HTML for every secret value' (210)",
+    "problem": "`marimo export/edit/run` write `__marimo__/session/iris_basics.py.json` next to the notebook. That file includes stdout, stderr and full tracebacks, none of which appear in the HTML. So `verify.py --live` leaves a record of the live run on the shared accounts (store and cache IDs, surface IDs, memory text, and any leaked secret) in the folder Nick will hand to customers, and the next `marimo edit` displays those cached outputs. .gitignore does not exclude it. The HTML grep is also blind to encoding: marimo stores outputs as JSON strings with `&`→`&` and `<`→`<`, and mo.md adds HTML escaping on top.",
+    "evidence": "Test in $TEMP with marimo 0.25.0: `print('PRINTED'+s)` appears 0 times in the HTML but is present in `__marimo__/session/n.py.json` (console stdout); the full traceback is saved only in the session JSON; a secret `SEC&R<E>T+/=` occurs 0 times raw in the HTML but appears as `SEC&R…`. research/marimo.md: 'marimo run/edit/export also write a __marimo__/session/<nb>.py.json… Add __marimo__/ to .gitignore'.",
+    "fix": "Add `__marimo__/` to .gitignore. verify.py --live exports a copy of the notebook in a temp directory, so the session cache lands there. It JSON-decodes the HTML payload and the session JSON, and scans both for each secret in raw, JSON-escaped, HTML-escaped and percent-encoded forms, plus the regexes above. It then deletes the temp directory. The README has a 'before handing this to a customer' step: delete `__marimo__/`."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.6 row 1 cleanup 'SCAN MATCH PREFIX* → UNLINK' (190); col 2 Cleanup (346-348); col 0 seed prefix (247)",
+    "problem": "Columns 0 and 2 share one PREFIX. Column 2's cleanup, as specified, removes every `PREFIX*` key and every index whose prefixes all start with PREFIX. That includes column 0's `PREFIX+'doc:'` documents and both of column 0's indexes, even while column 0 is still being presented. That breaks the 'each column must stand alone' rule. Under AUTORUN, column order is arbitrary, so column 0's cells fail and (combined with the first blocker) its cleanup is skipped.",
+    "evidence": "Col 0 writes `PREFIX+'doc:'` (line 247). Col 2's cleanup drops 'indexes whose FT.INFO prefixes all start with `PREFIX`' (347).",
+    "fix": "Give each column its own sub-prefix: `RS_PREFIX = PREFIX+'rs:'` and `CR_PREFIX = PREFIX+'cr:'`. Keep OWNED_INDEXES per column, and have each cleanup match only its own sub-prefix. CR keys are known in advance from the 20-record dataset, so set their EXPIRE by name instead of scanning."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "Col 1 TTL cell (290-291); §3.7 LangCache footprint (208-209)",
+    "problem": "On the shared cache, TTL is the only safety net for LangCache entries after a crash: there is no listing API, and deleting by attributes is not usable without attributes. Yet the live run never checks that TTL works. Under AUTORUN, 'Check again' fires straight away, before the 10 s expiry. The footprint check ('delete-by-id of tracked ids returning 404') runs after cleanup has already deleted the entries by id, so it passes whether TTL works or not. §7 lists 'ttlMillis expiry timing' as unknown, and the cache default is 'No expiration'.",
+    "evidence": "langcache.md: 'TTL default No expiration'; unknowns include 'Whether entries expire exactly at ttlMillis… or on a coarser sweep'.",
+    "fix": "verify.py --live sets one Cairn sentinel with ttlMillis=5000 and does not track it for cleanup. It polls search or delete-by-id for up to 60 s and fails if the entry is still there, then deletes it by id. Add the observed timing to the README."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.4 Env loader and AUTORUN (145-152); §3.7 offline verify (200-204); §6 Phase 5 (403)",
+    "problem": "The fallback loader imports the whole demo .env into the kernel. That includes names the notebook must never use: `CTX_SURFACE_ID` and `MCP_AGENT_KEY` (the live demo's surface and agent key), `OPENAI_API_KEY`, and `DEMO_USER_*`. The contract 'env var names = redis-iris-demos names' invites implementers to honour demo defaults such as MEMORY_NAMESPACE, MEMORY_OWNER_ID or CTX_SURFACE_ID. Using those would point cleanup at the live demo's scope. Separately, `IRIS_BASICS_AUTORUN=1` can come from a `.env`, because marimo 0.25.0 autoloads `.env` before setup; that silently bypasses every consent gate. And pytest (conftest imports the module) or the 'offline' export will pick up live credentials if IRIS_BASICS_ENV_FILE is set in the shell or a `.env` sits beside the notebook.",
+    "evidence": "Names in redis-iris-demos/.env (names only): DEMO_DOMAIN OPENAI_API_KEY … CTX_ADMIN_KEY … MCP_AGENT_KEY CTX_SURFACE_ID DEMO_USER_ID … LANGCACHE_THRESHOLD. research/marimo.md: 0.25.0 'autoloads .env from the notebook's directory even without a pyproject.toml'.",
+    "fix": "The loader copies only the 14 allowlisted names from §3.5, and a test asserts CTX_SURFACE_ID, MCP_AGENT_KEY, MEMORY_OWNER_ID and MEMORY_NAMESPACE are never read. AUTORUN is ignored when it came from a file. It also requires a nonce matching `IRIS_BASICS_RUN`, and shows a red banner whenever it is on. Offline verify and conftest clear every allowlisted variable plus IRIS_BASICS_*, set a no-dotenv flag, and install an autouse MockTransport that raises on any real host."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.5 console guidance (179); col 1 Cleanup 'no flush anywhere in the file (a test greps for it)' (301-302); §3.6 LangCache 'Never' (191)",
+    "problem": "The only console hazard the plan warns about is LangCache 'Generate key'. Agent Memory 'Flush' and 'Delete service' (which the official Iris tutorial uses as its cleanup step), LangCache Flush and Delete service, and deleting the Context Retriever service would each wipe or break the live demo. A plain grep for 'flush' would also fail on exactly those warnings. The delete-by-attributes helper only refuses an empty scope, so `{'domain':'radish-bank'}` would still be allowed.",
+    "evidence": "agent-memory.md verifier: 'the console Flush action completely erases all stored memory data… The official Iris tutorial's cleanup step is Delete service. Both would wipe the live Iris demo's store'. langcache.md: 'Delete service… immediately terminates all API keys'. langcache.md research asks the helper to require 'a non-empty attributes dict that contains the unique session tag'.",
+    "fix": "Each config cell carries a 'never on a shared service: Flush, Delete service, Generate key' callout. Change the grep test to look for `/flush` paths and `.flush(` calls rather than the word. The delete-by-attributes helper requires the value to equal the run's tag, `iris-basics-{RUN}`."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "Col 1 bite-size 1-4 and Wow (281-299)",
+    "problem": "Unscoped searches of the shared cache return the best match across the whole cache, and the server default is maxResults=1. So 'Anatomy of a hit', the Threshold lab's 'low floor' searches, and chat HITs can show the live demo's cached answers (for example the electrohub or radish-bank seed) to a customer, labelled as Cairn results. Foreign entries also skew the lab's precision and recall, and they can hide the notebook's own entry, producing a false MISS.",
+    "evidence": "langcache.md: 'an unscoped notebook search can return the demo's seeded entry'. `maxResults` is 'Defaults to 1', and the report advises to 'filter results client-side by entry.id in MY_IDS, using max_results>1 if the server honors it'.",
+    "fix": "When scoping is not available, request maxResults=5, keep only results whose `id` is in the ledger, and show foreign matches as 'another app's entry (hidden)'. Never show their prompt or response. Score the lab against our own entries only, and add a note if maxResults turns out not to be honoured live."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "Col 0 Seed '~72 ops, well under 100 ops/s over ~1 s' (247); every SCAN-based count, EXPIRE and cleanup",
+    "problem": "On a shared Essentials DB, the 100 ops/s limit is shared with the live demo app and the hosted Agent Memory and Context Retriever services. A 72-op burst in one second is not 'well under' that. `scan_iter` defaults to COUNT 10, so each full-keyspace SCAN (the config's PREFIX* count, the CR EXPIRE sweep, two cleanups, the footprint check) costs keys/10 operations against the demo's budget. The live demo could be throttled.",
+    "evidence": "Plan §1.3: '100 ops/s'. redis-py `scan_iter(count=None)` falls back to the server default of 10. flush_redis.py shows the demo DB holds every domain's keys.",
+    "fix": "Pace writes to about 20 ops/s. Use `SCAN COUNT 1000`. Delete and expire keys we wrote by name from the ledger instead of scanning. Keep SCAN for the reclaim and footprint checks only."
+   }
+  ]
+ },
+ {
+  "lens": "presenter",
+  "verdict": "Revise the plan before Phase 1. The safety and API groundwork is solid, but there is 1 blocker and 15 majors. The blocker: secret redaction covers only headers, and the Context Retriever request body and response both carry secrets. Most majors are about presenting live and reliability. Two wow cells depend on unverified service behaviour and have no fallback (the Agent Memory similarity sweep and zero-overlap recall, the LangCache below-floor threshold). Network-bound controls have no debounce or gating. The four columns cannot be both readable and all on screen. The Context Retriever column's bite-size cells are single-shot commands, not parameter exploration. There is no reset or orphan path for sessions that die, no presenter kit, an empty path for customers without credentials in columns 1 and 3, and AUTORUN will break the live export. The scope is about 2x what the recipe implies. Every fix is a change to the plan text, not a redesign.",
+  "issues": [
+   {
+    "severity": "blocker",
+    "plan_section": "§3.4 Setup block (HTTP) + §5 Column 2 bite-size 2",
+    "problem": "Redaction is defined for headers only. Two Context Retriever secrets would be shown on screen, in the trace and curl output, in the exported HTML and in the __marimo__ session JSON. First, the create-surface request body carries the Redis password in data_source.connection_config.password. Second, the create-agent-key response carries the agent key (`key`), a bearer credential. verify.py's HTML grep checks env values only. It misses the agent key, which is minted at runtime, and it misses the bare password when the env holds a full REDIS_URL.",
+    "evidence": "L155-156: 'records (component, method, url, redacted request JSON, status, ms, response summary) ... never stores Authorization / X-API-Key'. L328: 'create the surface and an agent key'. L209-210: 'greps the exported HTML for every secret value'. research/context-retriever.md §5: the create body includes \"password\":\"...\", and create agent key returns 201 {id,key,...}, 'key is only returned here'. Its safety section says: 'mask `password` when showing the create-surface JSON'.",
+    "fix": "Specify recursive redaction of body and response in http_call and wire_view, by key name (password, key, api_key, apiKey, token, secret, authorization). Add a runtime SECRETS registry. Every secret seen at runtime (the unquoted URL password, minted agent keys) is registered and scrubbed from every rendered string, including exception text. verify.py --live must also grep for the password component and the minted agent key (the child process writes them to a temp file). Add a test with a fake create-agent-key response."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 1 LangCache: threshold lab + wow chat",
+    "problem": "The lab and the chat search the shared cache without attributes. maxResults is SDK-only and defaults to 1. At the lab's low floor, or with the chat slider pulled low, the top result can be a live Iris demo entry. The plan would then show another demo's prompt and answer on the customer's screen, badge it as a HIT, and count it in precision/recall. A foreign top result also hides the notebook's own entry.",
+    "evidence": "L68-70 hard fact 10: the cache is shared and the demo searches without attributes. L287: 'Search each once at a low floor'. L295-296: 'A hit shows the cached answer with a badge (similarity, matched prompt, entry id, ms)'. research/langcache.md §4: 'Otherwise search unscoped and filter results client-side by entry.id in MY_IDS, using max_results>1 if the server honors it'.",
+    "fix": "Add a rule: any result whose id is not in the tracked set renders as 'matched an entry this notebook didn't create (content hidden)' and is scored as its own 'foreign' class. Never display a foreign prompt or response. Request maxResults=5 and take the best own entry. Phase 5 records whether maxResults is honoured."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 1 bite-size 2, 4 and 6; §7",
+    "problem": "The threshold lab and the wow's 'teach, then a paraphrase HITs' flow both assume a search can go below the cache default threshold (0.85). That is unverified, and the known paraphrase similarities (0.839-0.906) straddle 0.85. If the service enforces its floor, half the lab rows come back with no similarity and the slider does nothing below 0.85. No fallback is designed. Bite-size 2 duplicates the lab with a network call per slider move. Bite-size 6 (attributes) will most likely be a disabled card on this cache.",
+    "evidence": "L283: 'slider over one probe'. L286-289: threshold lab. L292-293: '(only if the cache defines one)... Otherwise show a disabled card'. L409-410. research/langcache.md: 'Depends on the unknown that per-request threshold can go below the cache default'. The plan's own §7 says attributes are 'probably none'.",
+    "fix": "Merge bite-size 2 into the lab (search once per probe, re-score client-side). Add a floor probe at connect: search a known paraphrase at 0.5. If nothing below 0.85 comes back, label those rows 'below cache floor X' and start the slider at the floor. In Phase 5, choose the chat's teach/paraphrase presets from the recorded similarities and set the default slider value below them. Replace bite-size 6 with a two-line note in the config cell."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 3 bite-size 2-3 (Search, Similarity lens)",
+    "problem": "'≈21 calls plus bisection' comes to roughly 40-60 sequential hosted searches, and each one embeds the query server-side. The notebook runs in one marimo kernel, so all four columns freeze for tens of seconds. 429 limits are undocumented, and the derived score assumes unverified behaviour: that the threshold is a hard monotone cut and that limit is applied after it, with hybrid scoring also possible. Bite-size 2's threshold slider also re-queries the hosted service on every drag.",
+    "evidence": "L368-369. L366-367: 'query box plus similarityThreshold slider and limit'. research/agent-memory.md, unverifiable: 'offline threshold-sweep result (about 0.001 accuracy, 61 calls)... Whether the live server applies similarityThreshold as a hard cut ... is unknown'. Unknowns: 'Rate limits... unverified' and 'Whether hosted search is pure vector or hybrid'.",
+    "fix": "Drop the bisection. Run one on-click sweep of 11 or 21 steps with limit=100, a progress bar, a 10 s timeout per call, and abort on the first 429. Cache the band table and drive bite-size 2's slider from it client-side, with a 'Re-query live' run_button. Label the bands 'derived; assumes a hard cut'. Phase 5 checks monotonicity and hides the cell if it fails."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 3 wow (memory inspector)",
+    "problem": "The headline payoff is a memory recalled despite '0 words in common'. That cannot be verified offline, because the hosted embedding model and the threshold semantics are unknown. The plan also never says which threshold or limit the wow uses. The tests assert only zero overlap, not recall, so if recall misses live, the column's wow fails with no fallback.",
+    "evidence": "L384-385: 'Presets include a zero-overlap question (tests assert zero overlap with the target fact)'. research/agent-memory.md unknowns: 'semantics and normalization of similarityThreshold... server default when omitted' is undocumented. The only evidence is weak: 0.4 excluded an unrelated memory, the demos default to 0.7, radish-bank uses 0.5.",
+    "fix": "Make the wow rank-based: search with a very low or omitted threshold and limit=3, and show the rank plus the overlap badge ('#1 of 3, 0 shared words'). Ship 3 zero-overlap presets. In Phase 5 keep those that rank the target first, and record the ranks in the README. Add this to the §7 checklist."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.2 Cell recipe (bite-size cells), applies to all columns",
+    "problem": "No control is given debounce or gating. mo.ui.slider defaults to debounce=False. marimo merges queued UI updates last-write-wins, so a drag does not fire one call per tick, but it still fires several blocking, billed calls. The Search index-anatomy controls (algorithm, metric, M, EF_CONSTRUCTION) would drop and recreate indexes reactively on every change. Display toggles such as the Agent Memory prompt-assembly tiers, or the LangCache chat slider, re-run network cells if they share a cell with the fetch.",
+    "evidence": "L122-123: '1–3 controls, the call, the result'. L250-253, L283, L366-367. The marimo 0.25.0 slider signature has debounce=False. marimo/_runtime/utils/set_ui_element_request_manager.py _merge_ui_commands: 'last-write-wins per element ID'. research/redis-search.md: 'gate expensive UI (sliders that fire queries) behind mo.ui.run_button or mo.ui.form'.",
+    "fix": "Add rules to §3.2. (a) Every control that feeds a hosted call uses debounce=True. (b) Index builds and all writes sit behind a run_button. (c) Split each interactive item into a gated fetch cell that stores its result and a render cell that reacts only to display controls. (d) Re-score client-side wherever possible (the lab pattern)."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.1 Layout; Launch row; §5 wow cells",
+    "problem": "The layout plan fits neither viewing mode. (1) `marimo run` sends no code to the browser, so in 'app mode for rooms' the brief's bite-size code cells are invisible. (2) Edit mode ignores --content-width: columns are at least 500 px wide and sized from localStorage, so the override only helps the mode that hides code. (3) Four readable columns will not fit. Windows 11 on 1080p laptops defaults to 125-150% scaling, which leaves about 1280-1536 CSS px. At 380-460 px the Search wow's 'three side-by-side tables' and Agent Memory's 'recalled memories beside the message' become panes about 130 px wide. (4) In edit mode the large setup block shows at the top of column 0, and every @app.function helper appears as a code cell in the middle of the narrative.",
+    "evidence": "L10 and L35: '`marimo run` app mode for rooms'. L109-111. L262: 'three side-by-side tables'. L381: 'beside the message'. research/marimo.md: 'marimo run sends no code to the browser by default'; 'marimo edit ... each at least 500px ... Width is stored in browser localStorage'; the setup cell 'shows at the top of column 0'. legacy A5: 'Consequence: presenter runs marimo edit --sandbox'.",
+    "fix": "Pick the presenting mode. Edit mode shows the code (what the brief asks for): accept about 2 columns on screen and scroll sideways. Run mode needs a collapsed per-cell 'Code' snippet. In either mode: design wows to stack vertically or use mo.ui.tabs (for example one rank table with BM25/vector/hybrid columns); set a target width (about 560-640 px) and take the Phase 4 screenshot at 1536x864; use `with app.setup(hide_code=True)`; set hide_code=True on every @app.function and place the helpers after each column's cleanup cell; add anchor links to the four titles in the intro."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 2 bite-size cells",
+    "problem": "This violates the brief. The Context Retriever bite-size cells are single-shot commands with no parameters to explore: an offline export viewer with no controls, create the surface, load the data, list the tools.",
+    "evidence": "L326-335: '(1) the ContextModel code, a live export JSON viewer, and a predicted tools table' (no controls listed); '(2) Create the surface'; '(3) Load data'; '(4) list_tools as a table'. The brief asks for 'bite-size code cells to explore the component's parameters'.",
+    "fix": "Bite-size 1 gets offline controls: an index-type dropdown per field (text/tag/numeric/none) and an allowed_values toggle, which update the export JSON and the predicted tools live (research wow idea 1, no credentials needed). Create the surface from the chosen model, with a 'reset to default model' button. Add a paging/provenance cell: limit/offset sliders on one filter tool showing has_more and total_count, plus the _retrieval stamp on the unified surface."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 2 Dataset",
+    "problem": "The plan tells the implementer to use the research §9 dataset, which puts __acl_field_mappings__ on Customer and Order. The main agent key is created without access_tags. How the service treats an unscoped key against mapped entities is unknown, so the explorer may return zero Customer and Order rows in front of the customer.",
+    "evidence": "L321-322: 'the validated 3-entity, 20-record inline dataset in research/context-retriever.md §9'. §9: `__acl_field_mappings__ = ACL` on Customer and Order. Verifier: 'the core demo could return zero rows. Keep ACL mappings opt-in (a separate surface or toggle) until verified live.'",
+    "fix": "State that the main dataset has no __acl_field_mappings__. Cut the experimental access-tag cell (recommended), or give it its own second surface with the mappings."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.3 Naming contract vs §5 Column 2 SDK usage",
+    "problem": "ContextModel class names become entity names and therefore tool names. Following §3.3 gives `cr_Customer`, which puts `cr` in every tool name on screen. `_Customer` gives a leading-underscore entity. A plain `class Customer` at cell level breaks the contract, and reviewers are told to enforce it.",
+    "evidence": "L130-132: 'Every global a column defines ... starts with its column prefix'. research/context-retriever.md §3: the registry is keyed by class name. §7: tool names are derived from the lowercased entity name (`get_{e}_by_id`).",
+    "fix": "Prescribe `@app.function(column=2) def cr_build_models(prefix) -> dict[str, type]`. It imports context_surfaces inside the function and defines Customer/Product/Order in its body. Always pass entities=[...]. Record this as an explicit exception in §3.3."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§5 Column 2 SDK usage + wow ('Break it')",
+    "problem": "(a) list_tools, query_tool and import_data go through the SDK's own async httpx client and skip HTTP_TRACE. The promised 'raw JSON-RPC request/response' accordion and wire view would therefore be reconstructed, not real. (b) MCPError is a bare string that the SDK wraps twice, so the rejection callout is ugly. (c) On the unified surface filter_* has no additionalProperties:false, so 'Break it' with an unknown argument may just succeed.",
+    "evidence": "L315-320: 'UnifiedClient.import_data / list_tools / query_tool'. L338-341. research/context-retriever.md: 'MCPError is a bare string exception ... should POST the JSON-RPC itself with httpx'; 'set tools and count_* declare additionalProperties:false; filter_* does not'; import_data's POST is retried up to 3 times.",
+    "fix": "Make the MCP tools/list and tools/call requests, and the import POST, through http_call (about 10 lines of JSON-RPC). Keep the SDK only for ContextModel/export_data_model, which also removes the need for top-level await. Optionally drop the SDK altogether: show the model code as text and ship the export JSON, saving about 73 MB / 79 packages and the <3.14 cap. Build 'Break it' from the schema: find an enum anywhere in inputSchema (including array items) and send a value outside it; otherwise use a tool with additionalProperties:false and add an unknown argument; hide the preset if neither exists. Show error.code and error.message verbatim."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.6 Safety model; §5 Column 3 bite-size 6 and cleanup; §3.7 footprint report",
+    "problem": "There is no reset or orphan path. A browser refresh or app restart mid-meeting starts a new kernel with a new RUN. Earlier Agent Memory memories (long-term TTL defaults to 365 d) and Context Retriever surfaces become orphans the notebook no longer knows about, and only Context Retriever has an orphan finder. Extraction, from the kick-off and from every USER event the wow sends, lands minutes after cleanup has run, and verify --live checks the footprint immediately, so it cannot see those memories. There is also no in-session reset for rehearsing or a second audience (tracked sets, stale outputs).",
+    "evidence": "L143: new RUN per kernel. L192: Agent Memory 'none server-side'; cleanup only by ownerId ib-{RUN}. L193: orphan finder for Context Retriever only. L374-376. L205-210. research/agent-memory.md: 'Namespace-wide sweeper for leftovers from crashed runs: search filter {namespace eq iris-basics-notebook} ... safe only because that namespace is used exclusively by this notebook'. marimo run --session-ttl defaults to 120.",
+    "fix": "Add an orphans panel to each column's config cell: Redis `SCAN irisnb_*` for any run, with TTLs shown; an Agent Memory namespace-only sweep (list, confirm, delete by id); Context Retriever as already planned; for LangCache, state that orphans cannot be enumerated and expire via ttlMillis. Every Agent Memory session's first event must carry the namespace. Add a 'Reset column' action: cleanup, clear the tracked sets, bump a `*_gen` token so dependent cells re-render to their initial state. verify --live re-checks Agent Memory after one extraction cadence, or reports 'extraction pending'."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§0 criteria table ('Offline parts of every column run with no credentials'); §3.5",
+    "problem": "Without credentials, columns 1 and 3 have no offline content, so a customer who hasn't provisioned the Iris services sees a title plus a stack of not-configured callouts (every gated cell stops with one). That fails 'hand it to a customer' for half the notebook. The Context Retriever key path is also a dead end for first-time users: the Admin keys tab only works after a service exists.",
+    "evidence": "L37. §5 columns 1 and 3 define no offline cells. L180: 'Context Retriever → Admin keys → New admin key'. research/context-retriever.md: the tab is usable 'After you have created your first Context Retriever service'; console-free route: `ctxctl auth login` then `ctxctl admin create`.",
+    "fix": "(a) Only the config cell renders not_configured; downstream cells use mo.stop(..., output=None). (b) Each hosted column gets a static 'Recorded live on <date>' panel with the real JSON, similarity numbers and tool list captured in Phase 5. It is clearly labelled and is not a simulator, so it respects the no-mock rule. (c) Add a 'Don't have one? Quick-create' docs link per service, plus the admin-key caveat and the ctxctl route."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§4 Shared content; §8 ('two-minute presenter script lives in the README')",
+    "problem": "There is no presenter kit. Four columns at 5-8 minutes each plus waits is 20-32+ minutes, and more with ~6 bite-size cells per column. Nothing separates a core path from a deep dive, there is no talk track per cell, and the README can't be seen during the demo. The extraction kick-off is supposed to be pressed first but sits at the far right (column 3, bite-size 6). There is no pre-meeting go/no-go check.",
+    "evidence": "L227-228. L374-376. L428. legacy-plans 3C C9: PRESENTER.md is 'the actual insurance for a second SE runs it cold'.",
+    "fix": "(1) Add an intro switch, `ib_notes` (a §3.3 exception), that reveals a one-line 'Say:' / 'Expect:' callout under each cell. (2) Core path per column = title → config → 1 bite-size → wow (about 3 min). The rest sits behind a per-column 'Deep dive' switch using mo.stop gating, not a lazy accordion. (3) Move the extraction kick-off into an intro pre-flight panel. (4) Add `verify.py --preflight --env-file`: warm the sandbox env and the HF cache (`uvx marimo@0.25.0 -y export html` with no credentials), run every read-only Test connection, and print a go/no-go table. (5) README 'Before the meeting' checklist, including: don't run redis-iris-demos `make setup` or `make reset` mid-meeting, because they flush LangCache."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.4 AUTORUN / pressed(); §3.7 verify --live",
+    "problem": "Under AUTORUN every gate is True in the same run. Send fires with an empty q.value, and LangCache rejects prompts shorter than 1 character with a 400; the cell errors and the export exits 1, so Phase 5's 'live export exits 0' cannot pass. Teach, New session, TTL 'Check again' (which needs a 10 s wait), Break it and orphan delete all fire at once in an undefined order.",
+    "evidence": "L145-148: 'pressed(btn) -> bool (returns btn.value or AUTORUN). Every run_button gate uses pressed()'. L44-45: `if send.value: history.append(q.value)`. research/langcache.md §2: search prompt 'req, 1-1024 chars'.",
+    "fix": "Change the signature to `pressed(btn, autorun=False)` and give each chat or multi-step cell a scripted AUTORUN sequence: preset question, teach one answer, one paraphrase, and an 11 s sleep in the TTL cell under AUTORUN only. Orphan-delete never autoruns. Add a test that the notebook with AUTORUN=1 and a mock transport completes."
+   },
+   {
+    "severity": "major",
+    "plan_section": "§3.2 recipe + §5 per-column cell lists (scope)",
+    "problem": "The recipe reads as one cell per bite-size item, but marimo forbids reading a UI element's value in the cell that defines it. Each item is therefore at least 2 cells, plus @app.function helpers. That is about 90-110 cells in total, around 25 per column at ~460 px: a heavy read, long review cycles, and more room for multiple-definition errors.",
+    "evidence": "L122-123: 'Each has a ### heading, one idea, 1–3 controls, the call, the result'. research/context-retriever.md §10: 'read form.value only in a later cell (marimo forbids reading it in the defining cell)'. Bite-size counts: Search 5 (+ embedder, seed), LangCache 6, Context Retriever 4 + optional, Agent Memory 7.",
+    "fix": "Cap each column at 3-4 bite-size items and write the recipe as 'controls cell + result cell'. Cut: LangCache bite-size 2 (merge into the lab) and 6 (becomes a note); the 'LLM would have taken ~N ms' stat, an invented number that contradicts §4's 'not a performance demo'; Agent Memory bisection and bite-size 7 (move to the README); the Context Retriever experimental access tags; Search's M/EF_CONSTRUCTION/EF_RUNTIME knobs; altair, if only one chart is left."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§5 Column 0 Embedder cell",
+    "problem": "The named workaround does nothing: model2vec never forwards force_download. The full 61 MB snapshot includes a 30 MB ONNX file the notebook never uses. The embedder cell runs automatically on open, so a download over venue Wi-Fi blocks the single kernel queue for every column, with no feedback.",
+    "evidence": "L243: 'Apply the Windows force_download=False workaround'. research/redis-search.md verifier: 'force_download ... has no effect either way'. The slim snapshot_download with allow_patterns is about 30 MB (3.2 s), and local_files_only works when given the same allow_patterns.",
+    "fix": "Call snapshot_download with allow_patterns [config.json, model.safetensors, tokenizer.json, README.md] and local_files_only=True first, then online with the same patterns. Wrap it in mo.status.spinner('first run: 30 MB model'). Warm it in --preflight."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§5 Column 0 bite-size 1 and 3",
+    "problem": "At about 36 docs HNSW is effectively exact. EF_RUNTIME, M and EF_CONSTRUCTION change nothing visible, and FT.INFO vector sizes differ only in the third decimal of a MB. Controls that visibly do nothing look broken in front of a customer.",
+    "evidence": "L245: '~36 Cairn help-center articles'. L251-253 and L256. research/redis-search.md: the recall lab needs 1000-3000 docs with a deliberately weak graph (M 4, EF_CONSTRUCTION 10) before recall moves.",
+    "fix": "Drop those sliders. Keep FLAT vs HNSW and the metric as build-time choices and say plainly: 'same results at this scale; ANN parameters matter at 10^5+'. Or swap in the FT.PROFILE 'Vector search mode' flip under a TAG pre-filter."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§3.4 http_call",
+    "problem": "No timeouts or spinners are specified. One kernel serves all four columns, so a slow or hung hosted call freezes every column with no feedback. httpx's default is 5 s: too short for creating a surface, and 30 s is too long in a meeting.",
+    "evidence": "L153-158 give no timeout. research/langcache.md: the default client is httpx Timeout(5.0). research/agent-memory.md: Timeout(30, connect=10). mo.status.spinner appears nowhere in the plan.",
+    "fix": "Set timeouts per call class (reads about 10 s, create surface about 30 s). Put a spinner naming the service around every hosted call. Error callouts show status, type and detail."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§2 File layout (.gitignore)",
+    "problem": "`__marimo__/` is missing. run, edit and export write the session cache there, including cell outputs. Reopening in edit mode shows stale outputs from the last session (old HITs, an old RUN id).",
+    "evidence": "L82: '.gitignore: .env, __pycache__, *.html exports, .agents/build/'. research/marimo.md: 'Add __marimo__/ to .gitignore'. research/marimo.md unknowns: stale outputs and CellNotInitializedError until Run all.",
+    "fix": "Add `__marimo__/` to .gitignore. The pre-meeting checklist says to delete it or press Run all before presenting."
+   },
+   {
+    "severity": "minor",
+    "plan_section": "§5 Column 2 SDK usage (connection_config)",
+    "problem": "pool_size is never specified. Each surface, including orphans, holds service-side idle connections to the free DB (30-connection cap), shared with the notebook and redis-iris-demos. Column 0 can then hit max clients mid-demo.",
+    "evidence": "L50: free tier allows 30 connections. research/context-retriever.md: 'defaults pool_size 10, min_idle 2 ... Use pool_size about 5 and min_idle 1'.",
+    "fix": "Set connection_config pool_size to 3-5 and min_idle_conns to 0-1. The config cell shows INFO clients connected_clients."
+   }
+  ]
+ }
+]

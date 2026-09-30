@@ -1,0 +1,10 @@
+# Secrets and per-machine state
+.env
+__marimo__/
+__pycache__/
+*.html
+.agents/build/
+
+# Local tooling
+.venv/
+.pytest_cache/
