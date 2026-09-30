@@ -1544,13 +1544,15 @@ may not). Each item names the fallback if it fails.
 | 3 | 1 | The custom `User-Agent: redis-iris-basics` is accepted by all three hosted services (the live run sent `python-httpx/x.y`) | drop the `User-Agent` header from all sessions |
 | 4 | 1 | The bodiless `DELETE /entries/{id}` with the session's `Content-Type: application/json` answers `204` (the verified request carried no `Content-Type`) | add a `headers=` pass-through to `call_service` and send `{"Content-Type": None}` on that call |
 | 5 | 1 | The cache-aside hit on the prefixed *What should I do about a broken tent pole?* clears 0.85; record the score for the README | lower the `similarityThreshold` sent in that one search and say so in the copy |
-| 6 | 2 | The MCP session with no `Accept` header gets JSON from `tools/list` under niquests (httpx's `*/*` was verified; niquests sends the same default) | add `"Accept": "application/json, text/event-stream"` (the docs' curl) to `cr_mcp_service` and update the safety test |
+| 6 | 2 | The MCP session's explicit `Accept: */*` gets JSON from `tools/list` under niquests (httpx's `*/*` was the verified shape; `niquests.Session(headers=)` replaces the default headers, so the value is set by hand, review round 1) | change it to `"Accept": "application/json, text/event-stream"` (the docs' curl) in `cr_mcp_service` and update the safety test |
 | 7 | 2 | `get_customer_by_id`'s `inputSchema.required` contains `id` (the cell checks and warns) | rename the argument in `cr_call_tool` |
 | 8 | 2 | Request B in `cr_rejected_call` (tag condition on `lifetime_value`): record which branch fired and the exact text for the README "Verified live" | none; the cell prints what arrives in every branch |
 | 9 | 2 | The tools count on this account (21 on 2026-09-30) | update the hedged gloss |
 | 10 | 2 | If a dedicated Redis user is used: the data import reports `imported` 6/6/8 and `FT._LIST` shows three new indexes | widen the ACL, or fall back to the default user |
 | 11 | 3 | The slider default 0.3 returns the allergy memory alone for the kitchen question | change the default and the hedged line |
 | 12 | 3 | After the session cell, wait past the cadence and press Clean up again; the owner-only listing finds and deletes any extracted memories | if extracted memories carry no `ownerId` match, note it in section 20 and the README |
+| 13 | 2 | The reply shape of `DELETE /context-surfaces/{id}`: which of 200/204 arrives and whether a 200 body echoes the resource (`cr_cleanup` shows the status alone on a gone reply, review round 1) | none needed; record the shape in the Context Retriever brief 2.6 |
+| 14 | 2 | The sort order of `GET /context-surfaces` (oldest or newest first) against the 20-page cap in `cr_cleanup`; the summary says so when `has_next` is still true | raise the cap, or delete the leftover `cairn-<run>` surface in the console |
 
 ## 19. Rules for the builders
 
@@ -1615,8 +1617,9 @@ may not). Each item names the fallback if it fails.
   local in `cr_create`'s failure branch, which the next statement overwrites.
 - Three header deviations from the live run are untested against the hosted endpoints and sit on
   the section 18 checklist with fallbacks: the custom `User-Agent`, the pinned `Content-Type` on
-  a bodiless `DELETE`, and niquests' default `Accept: */*` on the MCP session (same value httpx
-  sent, different client).
+  a bodiless `DELETE`, and `Accept: */*` set explicitly on the MCP session (the value httpx sent by
+  default; `niquests.Session(headers=)` replaces the defaults, so an unset header would go out
+  absent, review round 1).
 - `cr_create`'s failure branch calls `cr_data_source()` a second time to obtain the password for
   the "is it in the body" check; that string lives in a cell-local for one statement. The
   alternative, skipping the check, would let a validation body that echoes the request reach the

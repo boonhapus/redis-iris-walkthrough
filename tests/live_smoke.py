@@ -7,7 +7,9 @@ prefix the command with them.
     uv run python tests/live_smoke.py
 
 One line per cell: the cell name, the seconds it took, and one of `stopped` (the cell or one of
-its ancestors called mo.stop), `error: <ExceptionType>`, or the first 120 characters of the
+its ancestors called mo.stop), `error: <ExceptionType>`, `skipped: an ancestor errored` (a cell
+that reads a name an errored cell should have defined; without this guard marimo would re-run
+that ancestor live and misreport the cell as stopped), or the first 120 characters of the
 output's plain text. Definitions thread from cell to cell in file order, so a cell sees what the
 cells above it defined, and every reference whose name ends in `_button` is replaced with an
 object whose `.value` is True, so every button counts as pressed, Clean up included. Nothing here
@@ -82,10 +84,14 @@ def main():
     by_refs._classify = classify_and_record
 
     definitions = {}
+    errored = set()   # names an errored cell should have defined; a cell that reads one is skipped, not re-run through its ancestors
     exit_code = 0
     for data in app._cell_manager.cell_data():
         cell = getattr(data, "cell", None)
         if cell is None or data.cell_id == app._cell_manager.setup_cell_id:   # the setup block is not a cell
+            continue
+        if set(cell._cell.refs) & errored:
+            print(f"{data.name:<22}    0.0s  skipped: an ancestor errored", flush=True)
             continue
         refs = {}
         for name in cell._cell.refs:
@@ -99,6 +105,7 @@ def main():
             output, defs = cell.run(**refs)
         except Exception as exc:   # a real error; mo.stop never reaches here
             status = f"error: {type(exc).__name__}"
+            errored |= set(cell._cell.defs)
             exit_code = 1
         else:
             definitions.update(defs)

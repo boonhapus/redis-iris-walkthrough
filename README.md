@@ -1,6 +1,6 @@
 # How to take the Redis Iris services apart with one marimo notebook
 
-> **TL;DR:** Redis Iris is the real-time context engine for agents: Redis Search underneath, with LangCache, Context Retriever, and Agent Memory as hosted services on Redis Cloud. In this tutorial, you will run a notebook that lets you index, cache, retrieve, and remember with the four Redis services behind an agent's context.
+> **TL;DR:** Redis Iris is the real-time context engine for agents. This notebook takes apart Redis Search underneath it and three of its services, LangCache, Context Retriever, and Agent Memory, hosted on Redis Cloud. In this tutorial, you will run a notebook that lets you index, cache, retrieve, and remember with the four Redis components behind an agent's context.
 
 > **Note:** This tutorial uses the code from the following git repository: <repository URL>
 
@@ -27,6 +27,8 @@ One marimo notebook, `iris_basics.py`, with four columns, one per component, and
 - An Agent Memory service (endpoint, store ID, and API key)
 
 > **Note:** The notebook does not start a local Redis instance. The only thing that runs on your machine is a 30 MB embedding model.
+
+LangCache and Agent Memory are in public preview, and Context Retriever is in preview.
 
 A column whose credentials you do not have says "not configured" and stops, so you can run any subset of the four.
 
@@ -56,7 +58,7 @@ Open `.env`, uncomment the variables for the columns you want to run, and fill t
 | `LANGCACHE_CACHE_ID` | none | LangCache. The Cache ID on the same page |
 | `LANGCACHE_API_KEY` | none | LangCache. The API key, shown once when the service is created |
 | `CTX_ADMIN_KEY` | none | Context Retriever. An admin key from the Admin keys page, shown once |
-| `CTX_API_URL` | `https://cloud.redis.io/context-surfaces` | Context Retriever. The admin API base, which the default suits on Redis Cloud |
+| `CTX_API_URL` | `https://cloud.redis.io/context-surfaces` | Context Retriever. The admin API base. The default suits Redis Cloud |
 | `CTX_MCP_URL` | `https://gcp-us-east4.context-surfaces.redis.io/mcp` | Context Retriever. The MCP address used only if the agent-key listing names none |
 | `MEMORY_API_BASE_URL` | none | Agent Memory. The Endpoint on the service's General settings page, with `https://` |
 | `MEMORY_STORE_ID` | none | Agent Memory. The Store ID on the same page |
@@ -93,7 +95,7 @@ EXPIRE cairn:<run>:help:ship-times 3600
 The cells below it run as soon as the load finishes:
 
 1. `FT.SEARCH ... "hiking boots" SCORER BM25STD WITHSCORES` returns the match count and the top five rows with their scores. A title match counts double because `title` has weight 2.
-2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. Ask *best pizza near me* and the range returns 0 articles, which the cell marks as a miss.
+2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. Ask *best pizza near me*: in a live run on 2026-09-30 the range returned 0 articles, which the cell marks as a miss.
 3. The pre-filtered query `(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 ...]` returns five rows that all match the filter, above the same `KNN 5` over every article.
 4. Choose a question under **Question**. The table shows the rank each engine gave every article, with the article that answers it starred. In a live run on 2026-09-30, `BM25STD` ranked nothing for *trail shoes feel cramped*, the vector search ranked the boot guide first, and `FT.HYBRID` kept it first.
 
@@ -101,7 +103,7 @@ Every key expires after one hour. Step 8 removes them sooner.
 
 ## Step 5. Turn the similarity threshold
 
-In the LangCache column, press **Store 5 gear-care answers with ttlMillis 900000**. LangCache answers `201` with an `entryId` for each of the five prompts, and the table lists the five ids.
+In the Redis LangCache column, press **Store 5 gear-care answers with ttlMillis 900000**. LangCache answers `201` with an `entryId` for each of the five prompts, and the table lists the five ids.
 
 The next cell searches for *My rain jacket stopped beading water. How do I fix that?* at `similarityThreshold` 0.85:
 
@@ -125,15 +127,15 @@ Press **Run the cache-aside loop: miss, store for 10 s, hit, expire, 404**. The 
 
 ## Step 6. Generate tools from a data model
 
-The Context Retriever column declares three `ContextModel` classes, `Customer`, `Product`, and `Order`, and shows the `export_data_model` output before anything is sent. Press **Create the surface, an agent key, and load 20 records (sends your database password)**.
+The Redis Context Retriever column declares three `ContextModel` classes, `Customer`, `Product`, and `Order`, and shows the `export_data_model` output before anything is sent. Press **Create the surface, an agent key, and load 20 records (sends your database password)**.
 
-The service answers `201` with the surface id and the status `provisioning_indices`, and the column reports `imported 6 + 6 + 8 records, 20 keys set to expire in 1 h`. The create request is shown as sent, with the password masked.
+The service answers `201` with the surface id and a status, `provisioning_indices` in a live run on 2026-09-30, and the column reports `imported 6 + 6 + 8 records, 20 keys set to expire in 1 h`. The create request is shown as sent, with the password masked.
 
 The next cell sends one JSON-RPC `tools/list` over MCP, and the service lists every tool it generated from the data model. In a live run on 2026-09-30 that was 21 tools. The cell after it calls `get_customer_by_id` with `{"id": "C001"}`, and the service returns the record for Ada Lovelace with a `_retrieval` stamp naming the surface that served it.
 
 The column then sends two calls an agent should not get away with. For `filter_customer` with no condition, the service answered `isError` with `at least one condition is required` in a live run on 2026-09-30. Its answer to a tag condition on the numeric field `lifetime_value` is printed as it arrives.
 
-Last, the column reads your own database. `JSON.GET cairn:<run>:customer:C001` returns the document the service wrote, and `FT.INFO` on each index the service built reports `num_docs` 6, 6, and 8.
+Last, the column reads your own database. `JSON.GET cairn:<run>:customer:C001` returns the document the service wrote, and `FT.INFO` on each index the service built reports `num_docs` 6, 8, and 6 for customer, order, and product.
 
 ## Step 7. Recall a memory by meaning
 
@@ -145,7 +147,7 @@ Agent Memory answers `201` with `created` naming the five ids `cairn-<run>-m1` t
 {"memories": [{"id": "cairn-<run>-m1", "text": "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.", "ownerId": "cairn-<run>", "namespace": "iris-basics-notebook", "memoryType": "semantic", "topics": ["food", "allergy"]}]}
 ```
 
-Leave the question at *What should the kitchen avoid serving me?* and the `similarityThreshold` slider at 0.3. Agent Memory should return the allergy memory alone, ranked first with 0 words in common with the question. Move the slider to 0.0 and it should return all five in rank order, and at 0.5 the cell should read `0 memories at or above 0.5`.
+Leave the question at *What should the kitchen avoid serving me?* and the `similarityThreshold` slider at 0.3. Agent Memory should return the allergy memory alone, ranked first with 0 content words in common with the question. Move the slider to 0.0 and it should return all five in rank order, and at 0.5 the cell should read `0 memories at or above 0.5`.
 
 The reply carries no score. `similarityThreshold` is the only cut, and the request body under the table changes with the slider:
 
@@ -160,7 +162,7 @@ Press **Send 4 session events and assemble the prompt**. Agent Memory answers `2
 ```
 Retrieved memory context:
 Session summary:
-(none yet: this store summarizes only when that is switched on and the session is long enough)
+(none yet: this store summarises only when that is switched on and the session is long enough)
 Short-term memory:
 USER: I am training for a 50 kilometre trail race in April.
 ASSISTANT: Noted: a 50 km race in April. Do steep descents give you any trouble?
@@ -170,7 +172,7 @@ Long-term memory:
 - ...
 ```
 
-Under it, the top memory should read `#1 of 3 · 0 words in common`.
+Under it, the top memory should read `#1 of 3 · 0 content words in common`.
 
 ## Step 8. Clean up
 
@@ -197,7 +199,7 @@ Everything the notebook writes carries one run tag, derived from your user and h
 | `cairn-<run>-m<n>` | Long-term memory | Chosen by the notebook, so a second write is an update and Clean up needs no ledger |
 | `cairn-<run>-s<time>` | Session | One conversation, whose owner and namespace come from the first event |
 
-The index that column 0 creates, as Redis receives it:
+The index that the Redis Search column creates, as Redis receives it:
 
 ```
 FT.CREATE idx:cairn:<run>:help ON HASH PREFIX 1 cairn:<run>:help: SCORE 1.0 SCHEMA title TEXT WEIGHT 2.0 body TEXT WEIGHT 1.0 category TAG SEPARATOR , year NUMERIC SORTABLE embedding VECTOR HNSW 6 TYPE FLOAT32 DIM 256 DISTANCE_METRIC COSINE
@@ -212,7 +214,7 @@ A LangCache search, `POST /v1/caches/{cacheId}/entries/search`:
 A Context Retriever surface, `POST /api/v1/context-surfaces`, with the password masked as the notebook shows it:
 
 ```json
-{"name": "cairn-<run>", "description": "Made by the Redis Iris basics notebook. Safe to delete.", "metadata": {"created_by": "iris-basics-notebook", "run": "<run>"}, "data_model": {"title": "Cairn Outfitters", "entity_count": 3, "entities": ["..."]}, "data_source": {"type": "redis", "connection_config": {"addr": "<host>:<port>", "username": "default", "password": "***", "db": 0, "tls_enabled": false, "pool_size": 2, "min_idle_conns": 0}}}
+{"name": "cairn-<run>", "description": "Made by the Redis Iris basics notebook. Safe to delete.", "metadata": {"created_by": "iris-basics-notebook", "run": "<run>"}, "data_model": {"title": "Cairn Outfitters", "description": "Customers, products, and orders of a fictional outdoor-gear shop", "entity_count": 3, "entities": ["..."]}, "data_source": {"type": "redis", "connection_config": {"addr": "<host>:<port>", "username": "default", "password": "***", "db": 0, "tls_enabled": false, "pool_size": 2, "min_idle_conns": 0}}}
 ```
 
 One generated tool, called the way an agent calls it, as a JSON-RPC `tools/call` over MCP:
@@ -245,7 +247,7 @@ flowchart LR
 | Redis Search | Keys `cairn:<run>:help:*` and the index `idx:cairn:<run>:help` | Keys after one hour. The index does not | `FT.DROPINDEX` without `DD`, `UNLINK` on 36 keys | `FLUSHALL`, `DD`, a write outside the prefix |
 | LangCache | Entries by `entryId`, held in the kernel | Every entry after 15 minutes (`ttlMillis` 900000) | `DELETE /entries/{entryId}` per id | `/flush`, `DELETE /entries` with a body |
 | Context Retriever | Surface `cairn-<run>`, agent key `cairn-<run>-agent`, 20 keys under `cairn:<run>:` | Keys and the agent key after one hour. The surface does not | `DELETE` the surfaces named `cairn-<run>`, `UNLINK` on 20 keys, drop the indexes they left without `DD` | `DD`, another account's surface |
-| Agent Memory | Owner `cairn-<run>`, namespace `iris-basics-notebook`, memory ids `cairn-<run>-m1` to `m5` | Nothing. Memories last a year | Delete this owner's sessions and memories after checking each `ownerId` | `includeAll`, an id whose owner differs |
+| Agent Memory | Owner `cairn-<run>`, namespace `iris-basics-notebook`, memory ids `cairn-<run>-m1` to `m5` | Sessions after the store's session TTL, 1 hour by default. Long-term memories after a year by default | Delete this owner's sessions and memories after checking each `ownerId` | `includeAll`, an id whose owner differs |
 
 A LangCache entry this kernel has forgotten is reached only by its 15-minute TTL. A Context Retriever surface has no TTL and keeps your database password until you delete it.
 
@@ -259,7 +261,7 @@ Verify that `.env` sits next to `pyproject.toml` and that the column's variable 
 
 Verify that `uv run python --version` reports 3.13 or older. `ContextModel` reads class annotations in a way Python 3.14 defers.
 
-### The hybrid column shows a note
+### The three-engine table shows a note instead of a hybrid rank
 
 Verify that the Redis version is 8.4 or later. `FT.HYBRID` does not exist before it, and the cell says so instead of running.
 
@@ -275,19 +277,23 @@ A dependency of the store failed, not zero results. Wait and retry, or check the
 
 Verify the key. A regenerated key invalidates the old one for every app that uses the service.
 
+### Context Retriever tools answer 401
+
+The agent key expires one hour after Create. Press Create again: it makes a second surface with the same name, and Clean up deletes both.
+
 ### A run_button cell went back to "press the button"
 
 marimo reset it because a cell above re-ran. Press it again.
 
 ### Clean up cannot find the surface
 
-The create cell did not finish. The surface, if it was created, is named `cairn-<run>` in the console and can be deleted there.
+Clean up lists every surface on the account and deletes each one named `cairn-<run>`, so an unfinished create cell is not the cause. Verify that `CTX_ADMIN_KEY` is still valid: when the listing answers anything but `200`, the cell says so and deletes only the id this kernel holds. The surface is named `cairn-<run>` in the console.
 
 ## FAQ
 
 ### Do I need Redis Cloud?
 
-No. Column 0 runs on any Redis 8 with Search. The three hosted services, LangCache, Context Retriever, and Agent Memory, run on Redis Cloud.
+No. The Redis Search column runs on any Redis 8 with Search. The three hosted services, LangCache, Context Retriever, and Agent Memory, run on Redis Cloud.
 
 ### Does the notebook call an LLM?
 
@@ -295,7 +301,7 @@ No. The embedding model runs on your machine, and the hosted services embed on t
 
 ### What does the notebook leave behind if I close the laptop?
 
-Redis keys and the agent key expire in an hour, and LangCache entries in 15 minutes. A Context Retriever surface and Agent Memory records do not expire, so press Clean up. The run tag is the same every time you open the notebook on this machine, so Clean up in a fresh kernel still finds the surface and the memories. LangCache is the exception: entries cannot be listed, so the 15-minute `ttlMillis` is the net.
+Redis keys and the agent key expire in an hour, and LangCache entries in 15 minutes. A Context Retriever surface never expires and Agent Memory long-term records last a year by default, so press Clean up. The run tag is the same every time you open the notebook on this machine, so Clean up in a fresh kernel still finds the surface and the memories. LangCache is the exception: entries cannot be listed, so the 15-minute `ttlMillis` is the net.
 
 ### Can I point it at a shared LangCache?
 
@@ -330,4 +336,4 @@ The facts the copy relies on come from one live run on 2026-09-30 against a Redi
 - Context Retriever: the account served the unified tool surface, 21 tools for three entities. `get_customer_by_id` with `{"id": "C001"}` returned the record plus a `_retrieval` stamp, and `filter_customer` with no condition answered `isError` with *at least one condition is required*.
 - Agent Memory: the search reply carried no score. The allergy memory came back first for *What should the kitchen avoid serving me?* with 0 words in common.
 
-The schema-violation reply, the cache-aside hit score, and the `Accept`-less MCP session under niquests are recorded here after the first live run of this notebook.
+The schema-violation reply, the cache-aside hit score, and the MCP session's explicit `Accept: */*` under niquests are recorded here after the first live run of this notebook.

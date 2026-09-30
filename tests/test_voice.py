@@ -90,10 +90,11 @@ def _sentences(text):
     if current:
         paragraphs.append(" ".join(current))
     for paragraph in paragraphs:
+        paragraph = re.sub(r"(?<=\d)\.(?=\d)", "<dot>", paragraph)   # 8.4 and 0.85 are one token, not a sentence end
         for sentence in re.split(r"[.:?]", paragraph):
             words = [token for token in sentence.split() if re.search(r"[A-Za-z0-9]", token)]
             if words:
-                yield sentence.strip(), len(words)
+                yield sentence.replace("<dot>", ".").strip(), len(words)
 
 
 MD_STRINGS = _md_strings()

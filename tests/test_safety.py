@@ -82,13 +82,13 @@ def _column_assembled(column):
 
 
 def _environ_read(node):
-    """The variable name read when `node` is os.environ[...] or os.environ.get(...), possibly
-    followed by string methods (`.strip()`, `.rstrip('/')`); None otherwise."""
-    while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and _dotted(node.func) not in ("os.environ.get",):
+    """The variable name read when `node` is os.environ[...], os.environ.get(...) or os.getenv(...),
+    possibly followed by string methods (`.strip()`, `.rstrip('/')`); None otherwise."""
+    while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and _dotted(node.func) not in ("os.environ.get", "os.getenv"):
         node = node.func.value
     if isinstance(node, ast.Subscript) and _dotted(node.value) == "os.environ":
         return node.slice.value if isinstance(node.slice, ast.Constant) else ""
-    if isinstance(node, ast.Call) and _dotted(node.func) == "os.environ.get":
+    if isinstance(node, ast.Call) and _dotted(node.func) in ("os.environ.get", "os.getenv"):
         first = node.args[0] if node.args else None
         return first.value if isinstance(first, ast.Constant) else ""
     return None
@@ -222,7 +222,7 @@ def test_sessions_are_pinned():
         assert isinstance(content_type, ast.Constant) and content_type.value == "application/json"
 
 
-def test_mcp_session_sends_no_accept_header():
+def test_mcp_session_sends_the_verified_accept_header():
     sessions = [
         node for node in ast.walk(TREE)
         if isinstance(node, ast.Assign)
@@ -235,7 +235,9 @@ def test_mcp_session_sends_no_accept_header():
     for node in sessions:
         headers = next((keyword.value for keyword in node.value.keywords if keyword.arg == "headers"), None)
         assert isinstance(headers, ast.Dict)
-        assert "Accept" not in _constant_keys(headers), "the MCP session sends no Accept header (the live-verified shape)"
+        accept = next((value for key, value in zip(headers.keys, headers.values) if isinstance(key, ast.Constant) and key.value == "Accept"), None)
+        # niquests.Session(headers=) replaces the default headers, so the live-verified Accept must be set explicitly
+        assert isinstance(accept, ast.Constant) and accept.value == "*/*", "the MCP session sends Accept: */* (the live-verified value), never application/json alone"
 
 
 def test_create_reply_is_never_rendered():
@@ -244,7 +246,7 @@ def test_create_reply_is_never_rendered():
         assert not _column_assembled(2), "column 2 is assembled without a cr_create cell"
         return
     cell = cells["cr_create"]
-    bound = set()
+    bound, body_and_wire = set(), set()
     for node in ast.walk(cell):
         if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
             continue
@@ -252,15 +254,23 @@ def test_create_reply_is_never_rendered():
             continue
         constants = {argument.value for argument in node.value.args if isinstance(argument, ast.Constant)}
         if "POST" in constants and "/context-surfaces" in constants:
-            for name in [name for target in node.targets for name in _target_names(target)]:
+            names = [name for target in node.targets for name in _target_names(target)]
+            for name in names:
                 assert name.startswith("_"), f"{name}: the create reply is bound only to cell-local names"
                 bound.add(name)
+            body_and_wire.update(names[1:])   # the status is a number; the body and the raw wire are what could echo the request
     assert bound, "cr_create makes no POST /context-surfaces call"
     for node in ast.walk(cell):
-        if isinstance(node, ast.Call) and _dotted(node.func) == "mo.json":
+        if not isinstance(node, ast.Call) or not _dotted(node.func).startswith("mo."):
+            continue
+        if _dotted(node.func) == "mo.json":
             assert node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == "cr_create_wire", (
                 "the only mo.json argument in cr_create is cr_create_wire"
             )
+        rendered = {name.id for name in ast.walk(node) if isinstance(name, ast.Name)}
+        assert not rendered & body_and_wire, (
+            f"{sorted(rendered & body_and_wire)} reach a mo.* call in cr_create: the create reply is rendered only through its cut type, title and detail"
+        )
     expressions = [statement for statement in cell.body if isinstance(statement, ast.Expr)]
     if expressions:
         last_names = {name.id for name in ast.walk(expressions[-1]) if isinstance(name, ast.Name)}
