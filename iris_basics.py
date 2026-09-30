@@ -77,9 +77,9 @@ def intro():
 
     Agents do not have an intelligence problem. They have a context problem: the right facts, at the
     right moment, from data you already hold. [Redis Iris](https://redis.io/docs/latest/develop/ai/context-engine/)
-    is the real-time context engine that supplies them. This notebook takes apart Redis Search
-    underneath it and three of its services, LangCache, Context Retriever, and Agent Memory, hosted on
-    Redis Cloud. Each column is one component, run on Cairn Outfitters, a fictional outdoor-gear shop.
+    is the real-time context engine that supplies them: Redis Search underneath, then LangCache,
+    Context Retriever, and Agent Memory as hosted services on Redis Cloud. This notebook takes the four
+    apart, one column each, on Cairn Outfitters, a fictional outdoor-gear shop.
     Every step shows the exact `redis-cli` command or JSON request behind it. There is no LLM anywhere in it.
 
     | Component, left to right | Its one job here |
@@ -92,10 +92,10 @@ def intro():
     **Configuration.** Copy `.env.example` to `.env` next to `pyproject.toml`. marimo loads it
     when the kernel starts. A column whose variables are missing says so and stops.
 
-    **Safety.** Everything this notebook writes from this machine carries the run tag `{RUN_TAG}`: Redis keys under
-    `{KEY_PREFIX}` with a one-hour `EXPIRE`, LangCache entries with `ttlMillis`, a surface named
-    `cairn-{RUN_TAG}`, and memories owned by `cairn-{RUN_TAG}`. The tag is the same every time you open
-    the notebook on this machine, so Clean up in a fresh kernel still finds what an earlier kernel
+    **Safety.** Everything this notebook writes from this machine carries the run tag `{RUN_TAG}`. That means
+    Redis keys under `{KEY_PREFIX}` with a one-hour `EXPIRE`, LangCache entries with `ttlMillis`, a surface
+    named `cairn-{RUN_TAG}`, and memories owned by `cairn-{RUN_TAG}`. The tag is the same every time you
+    open the notebook on this machine. Clean up in a fresh kernel still finds what an earlier kernel
     wrote. Each column ends with one Clean up button whose label says what it deletes. Nothing is
     written until you press a button that says what it writes.
     """)
@@ -114,8 +114,9 @@ def rs_title():
     answer a question over 36 help articles by keyword, by meaning, and by both.
 
     The other three columns are built on this engine. The embedding model, `potion-base-8M`, runs
-    on your machine, so this column needs one setting, `REDIS_URL`. Docs:
-    [Search and query](https://redis.io/docs/latest/develop/ai/search-and-query/).
+    on your machine, so this column needs one setting, `REDIS_URL`.
+
+    Docs: [Search and query](https://redis.io/docs/latest/develop/ai/search-and-query/).
     """),
         mo.mermaid("""flowchart LR
     A[App] -->|embed locally| V[Vector]
@@ -273,7 +274,6 @@ def rs_search_controls(rs_help_centre_loaded):
 @app.cell(column=0)
 def rs_knn_versus_range(
     Query,
-    ResponseError,
     rs_client,
     rs_embedding_model,
     rs_help_centre_loaded,
@@ -287,13 +287,8 @@ def rs_knn_versus_range(
     _range = Query("@embedding:[VECTOR_RANGE $radius $vector]=>{$YIELD_DISTANCE_AS: vector_score}").sort_by("vector_score").return_fields("title", "category", "vector_score").paging(0, 10)
     _knn_params = {"vector": rs_query_vector_bytes}
     _range_params = {"radius": 0.5, "vector": rs_query_vector_bytes}   # edit the radius here. 0.5 is a starting point for this model
-    try:
-        rs_knn_result = rs_client.ft(rs_index_name).search(_knn, _knn_params)
-        rs_range_result = rs_client.ft(rs_index_name).search(_range, _range_params)
-    except ResponseError as _exc:   # the index was dropped by Clean up below and this cell was re-run by an edit
-        if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
-            raise
-        mo.stop(True, mo.callout(mo.md("The index is gone. Press *Load the help centre* again."), kind="info"))
+    rs_knn_result = rs_client.ft(rs_index_name).search(_knn, _knn_params)
+    rs_range_result = rs_client.ft(rs_index_name).search(_range, _range_params)
     _knn_table = mo.ui.table(
         [{"title": doc.title, "category": doc.category, "vector_score": round(float(doc.vector_score), 3)} for doc in rs_knn_result.docs],
         selection=None, show_download=False, pagination=False,
@@ -319,7 +314,6 @@ def rs_knn_versus_range(
 @app.cell(column=0)
 def rs_prefiltered(
     Query,
-    ResponseError,
     rs_client,
     rs_embedding_model,
     rs_help_centre_loaded,
@@ -329,13 +323,8 @@ def rs_prefiltered(
     _params = {"vector": embed_texts(rs_embedding_model, ["where is my parcel"])[0].astype(np.float32).tobytes()}
     _unfiltered = Query("*=>[KNN 5 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "year", "vector_score").paging(0, 5)
     _filtered = Query("(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "year", "vector_score").paging(0, 5)
-    try:
-        _unfiltered_result = rs_client.ft(rs_index_name).search(_unfiltered, _params)
-        _filtered_result = rs_client.ft(rs_index_name).search(_filtered, _params)
-    except ResponseError as _exc:
-        if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
-            raise
-        mo.stop(True, mo.callout(mo.md("The index is gone. Press *Load the help centre* again."), kind="info"))
+    _unfiltered_result = rs_client.ft(rs_index_name).search(_unfiltered, _params)
+    _filtered_result = rs_client.ft(rs_index_name).search(_filtered, _params)
     _params_args = rs_client.ft(rs_index_name).get_params_args(_params)
     mo.vstack([
         mo.md(r"""This cell runs the same `KNN 5` twice for *where is my parcel*, once over every article and once over `returns` and `shipping` articles from 2024 on. The filtered query string is the whole lesson:"""),
@@ -380,13 +369,8 @@ def rs_engine_results(
     _vector = embed_texts(rs_embedding_model, [rs_engine_question])[0].astype(np.float32).tobytes()
     _bm25 = Query(rs_engine_question).scorer("BM25STD").return_fields("title").paging(0, 10)
     _knn = Query("*=>[KNN 10 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title").paging(0, 10)
-    try:
-        _rankings = {"BM25 rank": [doc.id for doc in rs_client.ft(rs_index_name).search(_bm25).docs]}
-        _rankings["vector rank"] = [doc.id for doc in rs_client.ft(rs_index_name).search(_knn, {"vector": _vector}).docs]
-    except ResponseError as _exc:
-        if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
-            raise
-        mo.stop(True, mo.callout(mo.md("The index is gone. Press *Load the help centre* again."), kind="info"))
+    _rankings = {"BM25 rank": [doc.id for doc in rs_client.ft(rs_index_name).search(_bm25).docs]}
+    _rankings["vector rank"] = [doc.id for doc in rs_client.ft(rs_index_name).search(_knn, {"vector": _vector}).docs]
     _lines = [
         redis_cli(["FT.SEARCH", rs_index_name, *_bm25.get_args()]),
         redis_cli(["FT.SEARCH", rs_index_name, *_knn.get_args(), *rs_client.ft(rs_index_name).get_params_args({"vector": _vector})]),
@@ -469,14 +453,16 @@ def lc_title():
         mo.md(r"""
     # Redis LangCache
 
-    Users rarely ask the same question the same way twice, and an exact-key cache misses every
+    Users rarely ask the same question the same way twice, and an exact-match cache misses every
     rewording. Redis LangCache matches prompts by meaning: it embeds the prompt, searches the cache,
     and returns the stored answer when the similarity clears a threshold. Its one job in this
     column: return a stored answer for a question asked in other words.
 
     A match is a score above a line, so a wrong answer for a question that only sounds similar is
     possible. The threshold is the dial, and this column turns it. LangCache is in public preview on
-    Redis Cloud. Settings: `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`. Docs:
+    Redis Cloud.
+
+    Settings: `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`. Docs:
     [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
     [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
     """),
@@ -699,14 +685,14 @@ def lc_cache_aside(
     _steps.append({"step": "2 store the answer for 10 s", "request": "POST /entries", "status": _status, "similarity": "-", "ms": _wire["ms"]})
     _wires.append(_wire)
     _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _script["prefix"] + _script["again"], **_search})
-    _mine, _shown = lc_own_hits(_body, _own | {_taught_id})
-    _steps.append({"step": "3 ask again in other words", "request": "POST /entries/search", "status": _status, "similarity": f"hit {_mine[0]['similarity']:.3f}" if _mine else "miss", "ms": _wire["ms"]})
+    _mine, _shown = lc_own_hits(_body, _own | {_taught_id})   # steps 3 and 4 credit the taught entry alone, never a stored one that also cleared the line
+    _steps.append({"step": "3 ask again in other words", "request": "POST /entries/search", "status": _status, "similarity": next((f"hit {hit['similarity']:.3f}" for hit in _mine if hit.get("id") == _taught_id), "miss"), "ms": _wire["ms"]})
     _wires.append(_wire)
     with mo.status.spinner(title="Waiting 12 s for ttlMillis to fire"):
         time.sleep(12)
     _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _script["prefix"] + _script["again"], **_search})
     _mine, _shown = lc_own_hits(_body, _own | {_taught_id})
-    _steps.append({"step": "4 ask again after 12 s", "request": "POST /entries/search", "status": _status, "similarity": f"hit {_mine[0]['similarity']:.3f}" if _mine else "miss", "ms": _wire["ms"]})
+    _steps.append({"step": "4 ask again after 12 s", "request": "POST /entries/search", "status": _status, "similarity": next((f"hit {hit['similarity']:.3f}" for hit in _mine if hit.get("id") == _taught_id), "miss"), "ms": _wire["ms"]})
     _wires.append(_wire)
     _status, _body, _wire = call_service(lc_service, "DELETE", f"/entries/{_taught_id}")
     _type = _body.get("type", "") if isinstance(_body, dict) else ""
@@ -769,8 +755,9 @@ def cr_title():
     The agent gets `get_customer_by_id` and `filter_customer`, never a raw command. Context
     Retriever is in preview. This column needs an admin key (`CTX_ADMIN_KEY`) and, in `REDIS_URL`, a
     scratch database with Search and JSON that the hosted service can reach. The service is given
-    that database's password. Docs:
-    [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/).
+    that database's password.
+
+    Docs: [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/).
     """),
         mo.mermaid("""flowchart LR
     M[ContextModel classes] -->|export_data_model| J[data_model JSON]
@@ -786,8 +773,8 @@ def cr_configure():
     from urllib.parse import unquote, urlsplit
 
     mo.stop(not (os.environ.get("CTX_ADMIN_KEY") and os.environ.get("REDIS_URL")), mo.callout(mo.md("Context Retriever is not configured. Set `CTX_ADMIN_KEY` and `REDIS_URL` in the `.env` next to `pyproject.toml` (see `.env.example`), then restart the kernel."), kind="warn"))
-    cr_api_url = os.environ.get("CTX_API_URL", "https://cloud.redis.io/context-surfaces").rstrip("/")
-    cr_mcp_url_default = os.environ.get("CTX_MCP_URL", "https://gcp-us-east4.context-surfaces.redis.io/mcp")   # fallback only; the live address comes from the agent-key listing
+    cr_api_url = (os.environ.get("CTX_API_URL") or "https://cloud.redis.io/context-surfaces").rstrip("/")   # `or`: a blank line in .env keeps the default
+    cr_mcp_url_default = os.environ.get("CTX_MCP_URL") or "https://gcp-us-east4.context-surfaces.redis.io/mcp"   # fallback only; the live address comes from the agent-key listing
     cr_surface_name = f"cairn-{RUN_TAG}"
     cr_admin_service = niquests.Session(
         base_url=f"{cr_api_url}/api/v1",
@@ -816,8 +803,8 @@ def cr_configure():
         mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching the admin API. Check your connection, or `CTX_API_URL` if you set it."), kind="danger"))
     except redis.RedisError as _exc:
         mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while connecting. Check `REDIS_URL`."), kind="danger"))
-    mo.stop(cr_check_status != 200, mo.callout(mo.vstack([mo.md(f"The admin API answered `{cr_check_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {'check `CTX_ADMIN_KEY`' if cr_check_status == 401 else 'check `CTX_API_URL`' if cr_check_status == 404 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    mo.vstack([mo.callout(mo.md("The admin API accepted this key, and Redis answered `PONG`."), kind="success"), mo.accordion({"Request as sent (credential masked)": mo.json(cr_check_wire)})])
+    mo.stop(cr_check_status != 200, mo.callout(mo.vstack([mo.md(f"Context Retriever's admin API answered `{cr_check_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {'check `CTX_ADMIN_KEY`' if cr_check_status == 401 else 'check `CTX_API_URL`' if cr_check_status == 404 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
+    mo.vstack([mo.callout(mo.md("Context Retriever accepted this key, and Redis answered `PONG`."), kind="success"), mo.accordion({"Request as sent (credential masked)": mo.json(cr_check_wire)})])
     return (
         cr_admin_service,
         cr_data_source,
@@ -948,7 +935,7 @@ def cr_create(
             _body_text = json.dumps(_body) if _body is not None else ""
             _safe = isinstance(_body, dict) and (not _password or _password not in _body_text)
             _fields = {name: str(_body.get(name, ""))[:200] for name in ("type", "title", "detail")} if _safe else {}
-            _output = mo.callout(mo.md(f"The admin API answered `{_status}` `{_fields.get('type', '')}`. {_fields.get('title', '')} {_fields.get('detail', '')}".strip() + (" The reply is not shown because it may echo the request." if not _safe else "")), kind="danger")
+            _output = mo.callout(mo.md(f"Context Retriever's admin API answered `{_status}` `{_fields.get('type', '')}`. {_fields.get('title', '')} {_fields.get('detail', '')}".strip() + (" The reply is not shown because it may echo the request." if not _safe else "")), kind="danger")
         else:
             try:
                 cr_surface_id, cr_surface_status, _step = _body["id"], _body["status"], "agent key"     # provisioning_indices live
@@ -986,7 +973,7 @@ def cr_create(
 def cr_tools(cr_mcp_service, cr_mcp_url):
     mo.stop(cr_mcp_service is None, mo.callout(mo.md("Create the surface first."), kind="info"))
     _status, _body, cr_tools_wire = call_service(cr_mcp_service, "POST", cr_mcp_url, json_body={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-    mo.stop(_status != 200 or not isinstance(_body, dict) or "result" not in _body, mo.callout(mo.vstack([mo.md(f"The MCP endpoint answered `{_status}` to `tools/list`: {'the agent key expires one hour after Create, so press Create again' if _status == 401 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
+    mo.stop(_status != 200 or not isinstance(_body, dict) or "result" not in _body, mo.callout(mo.vstack([mo.md(f"Context Retriever's MCP endpoint answered `{_status}` to `tools/list`: {'the agent key expires one hour after Create, so press Create again' if _status == 401 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
     cr_tools_list = _body["result"]["tools"]
     _rows = [{
         "tool": tool["name"],
@@ -1000,7 +987,7 @@ def cr_tools(cr_mcp_service, cr_mcp_url):
     and nothing here was hand-written:
     """),
         mo.ui.table(_rows, selection=None, pagination=False, label=f"{len(_rows)} tools from 3 entities"),
-        mo.md("In a live run on 2026-09-30 this account's surface listed 21 tools (the unified tool surface). Required arguments are starred."),
+        mo.md("In a live run on 2026-09-30 this account's surface listed 21 tools for three entities. Required arguments are starred."),
         mo.accordion({"Request as sent (credential masked)": mo.json(cr_tools_wire)}),
     ])
     return (cr_tools_list,)
@@ -1016,8 +1003,8 @@ def cr_call_tool(cr_mcp_service, cr_mcp_url, cr_tools_list):
     _result = (_body.get("result") or {}) if isinstance(_body, dict) else {}
     _text = "".join(part.get("text", "") for part in _result.get("content") or [])
     _hint = "the agent key expires one hour after Create, so press Create again" if _status == 401 else (_text or json.dumps(_body)[:200])
-    mo.stop(_status != 200 or not _result or _result.get("isError"), mo.callout(mo.md(f"The MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}` and no record: {_hint}."), kind="danger"))
-    mo.stop(not _text.lstrip().startswith("{"), mo.callout(mo.md(f"The tool answered text, not a JSON record: {_text[:200]}"), kind="warn"))
+    mo.stop(_status != 200 or not _result or _result.get("isError"), mo.callout(mo.md(f"Context Retriever's MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}` and no record: {_hint}."), kind="danger"))
+    mo.stop(not _text.lstrip().startswith("{"), mo.callout(mo.md(f"`get_customer_by_id` answered text, not a JSON record: {_text[:200]}"), kind="warn"))
     cr_customer_record = json.loads(_text)
     mo.vstack([
         mo.md(r"""
@@ -1041,7 +1028,7 @@ def cr_rejected_call(cr_mcp_service, cr_mcp_url):
         _status, _body, _wire = call_service(cr_mcp_service, "POST", cr_mcp_url, json_body=_request)
         _rejected = isinstance(_body, dict) and isinstance(_body.get("error"), dict)   # a JSON-RPC error may ride on a 200 or a 400
         _hint = "the agent key expires one hour after Create, so press Create again (Clean up deletes both surfaces)" if _status == 401 else "read the body below"
-        mo.stop(not _rejected and (_status != 200 or not isinstance(_body, dict)), mo.callout(mo.vstack([mo.md(f"The MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {_hint}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
+        mo.stop(not _rejected and (_status != 200 or not isinstance(_body, dict)), mo.callout(mo.vstack([mo.md(f"Context Retriever's MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {_hint}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
         _result = _body.get("result") or {}
         if _rejected:
             _error = _body["error"]
@@ -1058,7 +1045,7 @@ def cr_rejected_call(cr_mcp_service, cr_mcp_url):
     to each is printed as it arrives:
     """),
         *_views,
-        mo.md("In a live run on 2026-09-30 the first call came back as a tool error, `at least one condition is required`. The second is the schema's job to refuse, with a JSON-RPC `-32602` or a tool error, and its answer here is what this service does."),
+        mo.md("In a live run on 2026-09-30 the first call came back as a tool error, `at least one condition is required`. The second is the schema's job to refuse, with a JSON-RPC `-32602` or a tool error. The answer above is this service's, live, not a recorded one."),
         mo.accordion(cr_rejected_wires),
     ])
     return
@@ -1145,7 +1132,7 @@ def cr_cleanup(
             if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
                 raise
     mo.vstack([
-        mo.callout(mo.md(("" if _list_status == 200 else f"The surface listing answered `{_list_status}`, so only the id this kernel knows was tried. ") + f"Deleted {sum(reply['gone'] for reply in _replies.values())} of {len(_targets)} surfaces named `{cr_surface_name}`, unlinked {cr_keys_removed} of {len(cr_record_keys)} keys, dropped {len(cr_indexes_dropped)} indexes left under `{KEY_PREFIX}`." + (f" The listing has more pages than Clean up reads, so a surface from an earlier kernel may remain. Check the console for `{cr_surface_name}`." if _has_more else "")), kind="success" if _list_status == 200 and not _has_more and all(reply["gone"] for reply in _replies.values()) else "danger"),
+        mo.callout(mo.md(("" if _list_status == 200 else f"The surface listing answered `{_list_status}`, so only the id this kernel knows was tried. ") + f"Deleted {sum(reply['gone'] for reply in _replies.values())} of {len(_targets)} surfaces named `{cr_surface_name}`, unlinked {cr_keys_removed} of {len(cr_record_keys)} keys, dropped {len(cr_indexes_dropped)} indexes left under `{KEY_PREFIX}`." + (f" The listing has more pages than Clean up reads, so a surface from an earlier kernel may remain under the name `{cr_surface_name}`." if _has_more else "")), kind="success" if _list_status == 200 and not _has_more and all(reply["gone"] for reply in _replies.values()) else "danger"),
         mo.md("```\n" + "\n".join([redis_cli(["UNLINK", *cr_record_keys])] + [redis_cli(["FT.DROPINDEX", name]) for name in cr_indexes_dropped]) + "\n```"),
         mo.accordion({key: mo.json(value["reply"]) for key, value in _replies.items()}),
         mo.md("The documents in your database stay when a surface is deleted, which is why the notebook unlinks them by name. In a live run on 2026-09-30 the service dropped its own indexes with the surface, so the `FT.DROPINDEX` pass is the check that it did."),
@@ -1167,7 +1154,9 @@ def am_title():
     Facts reach long-term memory two ways: your app writes them directly, or the service extracts
     them from sessions in the background, minutes later. Every call carries an owner id and a
     namespace, because the store is shared by every app that points at it. Agent Memory is in public
-    preview. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`. Docs:
+    preview.
+
+    Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`. Docs:
     [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/),
     [REST quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/rest-api-quickstart/).
     """),
@@ -1204,7 +1193,7 @@ def am_configure():
         mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
     mo.stop(
         not isinstance(am_health_body, dict),
-        mo.callout(mo.md("The endpoint answered with a page or an empty body, not JSON. `MEMORY_API_BASE_URL` is the Endpoint on the service's General settings, not a console page."), kind="danger"),
+        mo.callout(mo.md("Agent Memory answered with a page or an empty body, not JSON. `MEMORY_API_BASE_URL` is the store's data-plane URL, not a console page. See `.env.example`."), kind="danger"),
     )
     _hint = {401: "check `MEMORY_API_KEY`", 404: "check `MEMORY_STORE_ID`"}.get(am_health_status, "read the body below")
     mo.stop(
@@ -1212,7 +1201,7 @@ def am_configure():
         mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{am_health_status}` `{am_health_body.get('type', '')}`: {_hint}."), mo.json(am_health_body)]), kind="danger"),
     )
     mo.vstack([
-        mo.callout(mo.md(f"Store `{am_health_body.get('status')}`. Every write and every search above Clean up in this column carries `ownerId` `{am_owner_id}` and `namespace` `{am_namespace}`. On a store other apps share, that filter is the tenant boundary."), kind="success"),
+        mo.callout(mo.md(f"Store `{am_health_body.get('status')}`. The memories this column writes carry `ownerId` `{am_owner_id}` and `namespace` `{am_namespace}`, and the session events carry the same namespace. Every search and Clean up names the owner. On a store other apps share, owner and namespace are the tenant boundary."), kind="success"),
         mo.accordion({"Request as sent (credential masked)": mo.json(am_health_wire), "Reply": mo.json(am_health_body)}),
     ])
     return am_memory_ids, am_namespace, am_owner_id, am_service, am_session_id
@@ -1248,8 +1237,7 @@ def am_write(
     except niquests.RequestException as _exc:
         mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
     _reply = _body if isinstance(_body, dict) else {}
-    mo.stop(_status == 424, mo.callout(mo.md(f"`424` `{_reply.get('type', '')}`: {_reply.get('detail', '')}. This is a failure of the store's database or model, not 0 results."), kind="danger"))
-    _hint = {401: "check `MEMORY_API_KEY`", 404: "check `MEMORY_STORE_ID`"}.get(_status, "read the body below")
+    _hint = {401: "check `MEMORY_API_KEY`", 404: "check `MEMORY_STORE_ID`", 424: "a dependency of the store failed, not 0 results"}.get(_status, "read the body below")
     mo.stop(_status != 201, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_reply.get('type', '')}`: {_hint}."), mo.json(_reply if _reply else {"body": _body})]), kind="danger"))
     _created, _errors = _reply.get("created") or [], _reply.get("errors") or []   # `errors` rides on a 201 when some records failed
     am_memories_written = True
@@ -1257,7 +1245,7 @@ def am_write(
         mo.ui.table([{"id": memory["id"], "text": memory["text"], "topics": ", ".join(memory["topics"])} for memory in am_write_wire["body"]["memories"]], selection=None, pagination=False),
         *([mo.callout(mo.vstack([mo.md(f"{len(_errors)} of the 5 records answered an error."), mo.json(_errors)]), kind="danger")] if _errors else []),
         mo.accordion({"Request as sent (credential masked)": mo.json(am_write_wire), "Reply": mo.json(_reply)}),
-        mo.md(f"Agent Memory answered `201` with {len(_created)} ids in `created`, and in a live run on 2026-09-30 the memories were searchable at once. The spec calls a client-chosen `id` idempotent creation, so pressing Write again is meant to update, and the reply's `errors` says if it did not. Because the ids are yours, Clean up can name them without a ledger."),
+        mo.md(f"Agent Memory answered `201` with {len(_created)} ids in `created`, and in a live run on 2026-09-30 the memories were searchable at once. The spec calls a client-chosen `id` idempotent creation, so a second press should not make a duplicate, and the reply's `errors` says what the store did. Because the ids are yours, Clean up can name them without a ledger."),
     ])
     return (am_memories_written,)
 
@@ -1296,8 +1284,8 @@ def am_search(
     except niquests.RequestException as _exc:
         mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
     _reply = _body if isinstance(_body, dict) else {}
-    mo.stop(_status == 424, mo.callout(mo.md(f"`424` `{_reply.get('type', '')}`: {_reply.get('detail', '')}. This is a failure of the store's database or model, not 0 results."), kind="danger"))
-    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_reply.get('type', '')}`: read the body below."), mo.json(_reply if _reply else {"body": _body})]), kind="danger"))
+    _hint = {424: "a dependency of the store failed, not 0 results"}.get(_status, "read the body below")
+    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_reply.get('type', '')}`: {_hint}."), mo.json(_reply if _reply else {"body": _body})]), kind="danger"))
     am_recalled_memories = _reply.get("items", [])
     _rows = [
         {"rank": rank, "memory": item["text"], "topics": ", ".join(item.get("topics") or []), "content words in common": len(shared_stems(am_question.value, item["text"]))}
@@ -1307,7 +1295,7 @@ def am_search(
         mo.ui.table(_rows, selection=None, pagination=False) if _rows else mo.callout(mo.md(f"0 memories at or above {am_search_body['similarityThreshold']}."), kind="warn"),
         mo.json(am_search_body, label="Request body"),
         mo.md("Agent Memory answers with the memories at or above the threshold, best first, and says nothing about how close they were."),
-        mo.md("In a live run on 2026-09-30 the allergy memory was #1 of 5 at 0.0 with 0 content words in common. It was alone at 0.3 and absent at 0.5, and content words are word stems with stopwords removed. Another store or model may place the cut elsewhere, so start around 0.3 and move it."),
+        mo.md("In a live run on 2026-09-30 the allergy memory came back first at 0.0 with 0 content words in common. It was alone at 0.3 and absent at 0.5. Content words are word stems with stopwords removed. Another store or model may place the cut elsewhere, so start around 0.3 and move it."),
         mo.accordion({"Request as sent (credential masked)": mo.json(am_search_wire), "Reply": mo.json(_reply)}),
     ])
     return
@@ -1407,7 +1395,7 @@ def am_session(
 def am_cleanup_button():
     am_cleanup_button = mo.ui.run_button(label="Clean up: delete this owner's sessions and memories", kind="danger")
     mo.vstack([
-        mo.md("Clean up deletes this owner's sessions, lists every memory under the owner with no namespace filter, checks each `ownerId` here, deletes by id, and lists again. After session events, press it again once the extraction cadence above has passed, ten minutes to be safe, since extracted memories otherwise last a year:"),
+        mo.md("Clean up deletes this owner's sessions, lists every memory under the owner with no namespace filter, checks each `ownerId` here, deletes by id, and lists again. After session events, press it again ten minutes later, past the extraction cadence above, since extracted memories otherwise last a year by default:"),
         am_cleanup_button,
     ])
     return (am_cleanup_button,)
@@ -1423,11 +1411,10 @@ def am_cleanup(
 ):
     mo.stop(not am_cleanup_button.value)
     try:
-        _session_list_status, _body, _wire = call_service(am_service, "GET", "/session-memory", params={"filterOwnerId": am_owner_id, "limit": 1000})   # one page of 1000 is enough for one session per kernel
+        _session_list_status, _body, _wire = call_service(am_service, "GET", "/session-memory", params={"filterOwnerId": am_owner_id, "limit": 1000})   # one page: sessions expire on the store's one-hour default, so more than 1000 under one owner is implausible
     except niquests.RequestException as _exc:
         _session_list_status, _body = type(_exc).__name__, None
-    _sessions = _body.get("items", []) if _session_list_status == 200 and isinstance(_body, dict) else [am_session_id]   # by owner, never every session; this kernel's id if the listing fails
-    mo.stop(len(_sessions) > 20, mo.callout(mo.md(f"The session listing returned {len(_sessions)} sessions under `{am_owner_id}`, more than this notebook makes, so the filter may not have been applied as sent. Nothing was deleted."), kind="danger"))
+    _sessions = [session for session in (_body.get("items", []) if _session_list_status == 200 and isinstance(_body, dict) else [am_session_id]) if str(session).startswith(f"{am_owner_id}-s")]   # only ids this notebook shaped; the listing carries no ownerId to check
     _session_replies = []
     for _session in _sessions:
         try:
@@ -1456,21 +1443,17 @@ def am_cleanup(
         except niquests.RequestException as _exc:
             mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory on the delete. Check `MEMORY_API_BASE_URL`. No listing was re-run."), kind="danger"))
         _delete_reply = _body if isinstance(_body, dict) else {}   # `deleted`, plus `errors` when an id failed
-        mo.stop(_status == 424, mo.callout(mo.md(f"`424` `{_delete_reply.get('type', '')}`: {_delete_reply.get('detail', '')}. This is a failure of the store's database or model, not 0 results."), kind="danger"))
-        _hint = {401: "check `MEMORY_API_KEY`", 429: "press Clean up again in a moment"}.get(_status, "read the body below")
+        _hint = {401: "check `MEMORY_API_KEY`", 424: "a dependency of the store failed, not 0 results", 429: "press Clean up again in a moment"}.get(_status, "read the body below")
         mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_delete_reply.get('type', '')}` on the delete: {_hint}. No listing was re-run."), mo.json(_delete_reply if _delete_reply else {"body": _body})]), kind="danger"))
         _deleted += _delete_reply.get("deleted", [])
-        _delete_errors += _delete_reply.get("errors") or []
-    _listed_ids = {item["id"] for item in _listed}
-    _already_gone = [error for error in _delete_errors if error.get("id") in am_memory_ids and error.get("id") not in _listed_ids]   # a chosen id sent unlisted: gone before this press, not a failure
-    _delete_errors = [error for error in _delete_errors if error not in _already_gone]
+        _delete_errors += _delete_reply.get("errors") or []   # a chosen id that was never written may be among them
     try:
         _status, _body, _wire = call_service(am_service, "POST", "/long-term-memory/search", json_body={"text": "", "filter": {"ownerId": {"eq": am_owner_id}}, "limit": 100})
     except niquests.RequestException as _exc:
         _status, _body, _wire = type(_exc).__name__, None, {}
     _left = _body.get("items", []) if isinstance(_body, dict) else []
     mo.vstack([
-        mo.callout(mo.md(("" if _session_list_status == 200 else f"The session listing answered `{_session_list_status}`, so only this kernel's session id was tried. ") + f"Deleted {_sessions_deleted} session{'' if _sessions_deleted == 1 else 's'} ({_sessions_gone} already gone) and {len(_deleted)} memories ({len(set(_deleted) - set(am_memory_ids))} with ids the service chose). {len(_already_gone)} of the five chosen ids were already gone, and {len(_delete_errors)} ids answered an error. {len(_left)} left under `{am_owner_id}`" + ("." if _status == 200 else f", by a second listing that answered `{_status}`, so press Clean up again.")), kind="danger" if _delete_errors else "warn" if _left or _status != 200 or _session_list_status != 200 else "success"),
+        mo.callout(mo.md(("" if _session_list_status == 200 else f"The session listing answered `{_session_list_status}`, so only this kernel's session id was tried. ") + f"Deleted {_sessions_deleted} session{'' if _sessions_deleted == 1 else 's'} ({_sessions_gone} already gone) and {len(_deleted)} memories ({len(set(_deleted) - set(am_memory_ids))} with ids the service chose). {len(_delete_errors)} ids answered an error, shown in the reply below. {len(_left)} left under `{am_owner_id}`" + ("." if _status == 200 else f", by a second listing that answered `{_status}`, so press Clean up again.")), kind="warn" if _delete_errors or _left or _status != 200 or _session_list_status != 200 else "success"),
         mo.accordion({"Last DELETE /long-term-memory as sent (credential masked)": mo.json(_delete_wire or {}), "Last DELETE reply": mo.json(_delete_reply), "Second listing as sent (credential masked)": mo.json(_wire)}),
     ])
     return

@@ -22,7 +22,7 @@ if not NOTEBOOK_PATH.is_absolute():
 SOURCE = NOTEBOOK_PATH.read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE, filename=str(NOTEBOOK_PATH))
 
-WORD_CEILING = 30  # the plan's own ceiling is 25; 30 leaves room for a backticked command counted as words
+WORD_CEILING = 25  # the plan's ceiling (section 7.6); inline code is stripped before counting, so no slack is needed
 
 # `X`, `Y` and `Z`: three backticked items without the serial comma.
 BACKTICKED_LIST = re.compile(r"`[^`\n]+`, `[^`\n]+` and `[^`\n]+`")
@@ -56,13 +56,22 @@ def _literal_text(node):
     return None
 
 
+def _text_fragments(node):
+    """Every string fragment of a mo.md argument: a literal, an f-string, or the constant parts of a
+    concatenation or conditional (`mo.md(a + (f"..." if x else ""))`), so those are checked too."""
+    text = _literal_text(node)
+    if text is not None:
+        yield text
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _text_fragments(child)
+
+
 def _md_strings():
     strings = []
     for node in ast.walk(TREE):
         if isinstance(node, ast.Call) and _dotted(node.func) == "mo.md" and node.args:
-            text = _literal_text(node.args[0])
-            if text is not None:
-                strings.append(text)
+            strings.extend(_text_fragments(node.args[0]))
     return strings
 
 

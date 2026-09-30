@@ -63,7 +63,8 @@ def _constant_keys(dictionary):
 
 
 def _cells():
-    """(function node, column) for every module-level @app.cell function."""
+    """(function node, column) for every module-level @app.cell function. A bare `@app.cell` (marimo's
+    own serialization of a cell with no config) yields column None, so the import test can fail on it."""
     for node in TREE.body:
         if not isinstance(node, ast.FunctionDef):
             continue
@@ -75,6 +76,8 @@ def _cells():
                     None,
                 )
                 yield node, column
+            elif isinstance(decorator, ast.Attribute) and _dotted(decorator) == "app.cell":
+                yield node, None
 
 
 def _column_assembled(column):
@@ -195,17 +198,27 @@ def test_no_print():
 # ---- secrets ----
 
 
+# The two calls a secret may flow into on the way to a global: the client and the session keep it in
+# their own connection state, and nothing else in the notebook is allowed to.
+SECRET_SINKS = {"connect_redis", "niquests.Session"}
+
+
 def test_no_secret_read_bound_to_a_global():
     for node in ast.walk(TREE):
         if not isinstance(node, ast.Assign):
             continue
-        variable = _environ_read(node.value)
-        if variable is None or variable in NON_SECRET_READS:
+        # Every read anywhere inside the value: a bare read, `.strip()` on one, an f-string
+        # (`f"Bearer {os.environ[...]}"`), or a wrapper (`urlsplit(os.environ[...])`).
+        reads = {_environ_read(sub) for sub in ast.walk(node.value) if isinstance(sub, (ast.Subscript, ast.Call))}
+        secrets = {variable for variable in reads if variable is not None and variable not in NON_SECRET_READS}
+        if not secrets:
+            continue
+        if isinstance(node.value, ast.Call) and _dotted(node.value.func) in SECRET_SINKS:
             continue
         for name in [name for target in node.targets for name in _target_names(target)]:
             assert name.startswith("_"), (
-                f"{name} = os.environ[{variable!r}]: a secret read must stay in the expression that uses it, "
-                "or in a cell-local name starting with _"
+                f"{name} reads os.environ[{sorted(secrets)}]: a secret read must stay in the expression that uses it "
+                f"({sorted(SECRET_SINKS)}), or in a cell-local name starting with _"
             )
 
 
@@ -286,6 +299,7 @@ def test_create_reply_is_never_rendered():
 
 def test_import_ownership():
     for cell, column in _cells():
+        assert column is not None, f"{cell.name} carries no column="
         allowed = OWNED_IMPORTS.get(column, set())
         for node in ast.walk(cell):
             if isinstance(node, ast.Import):

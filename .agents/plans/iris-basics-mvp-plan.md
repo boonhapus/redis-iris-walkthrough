@@ -1196,7 +1196,7 @@ Runs with `uv run pytest`. Credentials are absent by construction: `app.run()` d
 
 - `test_notebook_runs_without_credentials`: deletes the ten names, sets `HF_HUB_OFFLINE=1`, imports `iris_basics`, calls `outputs, defs = iris_basics.app.run()`; asserts it returned (a raising cell propagates), `"RUN_TAG" in defs`, `defs["cr_data_model"]["entity_count"] == 3`, `len(defs["cr_record_keys"]) == 20`, every `redis_key_template` in the export starts with `defs["KEY_PREFIX"]`, and none of `rs_client`, `lc_service`, `cr_admin_service`, `am_service` is in `defs` (each configure cell stopped on its not-configured note).
 - `test_marimo_check_strict`: `subprocess.run([sys.executable, "-m", "marimo", "check", "--strict", "iris_basics.py"], capture_output=True, text=True)` exits 0. Verified 2026-09-30 under `uv run pytest` with pytest 9.1.1 and marimo 0.25.0 (`shutil.which("marimo")` also resolves to the venv script, so no fallback is written).
-- `test_columns_are_complete_and_contiguous`: regex `column=(\d)` over the file; the set is `{0, 1, 2, 3}`, every `@app.cell(` carries `column=`, and the sequence is non-decreasing in file order (marimo issue #3543).
+- `test_columns_are_complete_and_contiguous`: regex `column=(\d)` over the file; the set is `{0, 1, 2, 3}`, every `@app.cell(` carries `column=`, a bare `@app.cell` (marimo's serialization of a cell with no config) fails the test, and the sequence is non-decreasing in file order (marimo issue #3543). `test_safety._cells()` yields a bare-decorator cell with column `None`, which `test_import_ownership` rejects.
 - `test_no_pep723_header`: no `# /// script`.
 - `test_cell_count_budget`: `42 <= file.count("@app.cell(") <= 46` (45 planned, section 16).
 - `test_line_budget`: the file has at most 1,500 lines (section 16 plans about 1,450).
@@ -1212,7 +1212,7 @@ Runs with `uv run pytest`. Credentials are absent by construction: `app.run()` d
 - every dict literal containing a `"memories"` key or a `"filter"` key contains `"ownerId"` (directly or nested);
 - every `__redis_key_template__` assignment is an f-string starting with `{KEY_PREFIX}`;
 - no `mo.ui.text(kind="password")`, no `mo.ui.chat`, no `mo.state`, no `mo.ui.form`;
-- `test_no_secret_read_bound_to_a_global`: for every `ast.Assign` whose `value` node is itself a `Subscript` or `Call` on `os.environ` (`os.environ[...]`, `os.environ.get(...)`), every target name starts with `_`, except when the string constant read is `CTX_API_URL` or `CTX_MCP_URL` (the two non-secret reads). An `os.environ` read nested inside a larger expression (`connect_redis(os.environ["REDIS_URL"])`, an f-string in `niquests.Session(base_url=...)`) is not an `Assign` value and does not fire;
+- `test_no_secret_read_bound_to_a_global`: for every `ast.Assign` whose `value` contains an `os.environ` read anywhere inside it (`os.environ[...]`, `os.environ.get(...)`, `.strip()` on one, an f-string, a wrapper such as `urlsplit(...)`), every target name starts with `_`, except when every read is `CTX_API_URL` or `CTX_MCP_URL` (the two non-secret reads) or the value is a call to one of the two sinks `connect_redis(...)` or `niquests.Session(...)`, which keep the secret in their own connection state (review round 3; before it only a read that was itself the `Assign` value fired, so `am_auth = f"Bearer {os.environ[...]}"` passed);
 - no `retries=` keyword anywhere; every `niquests.Session(` call passes `disable_http3=True` and a `"Content-Type": "application/json"` header;
 - `test_mcp_session_sends_the_verified_accept_header`: the `niquests.Session(` call assigned to `cr_mcp_service` carries `"Accept": "*/*"` in its `headers` dict (the value httpx sent live; `niquests.Session(headers=)` replaces the default header set, so without the key niquests sends no `Accept` at all; section 18 row 6, review round 1);
 - `test_create_reply_is_never_rendered`: in the cell function named `cr_create`, every `mo.json(` call's first argument is the `Name` `cr_create_wire`, and no name bound from the `call_service(..., "POST", "/context-surfaces", ...)` tuple is a global (every target starts with `_`) or the cell's last expression;
@@ -1221,7 +1221,7 @@ Runs with `uv run pytest`. Credentials are absent by construction: `app.run()` d
 
 **`tests/test_voice.py`** (regex over every string constant inside a `mo.md(` call in `iris_basics.py`, after stripping fenced code, inline code and URLs)
 
-- `test_no_sentence_over_30_words`: split on `.`, `:`, `?`; no sentence has more than 30 words (the plan's own ceiling is 25; 30 leaves room for a backticked command counted as words);
+- `test_no_sentence_over_30_words`: split on `.`, `:`, `?`; no sentence has more than 25 words (review round 3: the ceiling is 25, the plan's own figure in 7.6, because inline code is stripped before counting and the 30-word slack rested on a false premise; the function keeps its name). Since round 3 the strings checked include the constant and f-string fragments of a concatenated or conditional `mo.md` argument, not only a literal first argument;
 - `test_serial_comma_in_three_item_lists`: no match for `` `[^`]+`, `[^`]+` and `[^`]+` `` (three backticked items joined without the serial comma) and no match for `, [A-Za-z ]+ and [A-Za-z ]+[.:]` following a second comma-separated item, the shape the critics found;
 - `test_no_semicolon_in_prose`: no `;` outside inline code or a mermaid block;
 - `test_no_exclamation_marks`; `test_no_developers_in_prose`; `test_no_try_free_link` (no `redis.io/try-free`);
@@ -1351,6 +1351,36 @@ its table alone, and say "the same KNN with no filter returns a top five that ig
 and year"); column 1, the `lc_threshold_table` `style_cell` colouring; column 2, the six-row
 markdown table in `cr_data_model` to three rows; column 3, the scope lens to two scopes (this
 owner, a nonexistent owner).
+
+**Measured after review round 3 (2026-09-30).** Body lines are the statements between the `def`
+and the `return`, counted with `ast`; the file is 1,463 lines. Column totals (the intro's 27 lines
+excluded): column 0 224 of 250, column 1 234 of 225, column 2 321 of 285, column 3 233 of 222.
+Round 3 removed the three index-not-found guards in column 0 (15 lines), folded the 424 stop into
+the status hint in `am_write`, `am_search` and `am_cleanup`, dropped `am_cleanup`'s
+`_already_gone` reconciliation and its 20-session guard, and split the Settings and Docs fragments
+of the title cells onto their own line (one or two lines each). The cells still over their ceiling
+are listed so the budget is honest, not met:
+
+| Column 0 | | Column 1 | | Column 2 | | Column 3 | |
+|---|---|---|---|---|---|---|---|
+| `rs_title` | 20 | `lc_title` | 38 (22) | `cr_title` | 22 | `am_title` | 24 (20) |
+| `rs_connect` | 33 | `lc_configure` | 38 (36) | `cr_configure` | 35 (34) | `am_configure` | 33 |
+| `rs_load` | 36 | `lc_store` | 21 | `cr_data_model` | 61 (60) | `am_write_button` | 5 |
+| `rs_full_text` | 13 | `lc_anatomy_of_a_hit` | 11 | `cr_create_button` | 9 (6) | `am_write` | 22 |
+| `rs_search_controls` | 7 | `lc_probes_and_slider` | 20 | `cr_create` | 60 (52) | `am_search_controls` | 9 |
+| `rs_knn_versus_range` | 28 | `lc_threshold_table` | 22 | `cr_tools` | 19 | `am_search` | 25 |
+| `rs_prefiltered` | 16 | `lc_strategies` | 20 | `cr_call_tool` | 20 | `am_scope_lens` | 21 |
+| `rs_engine_preset` | 6 | `lc_cache_aside_button` | 5 | `cr_rejected_call` | 28 (26) | `am_session_button` | 6 |
+| `rs_engine_results` | 46 (44) | `lc_cache_aside` | 34 | `cr_peek` | 18 | `am_session` | 36 |
+| `rs_cleanup_button` | 5 | `lc_cleanup_button` | 5 | `cr_cleanup_button` | 9 (6) | `am_cleanup_button` | 5 |
+| `rs_cleanup` | 14 | `lc_cleanup` | 20 (16) | `cr_cleanup` | 40 (30) | `am_cleanup` | 47 (28) |
+| **224** | | **234** | | **321** | | **233** | |
+
+A figure in brackets is the ceiling the cell still exceeds. `lc_title` carries the SDK accordion
+(section 9), `cr_create` the six admin calls with their error branches, `cr_cleanup` the R3.1
+listing and index pass, and `am_cleanup` the session, listing, delete and re-list steps with their
+status branches. None of the cut order above has been applied; the conformance review's keep list
+is intact.
 
 `src/cairn_support`: about 300 lines (`sample_data.py` 200, `embedder.py` 40, `formatting.py` 40,
 `__init__.py` 3). Tests: about 260 lines.

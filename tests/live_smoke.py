@@ -10,8 +10,9 @@ One line per cell: the cell name, the seconds it took, and one of `stopped` (the
 mo.stop), `stopped: an ancestor stopped` (the cell reads a name a stopped cell defines, so the
 notebook would never run it), `error: <ExceptionType>`, `skipped: an ancestor errored` (a cell
 that reads a name an errored cell should have defined; without either guard marimo would re-run
-that ancestor live and misreport the cell), or the first 120 characters of the output's plain
-text. Definitions thread from cell to cell in file order, so a cell sees what the cells above it
+that ancestor live and misreport the cell), `skipped: unresolved [...]` (a reference no earlier
+cell, button or setup name supplies, which marimo would also satisfy by re-running ancestors; the
+exit code is 1), or the first 120 characters of the output's plain text. Definitions thread from cell to cell in file order, so a cell sees what the cells above it
 defined, and every reference whose name ends in `_button` is replaced with an object whose
 `.value` is True, so every button counts as pressed, Clean up included. A stopped cell's partial
 definitions (the names it assigned before mo.stop) are never threaded on, which is what keeps a
@@ -27,6 +28,7 @@ told apart from an ordinary output through marimo's `by_refs._classify`, which s
 MarimoStopError before the runner swallows it.
 """
 
+import builtins
 import html
 import importlib.util
 import os
@@ -86,6 +88,10 @@ def main():
 
     by_refs._classify = classify_and_record
 
+    setup_names = set()   # the setup block's names, which Cell.run injects itself
+    for data in app._cell_manager.cell_data():
+        if data.cell_id == app._cell_manager.setup_cell_id and getattr(data, "cell", None) is not None:
+            setup_names = set(data.cell._cell.defs)
     definitions = {}
     errored = set()   # names an errored cell should have defined; a cell that reads one is skipped, not re-run through its ancestors
     stopped = set()   # names a stopped cell defines; a cell that reads one never runs in the notebook, so it never runs here
@@ -108,6 +114,14 @@ def main():
                 refs[name] = types.SimpleNamespace(value=True)
             elif name in definitions:
                 refs[name] = definitions[name]
+        # A reference nobody above defined would make Cell.run re-run its defining ancestors with a fresh
+        # namespace (a model load, a PING, a seed cell against the real unpressed button), so it is refused.
+        unresolved = {name for name in cell._cell.refs if name not in refs and name not in setup_names and name not in dir(builtins)}
+        if unresolved:
+            errored |= set(cell._cell.defs)
+            exit_code = 1
+            print(f"{data.name:<22}    0.0s  skipped: unresolved {sorted(unresolved)}", flush=True)
+            continue
         stops.clear()
         started = time.perf_counter()
         try:

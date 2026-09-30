@@ -101,6 +101,8 @@ def test_marimo_check_strict():
 def test_columns_are_complete_and_contiguous():
     decorators = re.findall(r"^@app\.cell\((.*)\)\s*$", SOURCE, flags=re.M)
     assert decorators, "no @app.cell decorator found"
+    # marimo serializes a cell with no config as a bare `@app.cell`, which the regex above cannot see.
+    assert len(re.findall(r"^@app\.cell\b", SOURCE, flags=re.M)) == len(decorators), "a cell without (column=...) exists"
     columns = []
     for arguments in decorators:
         match = re.search(r"column=(\d)", arguments)
@@ -116,7 +118,7 @@ def test_no_pep723_header():
 
 @assembled_only
 def test_cell_count_budget():
-    count = SOURCE.count("@app.cell(")
+    count = len(re.findall(r"^@app\.cell\b", SOURCE, flags=re.M))   # bare `@app.cell` counts too
     assert 42 <= count <= 46, f"{count} cells; 45 planned, 42-46 allowed"
 
 
