@@ -1,333 +1,247 @@
-# Redis Iris basics
+# How to take the Redis Iris services apart with one marimo notebook
 
-A single marimo notebook that takes the Redis Iris context engine apart, one column per
-component: **Redis Search** (the query engine underneath), **LangCache**, **Context
-Retriever** and **Agent Memory**. It calls the real hosted services with your own credentials
-and shows the exact HTTP JSON or `redis-cli` command behind every call, so you can see what an
-agent would really send. There is no LLM and no OpenAI key anywhere.
+> **TL;DR:** Redis Iris is the real-time context engine for agents: Redis Search underneath, with LangCache, Context Retriever, and Agent Memory as hosted services on Redis Cloud. In this tutorial, you will run a notebook that lets you index, cache, retrieve, and remember with the four Redis services behind an agent's context.
 
-Each column asks only for its own settings. Without them it shows a "not configured" note
-(column 2 also has a data-model cell that works offline), so a column you have no service for
-stays out of your way. Columns 1 to 3 add a panel, "Recorded live on 2026-09-30", with a few
-real outputs of a real run (a cache HIT, the tools a data model became, a memory recalled by
-meaning); the identifiers of the account it ran on are replaced by placeholders.
+> **Note:** This tutorial uses the code from the following git repository: <!-- repository URL -->
 
-Docs: [Redis Iris context engine](https://redis.io/docs/latest/develop/ai/context-engine/) ·
-[redis.io/iris](https://redis.io/iris/)
+When your agent needs context, you need a search index, a semantic cache, governed access to your data, and a memory that outlives the session. Redis gives you all four in one data layer, and this notebook shows the exact command or request behind each.
 
-## Run it
+## What you'll learn
 
-Install [uv](https://docs.astral.sh/uv/) once.
+- How one `FT.CREATE` over a key prefix answers a question by keyword (`BM25STD`), by meaning (a `VECTOR` field), and by both fused server-side (`FT.HYBRID`)
+- How LangCache turns a `similarityThreshold` into a cache hit, a cache miss, or a wrong answer, and why `ttlMillis` is the safety net
+- How Context Retriever turns three `ContextModel` classes into MCP tools, writes JSON documents into your own Redis, and refuses a call the schema does not allow
+- How Agent Memory recalls a fact with no word in common with the question, and why `ownerId` and `namespace` travel on every request
 
-```powershell
-# Windows
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+## What you'll build
 
-```sh
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+One marimo notebook, `iris_basics.py`, with four columns, one per component, and one `.env` that configures them. Each column connects read-only on load and writes only when you press a button whose label says what it writes. Each ends with a Clean up button that deletes only what that column wrote.
 
-Then, from this folder:
+## Prerequisites
 
-```sh
-# Presenting: code visible
-uvx marimo@0.25.0 edit --sandbox iris_basics.py
+- [uv](https://docs.astral.sh/uv/)
+- Python 3.12 or 3.13 (uv installs it)
+- A Redis 8 database with Search and JSON, either local or Redis Cloud
+- A LangCache service (API URL, cache ID, and API key)
+- A Context Retriever admin key
+- An Agent Memory service (endpoint, store ID, and API key)
 
-# Handing over: app mode, code hidden, runs by itself when opened
-uvx marimo@0.25.0 run --sandbox iris_basics.py
-```
+> **Note:** The notebook does not start a local Redis instance. The only thing that runs on your machine is a 30 MB embedding model.
 
-- **`edit` opens with nothing run.** Press **Ctrl+Shift+R** (*Run all stale cells*, or the
-  yellow play button at the bottom right) and wait about 15 seconds for the yellow marks to
-  clear. A cell that says *Waiting for a connection or a button above* is waiting for a
-  column's **Test connection**. A notebook cannot switch this on for itself: marimo ignores
-  such a setting in a script's header.
-- **One column fills the screen** in `edit` (about 1200 px wide). Zoom the browser out to
-  67-75%, or drag a column's border, to see two.
-- `--sandbox` makes marimo read the dependencies from the script header (`# /// script`) and
-  build a private environment. Without a terminal it skips this silently, so keep the flag.
-  The header pins Python below 3.14 because Context Retriever's `ContextModel` breaks on 3.14;
-  if you launch some other way, use Python 3.13.
-- The first launch downloads about 110 packages, and column 0 downloads a ~30 MB embedding
-  model the first time it needs one. `verify.py --preflight` warms both before a meeting.
-- In `edit`, marimo's browser console logs many "Language server initialization failed"
-  errors. They come from marimo, not from this notebook; you can turn its language servers off
-  in marimo's user settings if they distract you.
-- Do not change the notebook's width setting in `marimo edit` and then save: marimo drops the
-  column assignments when you do (marimo issue #3543). Edit the `.py` directly instead.
+A column whose credentials you do not have says "not configured" and stops, so you can run any subset of the four.
 
-## Configuration
-
-Put each column's settings in the field at the top of the column, or in a file. Console links
-and the click path for every value are in each column and in `.env.example`.
-
-| Column | Required | Optional | Where (https://cloud.redis.io) |
-|---|---|---|---|
-| 0 Search | `REDIS_URL`, or `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` (`REDIS_USERNAME`, `REDIS_SSL`, `REDIS_DB`) | | Databases → your database → Configuration → Public endpoint; Security → Default user → eye icon. Free 30 MB database: https://redis.io/try-free/ |
-| 1 LangCache | `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, `LANGCACHE_API_KEY` | `LANGCACHE_SCOPE_ATTR` | LangCache → your service → Configuration → Connectivity. The key is shown once; **never press Generate key on a shared cache**. Use a dedicated LangCache service for this notebook |
-| 2 Context Retriever | `CTX_ADMIN_KEY`, `REDIS_URL` (reachable by the hosted service; Search and JSON) | `CTX_API_URL`, `CTX_MCP_URL` | Context Retriever → Admin keys → New admin key (shown once; a service must exist first) |
-| 3 Agent Memory | `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, `MEMORY_API_KEY` | | Agent Memory → your service → Configuration → General settings; API keys tab |
-
-The redis.io free tier has no TLS, so the URL is `redis://`, not `rediss://`. `REDIS_URL`
-feeds column 0, column 2 and the "under the hood" look in column 3.
-
-**Where the file is.** Either a `.env` next to `iris_basics.py` (copy `.env.example`), or any
-file with the same names, such as another project's `.env`:
-
-```powershell
-$env:IRIS_BASICS_ENV_FILE='C:\path\to\redis-iris-demos\.env'   # PowerShell
-```
+## Step 1. Clone the repository
 
 ```sh
-IRIS_BASICS_ENV_FILE=/path/to/redis-iris-demos/.env            # sh
+git clone <!-- repository URL --> redis-iris-basics
+cd redis-iris-basics
 ```
 
-Use one or the other, not both. The process environment comes first, then the named file, but
-marimo itself loads the `.env` beside the notebook into the environment before the notebook
-starts, so with both, that `.env` wins. Only the names in the table are ever read. Comments in
-a settings file must sit on their own lines, because the loaders disagree about an inline
-`# note`. Saving a new `.env` needs a restart of `marimo run`; in `edit`, re-run the cell.
+`uv` reads `pyproject.toml` and `uv.lock`, so there is nothing else to install by hand.
 
-Two more settings are not credentials: `IRIS_BASICS_NO_DOTENV=1` stops the fallback to the
-`.env` beside the notebook, and `IRIS_BASICS_LEDGER_DIR` moves the ledger of created resources
-(default `%LOCALAPPDATA%\iris-basics`, else `~/.iris-basics`).
+## Step 2. Configure the environment
 
-## Safety
+Copy the sample file:
 
-Everything the notebook writes carries a run id (`<run>` below). Nothing is written until you
-press a button that says what it will write and where. A ledger on disk records what each run
-created, so Clean up still works after a kernel restart and touches nothing that is not yours.
-Secrets are never prefilled into a field and are scrubbed from every trace and message. On a
-shared service never use **Flush**, **Delete service** or **Generate key**; the notebook
-refuses to.
+```sh
+cp .env.example .env
+```
 
-| | Scope | Expires | Clean up | Never |
+Open `.env`, uncomment the variables for the columns you want to run, and fill them in. Every value comes from [Redis Cloud](https://cloud.redis.io) or from your own Redis.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REDIS_URL` | none | Redis Search and Context Retriever. `redis://default:<password>@<host>:<port>` from the database's Configuration page (public endpoint) and Security page (default user password). `rediss://` on a TLS database |
+| `LANGCACHE_HOST` | none | LangCache. The URL on the service's Connectivity page |
+| `LANGCACHE_CACHE_ID` | none | LangCache. The Cache ID on the same page |
+| `LANGCACHE_API_KEY` | none | LangCache. The API key, shown once when the service is created |
+| `CTX_ADMIN_KEY` | none | Context Retriever. An admin key from the Admin keys page, shown once |
+| `CTX_API_URL` | `https://cloud.redis.io/context-surfaces` | Context Retriever. The admin API base, which the default suits on Redis Cloud |
+| `CTX_MCP_URL` | `https://gcp-us-east4.context-surfaces.redis.io/mcp` | Context Retriever. The MCP address used only if the agent-key listing names none |
+| `MEMORY_API_BASE_URL` | none | Agent Memory. The Endpoint on the service's General settings page, with `https://` |
+| `MEMORY_STORE_ID` | none | Agent Memory. The Store ID on the same page |
+| `MEMORY_API_KEY` | none | Agent Memory. A key from the service's API keys page, shown once |
+
+Context Retriever uses the same `REDIS_URL` as Redis Search and hands that password to the hosted service, so point it at a scratch database.
+
+## Step 3. Start the notebook
+
+```sh
+uv run marimo edit iris_basics.py
+```
+
+Or present it as an app:
+
+```sh
+uv run marimo run iris_basics.py
+```
+
+marimo loads `.env` when the kernel starts, and each configured column connects read-only: Redis answers `PONG`, and each hosted service answers `200`.
+
+<!-- column 0 -->
+
+<!-- column 1 -->
+
+<!-- column 2 -->
+
+<!-- column 3 -->
+
+## Step 8. Clean up
+
+Press the Clean up button at the bottom of each column you used:
+
+- Redis Search: `FT.DROPINDEX` without `DD`, then `UNLINK` on the 36 keys
+- LangCache: `DELETE /entries/{entryId}` for each of the 5 entries this kernel stored
+- Context Retriever: `DELETE` every surface named `cairn-<run>`, which also revokes its agent key, then `UNLINK` on the 20 keys and `FT.DROPINDEX` without `DD` on the indexes the service left under the run prefix
+- Agent Memory: delete this owner's sessions, list its memories, check each `ownerId`, and delete them by id
+
+If you sent session events, press Agent Memory's button again once the store's extraction cadence has passed, 5 minutes by default and configurable from 60 to 600 seconds. Extraction adds memories with ids the service chooses, and this owner-scoped Clean up is what deletes them.
+
+## How it works
+
+Everything the notebook writes carries one run tag, derived from your user and host names, so it reads the same in every kernel on one machine.
+
+| Key | Type | Purpose |
+|---|---|---|
+| `cairn:<run>:help:<id>` | HASH | One help article: `title`, `body`, `category`, `year`, and a 1024-byte `embedding` |
+| `idx:cairn:<run>:help` | Search index | Watches the `cairn:<run>:help:` prefix with `TEXT`, `TAG`, `NUMERIC`, and `VECTOR` fields |
+| `cairn:<run>:customer:<id>`, `product:<sku>`, `order:<id>` | JSON | Written by the Context Retriever service into your database from the key templates you declared |
+| `idx:<surface>:<hash>:<entity>` | Search index | Built by the Context Retriever service, one per entity, dropped with the surface |
+| LangCache `entryId` | Cache entry | Chosen by the service, and the only handle on an entry, because a cache cannot be listed |
+| `cairn-<run>-m<n>` | Long-term memory | Chosen by the notebook, so a second write is an update and Clean up needs no ledger |
+| `cairn-<run>-s<time>` | Session | One conversation, whose owner and namespace come from the first event |
+
+The index that column 0 creates, as Redis receives it:
+
+```
+FT.CREATE idx:cairn:<run>:help ON HASH PREFIX 1 cairn:<run>:help: SCORE 1.0 SCHEMA title TEXT WEIGHT 2.0 body TEXT WEIGHT 1.0 category TAG SEPARATOR , year NUMERIC SORTABLE embedding VECTOR HNSW 6 TYPE FLOAT32 DIM 256 DISTANCE_METRIC COSINE
+```
+
+A LangCache search, `POST /v1/caches/{cacheId}/entries/search`:
+
+```json
+{"prompt": "My rain jacket stopped beading water. How do I fix that?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
+```
+
+A Context Retriever surface, `POST /api/v1/context-surfaces`, with the password masked as the notebook shows it:
+
+```json
+{"name": "cairn-<run>", "description": "Made by the Redis Iris basics notebook. Safe to delete.", "metadata": {"created_by": "iris-basics-notebook", "run": "<run>"}, "data_model": {"title": "Cairn Outfitters", "entity_count": 3, "entities": ["..."]}, "data_source": {"type": "redis", "connection_config": {"addr": "<host>:<port>", "username": "default", "password": "***", "db": 0, "tls_enabled": false, "pool_size": 2, "min_idle_conns": 0}}}
+```
+
+One generated tool, called the way an agent calls it, as a JSON-RPC `tools/call` over MCP:
+
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_customer_by_id", "arguments": {"id": "C001"}}}
+```
+
+Five memories in one Agent Memory write, `POST /v1/stores/{storeId}/long-term-memory`:
+
+```json
+{"memories": [{"id": "cairn-<run>-m1", "text": "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.", "ownerId": "cairn-<run>", "namespace": "iris-basics-notebook", "memoryType": "semantic", "topics": ["food", "allergy"]}]}
+```
+
+```mermaid
+flowchart LR
+    N[iris_basics.py] --> RS[Redis Search]
+    N --> LC[Redis LangCache]
+    N --> CR[Redis Context Retriever]
+    N --> AM[Redis Agent Memory]
+    RS -->|"FT.CREATE, HSET, FT.SEARCH, FT.HYBRID"| R[(Your Redis)]
+    LC -->|"POST /entries, POST /entries/search"| LCS[LangCache service]
+    CR -->|"POST /context-surfaces, tools/call"| CRS[Context Retriever service]
+    CRS -->|"JSON.SET, FT.CREATE"| R
+    AM -->|"POST /long-term-memory, /search"| AMS[Agent Memory service]
+```
+
+| Column | Scope | Expires | Clean up | Never |
 |---|---|---|---|---|
-| **Redis** (columns 0 and 2) | keys start `irisnb_<run>_`; nothing else is written | keys after 1 h (column 2's after 2 h); indexes do not | unlinks the ledgered keys, drops the ledgered indexes; leftover *indexes* of other runs only after a typed confirmation, and once that run's keys are gone | `FLUSH*`, `CONFIG`, `DD`, a scan-and-delete, a write outside the prefix |
-| **LangCache** | entries found by id in the ledger; tagged `iris-basics-<run>` only if your cache defines a scope attribute | every entry after 15 min (a taught answer 2 min, the expiry test 10 s) | delete by id; a `404` of type `resource-not-found` or `entry/not-found` counts as expired, while a `cache/not-found` or any other `404` is an error and the id stays in the ledger. A cache cannot be listed, so leftovers cannot be found: the expiry is the net | flush, delete by attribute, Generate key |
-| **Context Retriever** | surface `iris-basics-<run>` stamped with the run; key templates under `irisnb_<run>_cr:`; a pool of 2 connections; an agent key | keys and the agent key after 2 h; the surface does not | deletes the surface, unlinks the keys, drops any index the service built and left (every prefix under the run; the service drops its own with the surface); other runs' stamped surfaces older than 2 h after a typed confirmation | `PUT`, Delete service, touching a surface that is not ledgered or confirmed |
-| **Agent Memory** | owner `ib-<run>`, namespace `iris-basics-notebook`, ids `ib-<run>-...`; every session opens with a USER event carrying both | nothing (memories last a year) | deletes the ledgered sessions, then every memory listed under the owner, and none if one has another owner; **Clean up again** catches late extractions; other runs' memories older than 2 h after a typed confirmation | Flush, Delete service, `includeAll`, deleting an id that is neither ledgered nor owner-checked |
+| Redis Search | Keys `cairn:<run>:help:*` and the index `idx:cairn:<run>:help` | Keys after one hour. The index does not | `FT.DROPINDEX` without `DD`, `UNLINK` on 36 keys | `FLUSHALL`, `DD`, a write outside the prefix |
+| LangCache | Entries by `entryId`, held in the kernel | Every entry after 15 minutes (`ttlMillis` 900000) | `DELETE /entries/{entryId}` per id | `/flush`, `DELETE /entries` with a body |
+| Context Retriever | Surface `cairn-<run>`, agent key `cairn-<run>-agent`, 20 keys under `cairn:<run>:` | Keys and the agent key after one hour. The surface does not | `DELETE` the surfaces named `cairn-<run>`, `UNLINK` on 20 keys, drop the indexes they left without `DD` | `DD`, another account's surface |
+| Agent Memory | Owner `cairn-<run>`, namespace `iris-basics-notebook`, memory ids `cairn-<run>-m1` to `m5` | Nothing. Memories last a year | Delete this owner's sessions and memories after checking each `ownerId` | `includeAll`, an id whose owner differs |
 
-Every request to a hosted service also passes one checkpoint that refuses whatever is not tied
-to this run. Redis Cloud cannot give the notebook a narrower Redis user, so on a shared
-database those limits are the notebook's own: use a scratch database.
+A LangCache entry this kernel has forgotten is reached only by its 15-minute TTL. A Context Retriever surface has no TTL and keeps your database password until you delete it.
 
-## What each column shows
+## Troubleshooting
 
-Turn on **Presenter notes** for a *Say / Expect* line under each core cell. The core path of a
-column takes about three minutes; the **Deep dive** switch adds the rest.
+### A column says "not configured"
 
-### 0 · Redis Search
+Verify that `.env` sits next to `pyproject.toml` and that the column's variable names are uncommented, then restart the kernel.
 
-The Redis Query Engine that the other three components are built on, taken apart on a
-36-article help centre for a fictional outdoor retailer, Cairn Outfitters. Needs one Redis
-database with Search (a free 30 MB one is plenty); the embedding model, `potion-base-8M`,
-runs on your machine, so there is no API key.
+### Context Retriever fails to define the model
 
-**Core path:** Test connection (version, `FT.HYBRID` and `SVS-VAMANA` support, key and
-connection counts, leftovers) → Load the help centre (one `FT.CREATE`, 36 `HSET`s, each with a
-one-hour `EXPIRE`) → KNN or a radius → the wow, one query as keyword, vector and hybrid search.
-Also: full-text with prefix and typo switches, a pre-filter by category and year, and a deep
-dive that builds a second index (`FLAT`, `HNSW` or `SVS-VAMANA`) over the same documents.
+Verify that `uv run python --version` reports 3.13 or older. `ContextModel` reads class annotations in a way Python 3.14 defers.
 
-**Talk track.** Keyword search matches words, vector search matches meaning, and each fails
-where the other wins. *Trail shoes feel cramped* shares no word with the boot guide, so
-keyword search returns nothing while the vector search ranks the boot guide first;
-*Trailhead* is a product name, which keyword search finds and the vector search only guesses
-at; a typo returns no keyword hits at all. Hybrid fuses the rankings and has the right article
-first each time, though it is not magic: it rewards an article that both lists rank (try
-*will it fit my feet* under *Type your own*). Then the bridge to column 1: KNN can never say
-"nothing is close enough", only a radius can, and that empty answer is a cache MISS.
+### The hybrid column shows a note
 
-**Clean up** drops the ledgered indexes and unlinks the ledgered keys.
+Verify that the Redis version is 8.4 or later. `FT.HYBRID` does not exist before it, and the cell says so instead of running.
 
-### 1 · LangCache
+### The range query returns nothing for a sensible question
 
-Redis's managed semantic cache for LLM answers, taken apart on gear-care answers for Cairn
-Outfitters. Needs a LangCache service: a host, a Cache ID and an API key. **Use a service of
-your own.** A cache is shared by everything that points at it, and the live Iris demo searches
-its cache with no filter, so anything stored on a shared one can be served to somebody else's
-app until it expires.
+Raise the literal `0.5` radius in the `rs_knn_versus_range` cell. 0.5 is a starting point for this model, not a constant.
 
-**Core path:** Test connection (one search for a made-up prompt; checks the key and Cache ID)
-→ Store the gear-care answers (one `POST .../entries` each, with `ttlMillis`) → Threshold lab
-→ the wow, a chat that asks the cache first. Also: anatomy of a hit, `searchStrategies` (exact,
-semantic, both), and a deep dive on expiry.
+### Agent Memory answers 424
 
-**Talk track.** A cache can only say "close enough", and how close is a dial. The lab is that
-dial: fourteen labelled questions, searched once each, then re-scored on your machine as you
-slide the threshold. Raise it until the red rows (false hits: a wrong answer served) go, and
-watch the amber ones (paraphrases turned away) multiply. That is the bridge from column 0: a
-radius search that could return nothing, with a managed embedder. `exact` is the cheap, safe end
-of the dial; only `semantic` can be wrong. The chat closes the loop with no model in it: a MISS
-is where the LLM would run, so you play the model and *Teach it*; asked again in other words,
-it is a HIT, and the taught entry is deleted straight away. With no scope attribute a red note
-says a taught answer is visible to other apps for 120 s.
+A dependency of the store failed, not zero results. Wait and retry, or check the service's status in the console.
 
-**Clean up** deletes, by id, every entry the ledger names.
+### LangCache answers 401
 
-### 2 · Context Retriever
+Verify the key. A regenerated key invalidates the old one for every app that uses the service.
 
-A data model turned into governed MCP tools, taken apart on Cairn Outfitters: three Python
-classes (`Customer`, `Product`, `Order`) and 20 records. The heaviest setup of the four. Needs
-a Context Retriever **admin key**, and a **Redis database with Search and JSON that the hosted
-service can reach over the internet**, because the service, not this notebook, writes the data
-and builds the indexes. It is therefore given the database's password: use a scratch database.
-"The agent" is a form generated from each tool's own `inputSchema`.
+### A run_button cell went back to "press the button"
 
-**Core path:** change a field's index in the data model (offline, no credentials) → Create the
-surface and load the data (one button that says it sends the database password) → the wow, the
-tool explorer, with **Break it**. Also: Test connection, where the data went (`JSON.GET` and
-`FT.INFO` on your own database), paging and provenance, and a deep dive with the tool catalogue.
+marimo reset it because a cell above re-ran. Press it again.
 
-**Talk track.** An agent never writes a query: it calls the tools a data model makes. The
-prediction names the tools the service served on 2026-09-30 (`filter_customer`,
-`count_customer`, set tools) and says which fields each takes. Set `Order.status` to *not
-indexed* and `status` drops out of what `filter_order` accepts; set `Customer.name` to `tag` and
-`search_customer_by_text` disappears while `filter_customer` accepts `name`. A tag with
-`allowed_values` becomes a fixed menu, and the service enforces it: **Break it** comes back as a
-`-32602` rejection before anything reaches Redis. The records are JSON documents in *your*
-database, which the service wrote and indexed. The tool set depends on your model *and* the
-service's version (an older service names the tools the classic way, such as
-`filter_customer_by_tier`, and the diff shows it); the explorer and the paging cell work for
-both because they are built from each tool's schema, not from a list of names.
+### Clean up cannot find the surface
 
-**Clean up** deletes the surface, unlinks the keys and drops the indexes the service built.
+The create cell did not finish. The surface, if it was created, is named `cairn-<run>` in the console and can be deleted there.
 
-### 3 · Agent Memory
+## FAQ
 
-The hosted Redis Agent Memory service, taken apart on a made-up Cairn customer, Dana. Needs an
-Agent Memory service in Redis Cloud (endpoint, store ID and API key) and no LLM key: the service
-embeds and extracts with Redis's own models unless you brought your own. Every call is plain
-HTTP, shown as the exact JSON sent and received.
+### Do I need Redis Cloud?
 
-**Core path:** Test connection → **Start extraction now** (optional; extraction takes minutes,
-so press it before you present the other columns) → Write long-term memories → Sweep (one
-search at 11 thresholds, because the API returns no score) → the wow, a memory inspector. Also:
-the scope lens (N, 0, 0), and a deep dive on session memory, checking for extracted memories,
-and a read-only look inside the database behind the service.
+No. Column 0 runs on any Redis 8 with Search. The three hosted services, LangCache, Context Retriever, and Agent Memory, run on Redis Cloud.
 
-**Talk track.** Agent memory is two tiers. Short-term memory is the ordered events of the
-conversation in progress. Long-term memory is facts recalled by meaning, across sessions. Send
-*What should the kitchen avoid serving me?*: not one word of it is in the peanut-allergy memory
-(the count says 0), so a keyword index would return nothing; the service gets there by meaning.
-Press **New session** and send it again: the events reset and the memory does not. Then the
-lens: a similarity threshold is a cut, this API will not say how close a match is, so the
-sweep works it out (the slider starts at 0.3, where the allergy memory stays and the rest go)
-and **Re-query live** tests the assumption. The scope lens is why every call
-carries an owner and a namespace on a store others share. Last, extraction: the service also
-writes memories from your sessions on its own, minutes later, with ids it chose.
+### Does the notebook call an LLM?
 
-**Clean up** deletes the sessions and every memory under the run's owner; **Clean up again**,
-about ten minutes later, catches what extraction added since.
+No. The embedding model runs on your machine, and the hosted services embed on their side.
 
-## Verified live on 2026-09-30
+### What does the notebook leave behind if I close the laptop?
 
-`verify.py --live` ran the whole notebook (AUTORUN demo, then cleanup) against real services: a
-Redis Cloud database on Redis 8.6.2, LangCache, Context Retriever and Agent Memory. The first run
-found the problems listed below; after the fixes a second run passed all 28 of its steps. What
-the runs showed, with the numbers:
+Redis keys and the agent key expire in an hour, and LangCache entries in 15 minutes. A Context Retriever surface and Agent Memory records do not expire, so press Clean up. The run tag is the same every time you open the notebook on this machine, so Clean up in a fresh kernel still finds the surface and the memories. LangCache is the exception: entries cannot be listed, so the 15-minute `ttlMillis` is the net.
 
-- **Redis Search.** Redis 8.6.2 with Search; `FT.HYBRID` (8.4+) and `SVS-VAMANA` (8.2+) both
-  available. 36 hashes indexed (256 dimensions, `COSINE`, `HNSW`). *Trail shoes feel cramped*:
-  `BM25STD` returned no row, the vector search ranked the boot guide #1 of 10, and `FT.HYBRID`
-  with `RRF` kept it #1. Redis words a missing index `SEARCH_INDEX_NOT_FOUND Index not found:
-  <name>` (seen on `FT.INFO` and `FT.DROPINDEX`), not `Unknown index name`.
-- **LangCache.** A per-request `similarityThreshold` of 0.50 was honoured under the cache's 0.85
-  default: the least similar entry that came back scored 0.659. `maxResults` 5 returned five
-  entries, best first. The anatomy cell's rain-jacket paraphrase scored 0.896 and the taught
-  entry's paraphrase 0.894; the lab's paraphrases scored 0.812 to 0.949. In the lab the highest
-  false hit scored 0.950, so from 0.96 up there are none, and by then only 1 of the 6
-  paraphrases still hits. `exact` reports a similarity of 1. The taught answer was a HIT at
-  0.894 and was deleted straight after. Another app's entry near the test prompt came back as a
-  score only and stayed hidden. The lab and the strategies table met no rate limit. `DELETE`
-  of an entry that has expired answers `404` with type
-  `/errors/resource-not-found` (the API docs say `/errors/cache/entry/not-found`); both count as
-  expired.
-- **Context Retriever.** This account serves the **unified** tool surface: 21 tools for the
-  three-entity model, `get_`, `list_`, `count_`, `summarize_` and `filter_<entity>`,
-  `search_<entity>_by_text` for the two entities with a text field, and `intersect_results`,
-  `union_results`, `except_results` and `expand_results`. Create answered `201` with the surface
-  in status `provisioning_indices`, the agent-key listing named the MCP address, and 20 records
-  (6 Customer, 6 Product, 8 Order) imported. The service built three indexes, named
-  `idx:<surface id>:<hash>:<entity>`, and **dropped them together with the surface**; the data
-  stays until it is unlinked (20 of 20 keys were). `get_customer_by_id` with `C001` returned the
-  record plus a `_retrieval` stamp (`source`, `retrieved_at`, `source_version`). A `filter_`
-  tool called with no condition answers `isError`: *at least one condition is required*.
-- **Agent Memory.** The store reported healthy. Five memories were written and listed at once.
-  *What should the kitchen avoid serving me?* shares no word with the peanut-allergy memory, and
-  that memory came back **#1 of 3** at `similarityThreshold` 0.0. The reply carries no score.
-  The sweep put that memory in the band 0.3 to 0.4 and the other four in 0.0 to 0.3, so the
-  slider starts at 0.3; at 0.5 nothing comes back, and a live re-query agreed with the table.
-  The scope lens found 5, 0 and 0. A second Clean up, at least 11 minutes after the run's last
-  event (one question in one session; the extraction kick-off was not pressed), found no memory
-  that extraction had made.
-- **Secrets.** The scan found none of the six secrets in any spelling in the HTML exports and the
-  session files.
+### Can I point it at a shared LangCache?
 
-**What it found, now fixed:** the new Redis wording of a missing index stopped the deep dive
-and two cleanups (the notebook now knows both wordings, and an index that is already gone is
-counted apart and never stops a cleanup); Clean up trusted the wrong `404` type for an expired LangCache
-entry; the Context Retriever paging call sent no condition; column 2's prediction used classic
-names, so it now follows the unified ones; and the Agent Memory slider started at a value where
-nothing is returned.
+Yes. Every entry the notebook stores carries a TTL, and the searches hide other apps' entries. A service of your own is better, because anything stored on a shared cache can be served to somebody else's app until it expires.
 
-**Footprint after Clean up (second run):** empty. No key or index under the run's prefix, no new
-index anywhere, nothing live in the ledger, no memory or session for the run's owner, and no
-surface of the run (its id also answers `404` when fetched directly, which does not depend on
-the surface listing, capped at 500). The notebook's own Clean up cells removed everything, so
-`verify.py`'s safety-net sweep had nothing to do. A LangCache entry stored for 5 s was listed,
-then gone after about 6 s, and its delete answered `404`. The first run had left 36 keys of
-column 0 (removed by hand, all under the run's prefix and all carrying a TTL), one expired
-LangCache entry and three indexes the service had already dropped, for the reasons above.
+### Where do the numbers in the copy come from?
 
-**Not exercised live:** the orphan panels and their typed-confirmation deletes; the **Reset**
-buttons; column 3's **Start extraction now**, **Check for extracted memories**, **New session**
-and "under the hood" look, and the second and third question of its inspector; `SVS-VAMANA`
-index creation (the deep dive's second index ran as `FLAT` and found the same nearest article,
-0.369, as `HNSW`), and column 0's wow questions after the first; a LangCache scope attribute, and
-the end of its expiry deep dive (the entry stored for 10 s was gone when it was deleted more than
-11 s later, which is all the run showed); a Context Retriever surface on the classic tool surface,
-two runs on one database, and a restricted Redis user. The list of what the tests can and cannot
-show is in
-[tests/README.md](tests/README.md).
+One live run on 2026-09-30. Yours will differ by model, phrasing, and service version.
 
-## Before the meeting
+## Next steps
 
-- [ ] Settings in ONE place: a `.env` beside `iris_basics.py`, or
-      `$env:IRIS_BASICS_ENV_FILE='C:\path\to\redis-iris-demos\.env'` (PowerShell) /
-      `IRIS_BASICS_ENV_FILE=...` (sh). Not both: the `.env` beside the notebook wins.
-- [ ] `uv run --no-project --python 3.13 verify.py --preflight --env-file <file>` says GO. It
-      warms uv and the ~30 MB model and runs each column's read-only connection test.
-- [ ] Use your own LangCache, Context Retriever and Agent Memory services and a scratch database.
-- [ ] Do NOT run redis-iris-demos `make setup` or `make reset` during or just before the
-      meeting: they flush the shared cache and store you are demoing against.
-- [ ] Launch `uvx marimo@0.25.0 edit --sandbox iris_basics.py`, press **Ctrl+Shift+R**, zoom the
-      browser to 67-75%, press **Test connection** in every column, and leave the tab open.
-- [ ] Turn **Presenter notes** on. No red AUTORUN banner.
-- [ ] Column 3: press **Start extraction now** straight after its Test connection.
-- [ ] Do not restart the kernel or the server mid-session: a new run id cannot clean up the old
-      run, and its surfaces and memories become offered leftovers only after 2 h.
-- [ ] Afterwards: **Clean up** in every column, and **Clean up again** in column 3 about ten
-      minutes later.
-- [ ] Before handing the folder over: delete `__marimo__/` and `.env`.
+- Put a semantic cache in front of a real LLM call: [Semantic caching with Redis LangCache](https://redis.io/tutorials/semantic-caching-with-redis-langcache/)
+- Give a LangGraph agent memory that outlives the session: [Redis Agent Memory with LangGraph](https://redis.io/tutorials/redis-agent-memory-with-langgraph/)
+- Generate governed tools over your own data model: [Redis Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/)
+- Tune a vector index for your own corpus: [Vector search practical guide](https://redis.io/blog/vector-search-practical-guide/)
 
-## Handing it to a customer
+## Additional resources
 
-- Delete `__marimo__/` (it holds outputs, stdout and tracebacks) and `.env`.
-- Send `iris_basics.py`, `.env.example` and this README. Give them their own LangCache,
-  Context Retriever and Agent Memory services rather than yours.
-- They run `uvx marimo@0.25.0 run --sandbox iris_basics.py`, or `edit` to read the code.
+- [Redis Iris context engine](https://redis.io/docs/latest/develop/ai/context-engine/)
+- [Redis Search and query](https://redis.io/docs/latest/develop/ai/search-and-query/)
+- [Redis LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/) and its [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/)
+- [Redis Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/)
+- [Redis Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/) and its [REST quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/rest-api-quickstart/)
+- [redis-ai-resources](https://github.com/redis-developer/redis-ai-resources), the notebook collection
 
-## Tests
+## Verified live
 
-```sh
-uv run --no-project --python 3.13 verify.py
-```
+The facts the copy relies on come from one live run on 2026-09-30 against a Redis Cloud database on Redis 8.6.2 and the three hosted services. Scores vary by model, phrasing, and service version.
 
-Offline and credential-free: `marimo check --strict`, the pytest suite in `tests/`, and a
-headless `marimo export html` that must exit 0. `verify.py --preflight --env-file <file>` is
-the go / no-go before a meeting (above). What the tests prove, what only a live run can show,
-and how `verify.py --live` and the test hooks work is in [tests/README.md](tests/README.md).
+- Redis Search: `FT.HYBRID ... LOAD 1 @__key` returned the RESP2 pair-list reply the notebook parses. For *trail shoes feel cramped*, `BM25STD` returned no row, while KNN and hybrid ranked the boot guide first.
+- LangCache: the rain-shell paraphrase scored 0.896. The worst wrong answer in the threshold table scored 0.950. An entry stored with `ttlMillis` expired within about a second of the value, and a `DELETE` on the expired entry answered `404` with type `/errors/resource-not-found`.
+- Context Retriever: the account served the unified tool surface, 21 tools for three entities. `get_customer_by_id` with `{"id": "C001"}` returned the record plus a `_retrieval` stamp, and `filter_customer` with no condition answered `isError` with *at least one condition is required*.
+- Agent Memory: the search reply carried no score. The allergy memory came back first for *What should the kitchen avoid serving me?* with 0 words in common.
+
+The schema-violation reply, the cache-aside hit score, and the `Accept`-less MCP session under niquests are recorded here after the first live run of this notebook.
