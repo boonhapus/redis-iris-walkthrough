@@ -6,7 +6,7 @@ readme = "README.md"
 # <3.14: redis-context-retriever 0.0.6's ContextModel metaclass reads namespace["__annotations__"],
 #        which Python 3.14's deferred annotations (PEP 649) leave empty inside marimo cells
 #        (PydanticUserError "Field 'customer_id' requires a type annotation"; checked 2026-09-30 on 3.14.6).
-# >=3.12: numpy 2.5.3 needs Python 3.12 (redis-context-retriever itself needs 3.11).
+# >=3.12: one numpy pin and no marker split (plan R3.2); redis-context-retriever itself needs 3.11.
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "marimo==0.25.0",

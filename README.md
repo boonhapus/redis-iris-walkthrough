@@ -2,7 +2,7 @@
 
 > **TL;DR:** Redis Iris is the real-time context engine for agents: Redis Search underneath, with LangCache, Context Retriever, and Agent Memory as hosted services on Redis Cloud. In this tutorial, you will run a notebook that lets you index, cache, retrieve, and remember with the four Redis services behind an agent's context.
 
-> **Note:** This tutorial uses the code from the following git repository: <!-- repository URL -->
+> **Note:** This tutorial uses the code from the following git repository: <repository URL>
 
 When your agent needs context, you need a search index, a semantic cache, governed access to your data, and a memory that outlives the session. Redis gives you all four in one data layer, and this notebook shows the exact command or request behind each.
 
@@ -33,7 +33,7 @@ A column whose credentials you do not have says "not configured" and stops, so y
 ## Step 1. Clone the repository
 
 ```sh
-git clone <!-- repository URL --> redis-iris-basics
+git clone <repository URL> redis-iris-basics
 cd redis-iris-basics
 ```
 

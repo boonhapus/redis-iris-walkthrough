@@ -2,8 +2,9 @@
 budget rules from the plan.
 
 The file under test is iris_basics.py unless IRIS_BASICS_NOTEBOOK names another file (a column
-builder's assembled preview). The three budget and layout tests apply to the assembled notebook
-only, so they skip while the file still carries a `# @@ COLUMN` marker or the variable is set.
+builder's assembled preview). The two budget tests apply to the assembled notebook only, so they
+skip while the file still carries a `# @@ COLUMN` marker. The layout test runs everywhere: the
+scaffold and every builder preview carry the four title cells with column= in order.
 """
 
 import ast
@@ -41,12 +42,12 @@ CONFIGURE_CELLS = {
 
 SETUP_NAMES = {"RUN_TAG", "KEY_PREFIX", "KEY_TTL_SECONDS", "MASKED_HEADERS", "call_service", "connect_redis"}
 
-NOT_ASSEMBLED = "# @@ COLUMN" in SOURCE or "IRIS_BASICS_NOTEBOOK" in os.environ
+NOT_ASSEMBLED = "# @@ COLUMN" in SOURCE
 assembled_only = pytest.mark.skipif(
     NOT_ASSEMBLED,
     reason=(
-        "budget and layout rules apply to the assembled iris_basics.py only: the file under test "
-        "still carries a '# @@ COLUMN' marker or IRIS_BASICS_NOTEBOOK is set"
+        "budget rules apply to the assembled iris_basics.py only: the file under test "
+        "still carries a '# @@ COLUMN' marker"
     ),
 )
 
@@ -97,7 +98,6 @@ def test_marimo_check_strict():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@assembled_only
 def test_columns_are_complete_and_contiguous():
     decorators = re.findall(r"^@app\.cell\((.*)\)\s*$", SOURCE, flags=re.M)
     assert decorators, "no @app.cell decorator found"

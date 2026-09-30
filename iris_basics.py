@@ -89,7 +89,7 @@ def intro():
     | Redis Context Retriever | Turn three Python classes into MCP tools an agent calls over your Redis |
     | Redis Agent Memory | Recall a customer fact with no word in common with the question |
 
-    **Configuration.** Copy `.env.example` to `.env` next to `pyproject.toml`, and marimo loads it
+    **Configuration.** Copy `.env.example` to `.env` next to `pyproject.toml`. marimo loads it
     when the kernel starts. A column whose variables are missing says so and stops.
 
     **Safety.** Everything this kernel writes carries the run tag `{RUN_TAG}`: Redis keys under

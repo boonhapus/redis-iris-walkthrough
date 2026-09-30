@@ -41,7 +41,8 @@ button to press, literal output), in the voice guide's tutorial register
   No fragment imports a name another column owns. Every column other than 0 reaches redis-py
   exceptions as `redis.ResponseError` and `redis.RedisError` through the setup's `redis` module,
   and no column re-imports anything the setup block already provides (`json`, `os`, `re`, `sys`,
-  `time`, `uuid`, `datetime`, `timedelta`, `timezone`, `mo`, `niquests`, `np`, `redis`).
+  `time`, `hashlib`, `getpass`, `platform`, `datetime`, `timedelta`, `timezone`, `mo`, `niquests`,
+  `np`, `redis`). Section 17 lists `uuid` here; R3.1 removed it from the setup block.
   `tests/test_safety.py::test_import_ownership` enforces all of this.
 - The fragment reads only setup names (section 4), `cairn.*`, `redis_cli`, `shared_stems`,
   `EMBEDDING_MODEL_NAME`, `embed_texts`, `load_embedding_model`, and its own column's globals. It
@@ -49,17 +50,17 @@ button to press, literal output), in the voice guide's tutorial register
 - Every `mo.md` string in the fragment passes `tests/test_voice.py`: lead-ins of at most two
   sentences of at most 25 words, colon-terminated; no semicolon; serial commas; lowercase "hit"
   and "miss" in prose.
-- The builder checks the fragment by running `uv run python .agents/fragments/assemble.py`
+- ~~The builder checks the fragment by running `uv run python .agents/fragments/assemble.py`
   (which inserts whatever fragments exist and leaves the other markers in place), then
   `uv run marimo check --strict iris_basics.py` and `uv run pytest`. `git checkout iris_basics.py`
-  afterwards; the builder commits only the fragment and its README piece.
+  afterwards.~~ (void: R3.3 replaces this with the `--output` procedure below; a builder never
+  writes `iris_basics.py`.) The builder commits only the fragment and its README piece.
 - A builder never edits the scaffold, `src/`, `tests/` or another fragment. A needed change there
   is a note in the fragment's commit message for the assembly step.
 
-Two corrections from Revision 3: the setup block no longer imports `uuid` (R3.1 derives
-`RUN_TAG` from `hashlib`, `getpass`, and `platform`, which are setup names too and are not
-re-imported), and the check bullet above is replaced by the R3.3 procedure below. Builders never
-write `iris_basics.py`.
+Both strikes come from Revision 3: R3.1 derives `RUN_TAG` from `hashlib`, `getpass`, and
+`platform` instead of `uuid`, and R3.3 replaces the in-place check with the procedure below.
+Builders never write `iris_basics.py`.
 
 ## How a builder checks a fragment (Revision 3, R3.3, verbatim)
 
@@ -77,6 +78,13 @@ the `cr_data_model` and `cr_record_keys` assertions run only when the file under
 `def cr_data_model`; the not-configured assertions apply to whichever configure cells the file
 contains. `.gitignore` gains `.agents/fragments/preview_*.py`. The rule "`git checkout
 iris_basics.py` afterwards" in section 17 is void: a builder has no reason to touch the notebook.
+
+## For the assembly step (plan section 17, step 2.3)
+
+Besides pasting the four `readme_columnN.md` pieces over the `<!-- column N -->` markers, fill
+the two `<repository URL>` placeholders in `README.md` (the Note under the TL;DR and the
+`git clone` line in Step 1) with the real remote. The scaffold has no remote configured, so they
+ship as visible placeholders until then.
 
 ## The concatenation rule in one sentence
 
