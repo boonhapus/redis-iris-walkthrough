@@ -1214,7 +1214,7 @@ Runs with `uv run pytest`. Credentials are absent by construction: `app.run()` d
 - no `mo.ui.text(kind="password")`, no `mo.ui.chat`, no `mo.state`, no `mo.ui.form`;
 - `test_no_secret_read_bound_to_a_global`: for every `ast.Assign` whose `value` node is itself a `Subscript` or `Call` on `os.environ` (`os.environ[...]`, `os.environ.get(...)`), every target name starts with `_`, except when the string constant read is `CTX_API_URL` or `CTX_MCP_URL` (the two non-secret reads). An `os.environ` read nested inside a larger expression (`connect_redis(os.environ["REDIS_URL"])`, an f-string in `niquests.Session(base_url=...)`) is not an `Assign` value and does not fire;
 - no `retries=` keyword anywhere; every `niquests.Session(` call passes `disable_http3=True` and a `"Content-Type": "application/json"` header;
-- `test_mcp_session_sends_no_accept_header`: the `niquests.Session(` call assigned to `cr_mcp_service` has no `"Accept"` key in its `headers` dict (the live-verified shape, section 10 cell 5);
+- `test_mcp_session_sends_the_verified_accept_header`: the `niquests.Session(` call assigned to `cr_mcp_service` carries `"Accept": "*/*"` in its `headers` dict (the value httpx sent live; `niquests.Session(headers=)` replaces the default header set, so without the key niquests sends no `Accept` at all; section 18 row 6, review round 1);
 - `test_create_reply_is_never_rendered`: in the cell function named `cr_create`, every `mo.json(` call's first argument is the `Name` `cr_create_wire`, and no name bound from the `call_service(..., "POST", "/context-surfaces", ...)` tuple is a global (every target starts with `_`) or the cell's last expression;
 - `test_import_ownership`: the bare names `NumericField`, `TagField`, `TextField`, `VectorField`, `IndexDefinition`, `IndexType`, `Query`, `ResponseError` are imported only inside `column=0` cells; `unquote`, `urlsplit`, `Any`, `ContextField`, `ContextModel`, `ContextRelationship`, `export_data_model` only inside `column=2` cells; no other `ast.Import`/`ast.ImportFrom` appears in any column cell (section 17);
 - no `print(`.
@@ -1553,6 +1553,7 @@ may not). Each item names the fallback if it fails.
 | 12 | 3 | After the session cell, wait past the cadence and press Clean up again; the owner-only listing finds and deletes any extracted memories | if extracted memories carry no `ownerId` match, note it in section 20 and the README |
 | 13 | 2 | The reply shape of `DELETE /context-surfaces/{id}`: which of 200/204 arrives and whether a 200 body echoes the resource (`cr_cleanup` shows the status alone on a gone reply, review round 1) | none needed; record the shape in the Context Retriever brief 2.6 |
 | 14 | 2 | The sort order of `GET /context-surfaces` (oldest or newest first) against the 20-page cap in `cr_cleanup`; the summary says so when `has_next` is still true | raise the cap, or delete the leftover `cairn-<run>` surface in the console |
+| 15 | 3 | Press Write twice in one kernel and record the status and body of the second reply (Agent Memory brief 2.2: re-creating an existing id is UNVERIFIED, upsert or per-item error; R3.1 makes the second press likely, since the ids are stable per machine) | if it is a per-item error, `am_write` needs a branch that reads it as "already written" instead of rendering the `errors` callout |
 
 ## 19. Rules for the builders
 
@@ -1574,8 +1575,9 @@ may not). Each item names the fallback if it fails.
    never rendered: on a non-2xx, only the status and the cut `type`, `title`, `detail` strings,
    after checking the password is absent from the serialized body (section 10 cell 5).
 5. No `retries=` on any session; `disable_http3=True` and `"Content-Type": "application/json"` on
-   every session; `"Accept": "application/json"` on the three REST sessions and no `Accept` on
-   `cr_mcp_service`; timeouts `(5, 30)`, or `(5, 60)` for the admin API.
+   every session; `"Accept": "application/json"` on the three REST sessions and `"Accept": "*/*"`
+   on `cr_mcp_service` (the value httpx sent live; niquests sends none unless set); timeouts
+   `(5, 30)`, or `(5, 60)` for the admin API.
 6. Show the wire with `redis_cli(argv)` rebuilt from redis-py, or with `call_service`'s `wire` in
    `mo.json`; never `print`, never `repr(session)`.
 7. Only two functions may be defined in column cells: `lc_own_hits` and `cr_data_source`. Every

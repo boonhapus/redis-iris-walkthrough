@@ -17,6 +17,13 @@ When your agent needs context, you need a search index, a semantic cache, govern
 
 One marimo notebook, `iris_basics.py`, with four columns, one per component, and one `.env` that configures them. Each column connects read-only on load and writes only when you press a button whose label says what it writes. Each ends with a Clean up button that deletes only what that column wrote.
 
+Each column has one job:
+
+- Redis Search: answer a question over 36 help articles by keyword, by meaning, and by both
+- Redis LangCache: return a stored answer for a question asked in other words
+- Redis Context Retriever: turn three Python classes into MCP tools an agent calls over your Redis
+- Redis Agent Memory: recall a customer fact with no word in common with the question
+
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/)
@@ -96,7 +103,7 @@ The cells below it run as soon as the load finishes:
 
 1. `FT.SEARCH ... "hiking boots" SCORER BM25STD WITHSCORES` returns the match count and the top five rows with their scores. A title match counts double because `title` has weight 2.
 2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. Ask *best pizza near me*: in a live run on 2026-09-30 the range returned 0 articles, which the cell marks as a miss.
-3. The pre-filtered query `(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 ...]` returns five rows that all match the filter, above the same `KNN 5` over every article.
+3. The pre-filtered query `(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 ...]` returns five rows that all match the filter, below the same `KNN 5` over every article.
 4. Choose a question under **Question**. The table shows the rank each engine gave every article, with the article that answers it starred. In a live run on 2026-09-30, `BM25STD` ranked nothing for *trail shoes feel cramped*, the vector search ranked the boot guide first, and `FT.HYBRID` kept it first.
 
 Every key expires after one hour. Step 8 removes them sooner.
@@ -113,7 +120,7 @@ The next cell searches for *My rain jacket stopped beading water. How do I fix t
 
 LangCache answers `200` with the rain-shell entry in `data`, its stored answer, and its `similarity`, 0.896 in a live run on 2026-09-30.
 
-Drag the `similarityThreshold` slider. The table re-scores six labelled questions from one search each at 0.50. In that live run, at 0.85 most paraphrases read `HIT`, the synthetic sleeping bag read `WRONG ANSWER`, and the capital of Australia read `MISS`. Above the worst wrong answer, 0.950 in that run, the red rows go, and most paraphrases turn grey.
+Drag the `similarityThreshold` slider. The table re-scores six labelled questions from one search each at 0.50. In that live run, at 0.85 most paraphrases were hits, the synthetic sleeping bag was a wrong answer, and the capital of Australia was a miss. Above the worst wrong answer, 0.950 in that run, the red rows go, and most paraphrases turn grey.
 
 The strategies table sends two spellings of the stored down-bag prompt through `exact` and `semantic`. `exact` reports `similarity` 1 for the all-caps copy and misses the copy without its question mark. In a live run on 2026-09-30, `semantic` did the reverse.
 
@@ -121,7 +128,7 @@ Press **Run the cache-aside loop: miss, store for 10 s, hit, expire, 404**. The 
 
 - `POST /entries/search` for the question: `200` with an empty `data`
 - `POST /entries` with `ttlMillis` 10000: `201` with an `entryId`
-- `POST /entries/search` for the question in other words: `200` with the taught entry and its `similarity`
+- `POST /entries/search` for the question in other words: `200` with the taught entry when the paraphrase clears 0.85 (score recorded under Verified live)
 - the same search after a 12-second wait: `200` with an empty `data`
 - `DELETE /entries/{entryId}`: `404` with type `/errors/resource-not-found` in a live run on 2026-09-30
 
@@ -133,7 +140,7 @@ The service answers `201` with the surface id and a status, `provisioning_indice
 
 The next cell sends one JSON-RPC `tools/list` over MCP, and the service lists every tool it generated from the data model. In a live run on 2026-09-30 that was 21 tools. The cell after it calls `get_customer_by_id` with `{"id": "C001"}`, and the service returns the record for Ada Lovelace with a `_retrieval` stamp naming the surface that served it.
 
-The column then sends two calls an agent should not get away with. For `filter_customer` with no condition, the service answered `isError` with `at least one condition is required` in a live run on 2026-09-30. Its answer to a tag condition on the numeric field `lifetime_value` is printed as it arrives.
+The column then sends two calls the schema should refuse. For `filter_customer` with no condition, the service answered `isError` with `at least one condition is required` in a live run on 2026-09-30. Its answer to a tag condition on the numeric field `lifetime_value` is printed as it arrives.
 
 Last, the column reads your own database. `JSON.GET cairn:<run>:customer:C001` returns the document the service wrote, and `FT.INFO` on each index the service built reports `num_docs` 6, 8, and 6 for customer, order, and product.
 
@@ -187,7 +194,7 @@ If you sent session events, press Agent Memory's button again once the store's e
 
 ## How it works
 
-Everything the notebook writes carries one run tag, derived from your user and host names, so it reads the same in every kernel on one machine.
+Everything the notebook writes carries one run tag, derived from your user and host names. It reads the same in every kernel on one machine.
 
 | Key | Type | Purpose |
 |---|---|---|
@@ -196,7 +203,7 @@ Everything the notebook writes carries one run tag, derived from your user and h
 | `cairn:<run>:customer:<id>`, `product:<sku>`, `order:<id>` | JSON | Written by the Context Retriever service into your database from the key templates you declared |
 | `idx:<surface>:<hash>:<entity>` | Search index | Built by the Context Retriever service, one per entity, dropped with the surface |
 | LangCache `entryId` | Cache entry | Chosen by the service, and the only handle on an entry, because a cache cannot be listed |
-| `cairn-<run>-m<n>` | Long-term memory | Chosen by the notebook, so a second write is an update and Clean up needs no ledger |
+| `cairn-<run>-m<n>` | Long-term memory | Chosen by the notebook, so Clean up needs no ledger and a second write is meant to update |
 | `cairn-<run>-s<time>` | Session | One conversation, whose owner and namespace come from the first event |
 
 The index that the Redis Search column creates, as Redis receives it:
@@ -303,7 +310,7 @@ No. The embedding model runs on your machine, and the hosted services embed on t
 
 Redis keys and the agent key expire in an hour, and LangCache entries in 15 minutes. A Context Retriever surface never expires and Agent Memory long-term records last a year by default, so press Clean up. The run tag is the same every time you open the notebook on this machine, so Clean up in a fresh kernel still finds the surface and the memories. LangCache is the exception: entries cannot be listed, so the 15-minute `ttlMillis` is the net.
 
-### Can I point it at a shared LangCache?
+### Can I point it at a shared Redis LangCache service?
 
 Yes. Every entry the notebook stores carries a TTL, and the searches hide other apps' entries. A service of your own is better, because anything stored on a shared cache can be served to somebody else's app until it expires.
 
@@ -329,7 +336,7 @@ One live run on 2026-09-30. Yours will differ by model, phrasing, and service ve
 
 ## Verified live
 
-The facts the copy relies on come from one live run on 2026-09-30 against a Redis Cloud database on Redis 8.6.2 and the three hosted services. Scores vary by model, phrasing, and service version.
+The facts here come from one live run on 2026-09-30 against a Redis Cloud database on Redis 8.6.2 and the three hosted services. Scores vary by model, phrasing, and service version.
 
 - Redis Search: `FT.HYBRID ... LOAD 1 @__key` returned the RESP2 pair-list reply the notebook parses. For *trail shoes feel cramped*, `BM25STD` returned no row, while KNN and hybrid ranked the boot guide first.
 - LangCache: the rain-shell paraphrase scored 0.896. The worst wrong answer in the threshold table scored 0.950. An entry stored with `ttlMillis` expired within about a second of the value, and a `DELETE` on the expired entry answered `404` with type `/errors/resource-not-found`.

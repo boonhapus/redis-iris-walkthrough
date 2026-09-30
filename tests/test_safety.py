@@ -115,6 +115,10 @@ def test_no_dd_and_no_delete_documents():
         for keyword in call.keywords:
             if keyword.arg == "delete_documents":
                 assert not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True)
+        if _dotted(call.func).split(".")[-1] == "dropindex":   # redis-py also takes delete_documents positionally
+            assert not any(isinstance(argument, ast.Constant) and argument.value is True for argument in call.args), (
+                "dropindex(True) deletes the documents too"
+            )
 
 
 def test_key_templates_start_with_prefix():
