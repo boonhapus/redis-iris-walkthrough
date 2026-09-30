@@ -1,10 +1,25 @@
-# Secrets and per-machine state
+# Secrets and per-machine settings (marimo loads .env from this folder)
 .env
-__marimo__/
-__pycache__/
-*.html
-.agents/build/
+.env.*
+!.env.example
 
-# Local tooling
+# uv-managed environment and Python caches
 .venv/
+__pycache__/
 .pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# marimo's per-notebook session cache and HTML exports
+__marimo__/
+*.html
+
+# Build-time previews a column builder assembles for itself
+.agents/fragments/preview_*.py
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

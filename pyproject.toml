@@ -1,0 +1,52 @@
+[project]
+name = "redis-iris-basics"
+version = "0.2.0"
+description = "Redis Iris basics: one marimo notebook that takes Redis Search, LangCache, Context Retriever, and Agent Memory apart on Cairn Outfitters sample data."
+readme = "README.md"
+# <3.14: redis-context-retriever 0.0.6's ContextModel metaclass reads namespace["__annotations__"],
+#        which Python 3.14's deferred annotations (PEP 649) leave empty inside marimo cells
+#        (PydanticUserError "Field 'customer_id' requires a type annotation"; checked 2026-09-30 on 3.14.6).
+# >=3.12: numpy 2.5.3 needs Python 3.12 (redis-context-retriever itself needs 3.11).
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "marimo==0.25.0",
+  "redis==8.1.0",
+  "niquests==3.21.2",
+  "redis-context-retriever==0.0.6",  # import name: context_surfaces; pulls httpx, fastmcp, pydantic, keyring
+  "model2vec==0.9.0",
+  "numpy==2.5.3",
+  # tokenizers (pulled in by model2vec) caps huggingface-hub at <2.0; 1.33.0 is the last 1.x (2026-09-24).
+  "huggingface-hub==1.33.0",
+  # marimo parses .env with python-dotenv when it is installed; its fallback parser keeps an
+  # inline "# comment" as part of the value.
+  "python-dotenv==1.2.3",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The distribution is redis-iris-basics; the importable package is cairn_support.
+module-name = "cairn_support"
+
+[tool.marimo.runtime]
+# The default is already [".env"]; stating it documents where configuration comes from and
+# makes the editor's Secrets panel write new keys to this file.
+dotenv = [".env"]
+# Pick up edits to src/cairn_support without restarting the kernel.
+auto_reload = "lazy"
+
+[tool.marimo.package_management]
+manager = "uv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+  # redis-context-retriever 0.0.6's own models emit about 14 of these on import.
+  "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+]
