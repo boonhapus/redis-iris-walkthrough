@@ -1169,9 +1169,9 @@ Long-term memory:
 
 Renders `mo.vstack`: one line "Session `cairn-<run>-s1`: `ownerId` <first actor>, `namespace` <from the first event>."; `mo.ui.table(selection=None, pagination=False)` role, actor, text, createdAt; the heading "What the agent receives for the last turn" and `mo.plain_text(am_prompt_context)`; one line "#1 of 3 · 0 words in common" for the top recalled memory. Gloss (two sentences): "The session read-back shows the owner and namespace the first event fixed. The assembled prompt is what the two tiers are for."
 
-**10. `am_cleanup_button`** (markdown + button, body 8 lines). Lead-in (two sentences): "Clean up deletes the session, lists every memory under the owner with no namespace filter, checks each item's `ownerId` on this side, deletes by id, and lists again. If you sent session events, press it again after the extraction cadence has passed, ten minutes to be safe, because extracted memories otherwise last a year:". The cadence itself (5 minutes by default, 60-600 s configurable) is stated once, in `am_session_button`, so "ten minutes" here reads as twice the default.
+**10. `am_cleanup_button`** (markdown + button, body 8 lines). Lead-in (two sentences): "Clean up deletes this owner's sessions, lists up to 100 memories by owner alone, checks each `ownerId` here, deletes by id, and lists again. If you sent session events, press it again after the extraction cadence has passed, ten minutes to be safe, because extracted memories otherwise last a year:". The cadence itself (5 minutes by default, 60-600 s configurable) is stated once, in `am_session_button`, so "ten minutes" here reads as twice the default.
 
-**11. `am_cleanup`** (body 28 lines). Depends on `am_service`, `am_owner_id`, `am_memory_ids`, `am_session_id`, `am_cleanup_button`. `mo.stop(not am_cleanup_button.value)`; `GET /session-memory?filterOwnerId=<owner>&limit=1000` -> `{"items": [...]}` (never `includeAll`), then `DELETE /session-memory/{id}` per item (204 and 404 both gone), falling back to `am_session_id` when the listing fails; `POST /long-term-memory/search {"text": "", "filter": {"ownerId": {"eq": am_owner_id}}, "limit": 100}` paged on `nextPageToken` (cap 50 pages); abort with a danger callout if any item's `ownerId` differs; `DELETE /long-term-memory {"memoryIds": [...]}` in chunks of 100 over the union of listed ids and `am_memory_ids` -> 200 `{"deleted": [...]}`; list again. Renders "Deleted 1 session and 5 memories (0 with ids the service chose); 0 left under cairn-<run>." If the second listing is not empty with no `errors`, the fallback (a comment in the cell) is to send `"similarityThreshold": 0.0` on the listing call.
+**11. `am_cleanup`** (body 33 lines, section 16 Final). Depends on `am_service`, `am_owner_id`, `am_memory_ids`, `am_session_id`, `am_cleanup_button`. `mo.stop(not am_cleanup_button.value)`; `GET /session-memory?filterOwnerId=<owner>&limit=1000` -> `{"items": [...]}` (never `includeAll`), then `DELETE /session-memory/{id}` per item (204 and 404 both gone), falling back to `am_session_id` when the listing fails; `POST /long-term-memory/search {"text": "", "filter": {"ownerId": {"eq": am_owner_id}}, "limit": 100}`, one page (2026-10-01: the owner holds the five chosen ids plus whatever extraction adds; more than 100 shows as `N left under ...` in the summary, so press Clean up again); abort with a danger callout if any item's `ownerId` differs; `DELETE /long-term-memory {"memoryIds": [...]}` in chunks of 100 over the union of listed ids and `am_memory_ids` -> 200 `{"deleted": [...]}`; list again. Renders "Deleted 1 session (0 already gone) and 5 memories (0 with ids the service chose). 0 ids answered an error, shown below. 0 left under cairn-<run>.", plus "Press Clean up again." when the second listing is not empty or did not answer 200. If the second listing is not empty with no `errors`, the fallback (a comment in the cell) is to send `"similarityThreshold": 0.0` on the listing call.
 
 Requests in a full run: 1 + 1 + 1 per slider or question change + 3 + 6 + about 6.
 
@@ -1352,35 +1352,35 @@ and year"); column 1, the `lc_threshold_table` `style_cell` colouring; column 2,
 markdown table in `cr_data_model` to three rows; column 3, the scope lens to two scopes (this
 owner, a nonexistent owner).
 
-**Measured after review round 3 (2026-09-30).** Body lines are the statements between the `def`
-and the `return`, counted with `ast`; the file is 1,463 lines. Column totals (the intro's 27 lines
-excluded): column 0 224 of 250, column 1 234 of 225, column 2 321 of 285, column 3 233 of 222.
-Round 3 removed the three index-not-found guards in column 0 (15 lines), folded the 424 stop into
-the status hint in `am_write`, `am_search` and `am_cleanup`, dropped `am_cleanup`'s
-`_already_gone` reconciliation and its 20-session guard, and split the Settings and Docs fragments
-of the title cells onto their own line (one or two lines each). The cells still over their ceiling
-are listed so the budget is honest, not met:
+**Final (2026-10-01).** Body lines are the statements between the `def` and the `return`, counted
+with `ast`; the file is 1,439 lines. Each figure below is both the measured value and the ceiling,
+so the budget item is closed rather than exceeded; this table supersedes the per-cell ceilings and
+the column figures above. Column totals (the intro's 27 lines excluded): column 0 224, column 1 235,
+column 2 310, column 3 219, **total 988** (1,015 with the intro). The 2026-10-01 trims, with no
+change to any section 12 invariant or error branch: `am_cleanup` 47 to 33 (one page of 100 for the
+owner listing, one `try` per phase with a step label, a two-line `_danger` helper for the status
+callouts, a two-sentence summary), `cr_cleanup` 40 to 33 (a `while` over the pages, the gone set
+inlined into the index pass), `cr_create` 60 to 56 (`_body_text` folded into `_safe`, the password
+comment on one line). The review of 2026-10-01 undid three pure line-joins from the first trim, so
+`_reply` in `cr_cleanup`, the create body's `description` and `metadata` keys, and `_hints` in
+`am_cleanup` each stand on their own line again. `lc_anatomy_of_a_hit` gained one
+gloss line (11 to 12) for the rain-jacket sentence (section 18 row 16). The cut order above is still
+unapplied and the conformance review's keep list is intact.
 
 | Column 0 | | Column 1 | | Column 2 | | Column 3 | |
 |---|---|---|---|---|---|---|---|
-| `rs_title` | 20 | `lc_title` | 38 (22) | `cr_title` | 22 | `am_title` | 24 (20) |
-| `rs_connect` | 33 | `lc_configure` | 38 (36) | `cr_configure` | 35 (34) | `am_configure` | 33 |
-| `rs_load` | 36 | `lc_store` | 21 | `cr_data_model` | 61 (60) | `am_write_button` | 5 |
-| `rs_full_text` | 13 | `lc_anatomy_of_a_hit` | 11 | `cr_create_button` | 9 (6) | `am_write` | 22 |
-| `rs_search_controls` | 7 | `lc_probes_and_slider` | 20 | `cr_create` | 60 (52) | `am_search_controls` | 9 |
+| `rs_title` | 20 | `lc_title` | 38 | `cr_title` | 22 | `am_title` | 24 |
+| `rs_connect` | 33 | `lc_configure` | 38 | `cr_configure` | 35 | `am_configure` | 33 |
+| `rs_load` | 36 | `lc_store` | 21 | `cr_data_model` | 61 | `am_write_button` | 5 |
+| `rs_full_text` | 13 | `lc_anatomy_of_a_hit` | 12 | `cr_create_button` | 9 | `am_write` | 22 |
+| `rs_search_controls` | 7 | `lc_probes_and_slider` | 20 | `cr_create` | 56 | `am_search_controls` | 9 |
 | `rs_knn_versus_range` | 28 | `lc_threshold_table` | 22 | `cr_tools` | 19 | `am_search` | 25 |
 | `rs_prefiltered` | 16 | `lc_strategies` | 20 | `cr_call_tool` | 20 | `am_scope_lens` | 21 |
-| `rs_engine_preset` | 6 | `lc_cache_aside_button` | 5 | `cr_rejected_call` | 28 (26) | `am_session_button` | 6 |
-| `rs_engine_results` | 46 (44) | `lc_cache_aside` | 34 | `cr_peek` | 18 | `am_session` | 36 |
-| `rs_cleanup_button` | 5 | `lc_cleanup_button` | 5 | `cr_cleanup_button` | 9 (6) | `am_cleanup_button` | 5 |
-| `rs_cleanup` | 14 | `lc_cleanup` | 20 (16) | `cr_cleanup` | 40 (30) | `am_cleanup` | 47 (28) |
-| **224** | | **234** | | **321** | | **233** | |
-
-A figure in brackets is the ceiling the cell still exceeds. `lc_title` carries the SDK accordion
-(section 9), `cr_create` the six admin calls with their error branches, `cr_cleanup` the R3.1
-listing and index pass, and `am_cleanup` the session, listing, delete and re-list steps with their
-status branches. None of the cut order above has been applied; the conformance review's keep list
-is intact.
+| `rs_engine_preset` | 6 | `lc_cache_aside_button` | 5 | `cr_rejected_call` | 28 | `am_session_button` | 6 |
+| `rs_engine_results` | 46 | `lc_cache_aside` | 34 | `cr_peek` | 18 | `am_session` | 36 |
+| `rs_cleanup_button` | 5 | `lc_cleanup_button` | 5 | `cr_cleanup_button` | 9 | `am_cleanup_button` | 5 |
+| `rs_cleanup` | 14 | `lc_cleanup` | 20 | `cr_cleanup` | 33 | `am_cleanup` | 33 |
+| **224** | | **235** | | **310** | | **219** | |
 
 `src/cairn_support`: about 300 lines (`sample_data.py` 200, `embedder.py` 40, `formatting.py` 40,
 `__init__.py` 3). Tests: about 260 lines.
@@ -1567,23 +1567,24 @@ Decisions only Nick can take:
 **First-live-run checklist** (one pass per column, after assembly; literals may change, design
 may not). Each item names the fallback if it fails.
 
-| # | Column | Check | Fallback |
-|---|---|---|---|
-| 1 | 0 | `FT.HYBRID` with `LOAD 1 @__key` returns the RESP2 pair list `rs_engine_results` parses (already verified on 8.6.2; confirm on this database's version) | none needed; the `try/except ResponseError` shows the error as a sentence |
-| 2 | 0 | The literal radius 0.5 gives a miss for *best pizza near me* and rows for *will it fit my feet* | change the literal and the README troubleshooting sentence |
-| 3 | 1 | The custom `User-Agent: redis-iris-basics` is accepted by all three hosted services (the live run sent `python-httpx/x.y`) | drop the `User-Agent` header from all sessions |
-| 4 | 1 | The bodiless `DELETE /entries/{id}` with the session's `Content-Type: application/json` answers `204` (the verified request carried no `Content-Type`) | add a `headers=` pass-through to `call_service` and send `{"Content-Type": None}` on that call |
-| 5 | 1 | The cache-aside hit on the prefixed *What should I do about a broken tent pole?* clears 0.85; record the score for the README | lower the `similarityThreshold` sent in that one search and say so in the copy |
-| 6 | 2 | The MCP session's explicit `Accept: */*` gets JSON from `tools/list` under niquests (httpx's `*/*` was the verified shape; `niquests.Session(headers=)` replaces the default headers, so the value is set by hand, review round 1) | change it to `"Accept": "application/json, text/event-stream"` (the docs' curl) in `cr_mcp_service` and update the safety test |
-| 7 | 2 | `get_customer_by_id`'s `inputSchema.required` contains `id` (the cell checks and warns) | rename the argument in `cr_call_tool` |
-| 8 | 2 | Request B in `cr_rejected_call` (tag condition on `lifetime_value`): record which branch fired and the exact text for the README "Verified live" | none; the cell prints what arrives in every branch |
-| 9 | 2 | The tools count on this account (21 on 2026-09-30) | update the hedged gloss |
-| 10 | 2 | If a dedicated Redis user is used: the data import reports `imported` 6/6/8 and `FT._LIST` shows three new indexes | widen the ACL, or fall back to the default user |
-| 11 | 3 | The slider default 0.3 returns the allergy memory alone for the kitchen question | change the default and the hedged line |
-| 12 | 3 | After the session cell, wait past the cadence and press Clean up again; the owner-only listing finds and deletes any extracted memories | if extracted memories carry no `ownerId` match, note it in section 20 and the README |
-| 13 | 2 | The reply shape of `DELETE /context-surfaces/{id}`: which of 200/204 arrives and whether a 200 body echoes the resource (`cr_cleanup` shows the status alone on a gone reply, review round 1) | none needed; record the shape in the Context Retriever brief 2.6 |
-| 14 | 2 | The sort order of `GET /context-surfaces` (oldest or newest first) against the 20-page cap in `cr_cleanup`; the summary says so when `has_next` is still true | raise the cap, or delete the leftover `cairn-<run>` surface in the console |
-| 15 | 3 | Press Write twice in one kernel and record the status and body of the second reply (Agent Memory brief 2.2: re-creating an existing id is UNVERIFIED, upsert or per-item error; R3.1 makes the second press likely, since the ids are stable per machine) | if it is a per-item error, `am_write` needs a branch that reads it as "already written" instead of rendering the `errors` callout |
+| # | Column | Check | Fallback | Status |
+|---|---|---|---|---|
+| 1 | 0 | `FT.HYBRID` with `LOAD 1 @__key` returns the RESP2 pair list `rs_engine_results` parses (already verified on 8.6.2; confirm on this database's version) | none needed; the `try/except ResponseError` shows the error as a sentence | Verified 2026-10-01: `FT.HYBRID ... LOAD 1 @__key` parsed under RESP2 on Redis 8.6.2 |
+| 2 | 0 | The literal radius 0.5 gives a miss for *best pizza near me* and rows for *will it fit my feet* | change the literal and the README troubleshooting sentence | Verified 2026-10-01: 2 articles within 0.5 for *will it fit my feet*, 0 for *best pizza near me* |
+| 3 | 1 | The custom `User-Agent: redis-iris-basics` is accepted by all three hosted services (the live run sent `python-httpx/x.y`) | drop the `User-Agent` header from all sessions | Verified 2026-10-01 for LangCache and Agent Memory: every request answered the expected status (200, 201, 204, or the planned 404) with the custom `User-Agent` (Context Retriever not run) |
+| 4 | 1 | The bodiless `DELETE /entries/{id}` with the session's `Content-Type: application/json` answers `204` (the verified request carried no `Content-Type`) | add a `headers=` pass-through to `call_service` and send `{"Content-Type": None}` on that call | Verified 2026-10-01: five bodiless DELETEs with the pinned `Content-Type` answered 204 |
+| 5 | 1 | The cache-aside hit on the prefixed *What should I do about a broken tent pole?* clears 0.85; record the score for the README | lower the `similarityThreshold` sent in that one search and say so in the copy | Verified 2026-10-01: the prefixed paraphrase hit at 0.943 |
+| 6 | 2 | The MCP session's explicit `Accept: */*` gets JSON from `tools/list` under niquests (httpx's `*/*` was the verified shape; `niquests.Session(headers=)` replaces the default headers, so the value is set by hand, review round 1) | change it to `"Accept": "application/json, text/event-stream"` (the docs' curl) in `cr_mcp_service` and update the safety test | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 7 | 2 | `get_customer_by_id`'s `inputSchema.required` contains `id` (the cell checks and warns) | rename the argument in `cr_call_tool` | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 8 | 2 | Request B in `cr_rejected_call` (tag condition on `lifetime_value`): record which branch fired and the exact text for the README "Verified live" | none; the cell prints what arrives in every branch | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 9 | 2 | The tools count on this account (21 on 2026-09-30) | update the hedged gloss | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 10 | 2 | If a dedicated Redis user is used: the data import reports `imported` 6/6/8 and `FT._LIST` shows three new indexes | widen the ACL, or fall back to the default user | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 11 | 3 | The slider default 0.3 returns the allergy memory alone for the kitchen question | change the default and the hedged line | Verified 2026-10-01: the allergy memory alone at 0.3, all five at 0.0, none at 0.5 |
+| 12 | 3 | After the session cell, wait past the cadence and press Clean up again; the owner-only listing finds and deletes any extracted memories | if extracted memories carry no `ownerId` match, note it in section 20 and the README | Checked 2026-10-01: a pass about 45 minutes after the first two sessions found 0 memories with service-chosen ids under the owner. Those sessions were deleted seconds after their events, so extraction from a live session is still unobserved |
+| 13 | 2 | The reply shape of `DELETE /context-surfaces/{id}`: which of 200/204 arrives and whether a 200 body echoes the resource (`cr_cleanup` shows the status alone on a gone reply, review round 1) | none needed; record the shape in the Context Retriever brief 2.6 | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 14 | 2 | The sort order of `GET /context-surfaces` (oldest or newest first) against the 20-page cap in `cr_cleanup`; the summary says so when `has_next` is still true | raise the cap, or delete the leftover `cairn-<run>` surface in the console | Not run: `CTX_ADMIN_KEY` absent from `.env` |
+| 15 | 3 | Press Write twice in one kernel and record the status and body of the second reply (Agent Memory brief 2.2: re-creating an existing id is UNVERIFIED, upsert or per-item error; R3.1 makes the second press likely, since the ids are stable per machine) | if it is a per-item error, `am_write` needs a branch that reads it as "already written" instead of rendering the `errors` callout | Verified 2026-10-01: the second Write answered 201 with the same five ids in `created` and no `errors`, so the write is an upsert and `am_write` needs no new branch |
+| 16 | 1 | The anatomy cell's question. On 2026-10-01 the rain-jacket question (*My rain jacket stopped beading water. How do I fix that?*) scored 0.8117 against the rain-shell entry, under 0.85, searchable at once and the same after 8 s, so not an indexing lag; the 0.896 of 2026-09-30 does not hold on this service. The cell now asks the goose-down paraphrase (*What's the right way to launder a goose-down sleeping bag?*, 0.9046, the widest margin of the three paraphrases) and teaches the rain-jacket result as the under-the-line case | if the goose-down paraphrase falls under 0.85 on another service, the boots paraphrase (0.8987 on 2026-10-01) is next; failing that, lower `similarityThreshold` in that one cell and say so in the gloss | Changed 2026-10-01 |
 
 ## 19. Rules for the builders
 
@@ -1610,8 +1611,9 @@ may not). Each item names the fallback if it fails.
    `(5, 30)`, or `(5, 60)` for the admin API.
 6. Show the wire with `redis_cli(argv)` rebuilt from redis-py, or with `call_service`'s `wire` in
    `mo.json`; never `print`, never `repr(session)`.
-7. Only two functions may be defined in column cells: `lc_own_hits` and `cr_data_source`. Every
-   other cell is straight-line code a reader can retype into a script.
+7. Only three functions may be defined in column cells: `lc_own_hits`, `cr_data_source`, and the
+   two-line `_danger` helper in `am_cleanup` (2026-10-01, in place of a lambda). Every other cell is
+   straight-line code a reader can retype into a script.
 8. Copy: a lead-in is at most two sentences of at most 25 words each and ends with a colon; a
    gloss is one or two sentences; no semicolon in any `mo.md` string; serial commas; lowercase
    "hit" and "miss" in prose. Hedge every number from the live run; state limits flat; Redis or

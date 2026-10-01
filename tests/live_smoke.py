@@ -2,9 +2,10 @@
 
 Run by hand (the file has no test_ prefix, so pytest never collects it), with the configuration
 in the process environment: Cell.run() and App.run() load no .env, so export the names first or
-prefix the command with them.
+let uv load the file:
 
-    uv run python tests/live_smoke.py
+    uv run --env-file .env python tests/live_smoke.py
+    uv run --env-file .env python tests/live_smoke.py --full
 
 One line per cell: the cell name, the seconds it took, and one of `stopped` (the cell called
 mo.stop), `stopped: an ancestor stopped` (the cell reads a name a stopped cell defines, so the
@@ -12,14 +13,17 @@ notebook would never run it), `error: <ExceptionType>`, `skipped: an ancestor er
 that reads a name an errored cell should have defined; without either guard marimo would re-run
 that ancestor live and misreport the cell), `skipped: unresolved [...]` (a reference no earlier
 cell, button or setup name supplies, which marimo would also satisfy by re-running ancestors; the
-exit code is 1), or the first 120 characters of the output's plain text. Definitions thread from cell to cell in file order, so a cell sees what the cells above it
+exit code is 1), or the first 120 characters of the output's plain text. With `--full` the whole
+output follows each line: the visible text plus the data every marimo element carries (table
+rows, JSON views, callout kinds), so a request as sent, a reply, or a table can be read back.
+Definitions thread from cell to cell in file order, so a cell sees what the cells above it
 defined, and every reference whose name ends in `_button` is replaced with an object whose
 `.value` is True, so every button counts as pressed, Clean up included. A stopped cell's partial
 definitions (the names it assigned before mo.stop) are never threaded on, which is what keeps a
 seed cell from sending requests to a service whose configure cell failed its check. Nothing here
-prints a header, a request body, or an environment value: only the visible text of an output,
-redacted of any configured value as a second guard, then cut to 120 characters. The exit code is
-1 if any cell raised, otherwise 0.
+prints a header or an environment value: credential headers are masked by the notebook before
+they reach any output, and every configured value is redacted from every printed line as a second
+guard. The exit code is 1 if any cell raised, otherwise 0.
 
 Verified on marimo 0.25.0: `Cell.run(**refs)` accepts only names in the cell's references, runs
 the ancestors that define whatever was not passed, injects the setup block's names itself, and
@@ -28,6 +32,7 @@ told apart from an ordinary output through marimo's `by_refs._classify`, which s
 MarimoStopError before the runner swallows it.
 """
 
+import argparse
 import builtins
 import html
 import importlib.util
@@ -49,16 +54,29 @@ CONFIG_NAMES = (
     "MEMORY_API_BASE_URL", "MEMORY_STORE_ID", "MEMORY_API_KEY",
 )
 
+_ATTRIBUTE = re.compile(r"""\sdata-[a-z0-9-]+=(?:'([^']*)'|"([^"]*)")""")
 
-def _plain_text(output):
-    """The visible text of a cell output: tags (and everything inside them) gone, entities decoded."""
+
+def _plain_text(output, full=False):
+    """The visible text of a cell output: tags (and everything inside them) gone, entities decoded.
+
+    With full=True the values of every element's data-* attributes come first, decoded, one per
+    line: marimo keeps a table's rows, a JSON view's data and a callout's kind there, not in text.
+    """
     if output is None:
         return ""
     text = getattr(output, "text", None)
     if not isinstance(text, str):
         text = str(output)
-    text = re.sub(r"<[^>]*>", " ", text)
-    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+    parts = []
+    if full:
+        for single, double in _ATTRIBUTE.findall(text):
+            value = html.unescape(single or double)
+            if len(value) > 2:   # skip '' and the like
+                parts.append(value)
+    visible = re.sub(r"<[^>]*>", " ", text)
+    parts.append(re.sub(r"\s+", " ", html.unescape(visible)).strip())
+    return "\n".join(part for part in parts if part)
 
 
 def _redact(line):
@@ -69,7 +87,11 @@ def _redact(line):
     return line
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--full", action="store_true", help="print each cell's whole output after its line")
+    args = parser.parse_args(argv)
+
     spec = importlib.util.spec_from_file_location("iris_basics_live", NOTEBOOK_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -124,6 +146,7 @@ def main():
             continue
         stops.clear()
         started = time.perf_counter()
+        full_text = ""
         try:
             output, defs = cell.run(**refs)
         except Exception as exc:   # a real error; mo.stop never reaches here
@@ -137,7 +160,11 @@ def main():
             else:
                 definitions.update(defs)
                 status = _redact(_plain_text(output))[:120]
+                if args.full:
+                    full_text = _redact(_plain_text(output, full=True))
         print(_redact(f"{data.name:<22} {time.perf_counter() - started:6.1f}s  {status}"), flush=True)
+        if full_text:
+            print("    " + full_text.replace("\n", "\n    "), flush=True)
     return exit_code
 
 

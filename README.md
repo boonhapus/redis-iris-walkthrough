@@ -2,7 +2,7 @@
 
 > **TL;DR:** Redis Iris is the real-time context engine for agents: Redis Search underneath, then LangCache, Context Retriever, and Agent Memory as hosted services on Redis Cloud. This notebook takes the four apart, one column each, on Cairn Outfitters, a fictional outdoor-gear shop. In this tutorial, you will run a notebook that lets you index, cache, retrieve, and remember with the four Redis components behind an agent's context.
 
-> **Note:** This tutorial uses the code from the following git repository: <repository URL>
+> **Note:** The code for this tutorial is the `redis-iris-basics` folder that holds this README: one notebook, one package, and one `.env`.
 
 When your agent needs context, you need a search index, a semantic cache, governed access to your data, and a memory that outlives the session. Redis gives you all four in one data layer, and this notebook shows the exact command or request behind each.
 
@@ -39,16 +39,14 @@ Each column has one job:
 
 A column whose credentials you do not have says "not configured" and stops, so you can run any subset of the four.
 
-## Step 1. Clone the repository
+## Step 1. Open the folder
 
 ```sh
-git clone <repository URL> redis-iris-basics
 cd redis-iris-basics
 ```
 
-The repository URL is filled in when the repo is published.
-
-`uv` reads `pyproject.toml` and `uv.lock`, so there is nothing else to install by hand.
+If you received the folder as a git repository, clone it first. `uv` reads `pyproject.toml` and
+`uv.lock` on the first `uv run`, so there is nothing else to install by hand.
 
 ## Step 2. Configure the environment
 
@@ -104,9 +102,9 @@ EXPIRE cairn:<run>:help:ship-times 3600
 The cells below it run as soon as the load finishes:
 
 1. `FT.SEARCH ... "hiking boots" SCORER BM25STD WITHSCORES` returns the match count and the top five rows with their scores. A title match counts double because `title` has weight 2.
-2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. Ask *best pizza near me*: in a live run on 2026-09-30 the range returned 0 articles, which the cell marks as a miss.
+2. Type a question under **Ask the help centre**. `KNN 3` returns three rows for any question, and `VECTOR_RANGE` with radius 0.5 returns only the articles within it. In a live run on 2026-10-01 the range returned 2 articles for the default question. Ask *best pizza near me*: it returned 0, which the cell marks as a miss.
 3. The pre-filtered query `(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 ...]` returns five rows that all match the filter, below the same `KNN 5` over every article.
-4. Choose a question under **Question**. The table shows the rank each engine gave every article, with the article that answers it starred. In a live run on 2026-09-30, `BM25STD` ranked nothing for *trail shoes feel cramped*, the vector search ranked the boot guide first, and `FT.HYBRID` kept it first.
+4. Choose a question under **Question**. The table shows the rank each engine gave every article, with the article that answers it starred. In a live run on 2026-10-01, `BM25STD` ranked nothing for *trail shoes feel cramped*, and the vector search and `FT.HYBRID` both ranked the boot guide first.
 
 Every key expires after one hour. Step 8 removes them sooner.
 
@@ -114,25 +112,25 @@ Every key expires after one hour. Step 8 removes them sooner.
 
 In the Redis LangCache column, press **Store 5 gear-care answers with ttlMillis 900000**. LangCache answers `201` with an `entryId` for each of the five prompts, and the table lists the five ids.
 
-The next cell searches for *My rain jacket stopped beading water. How do I fix that?* at `similarityThreshold` 0.85:
+The next cell searches for *What's the right way to launder a goose-down sleeping bag?* at `similarityThreshold` 0.85. The stored prompt is *How do I wash my down sleeping bag?*:
 
 ```json
-{"prompt": "My rain jacket stopped beading water. How do I fix that?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
+{"prompt": "What's the right way to launder a goose-down sleeping bag?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
 ```
 
-LangCache answers `200` with the rain-shell entry in `data`, its stored answer, and its `similarity`, 0.896 in a live run on 2026-09-30.
+LangCache answers `200` with the down-bag entry in `data`, its stored answer, and its `similarity`, 0.905 in a live run on 2026-10-01, although *launder* and *wash* share no word. In the same run LangCache scored *My rain jacket stopped beading water. How do I fix that?* at 0.812 against the rain-shell answer, under the line. Which questions clear the line is what the slider is for.
 
-Drag the `similarityThreshold` slider. The table re-scores six labelled questions from one search each at 0.50. At 0.85 most paraphrases were hits, the synthetic sleeping bag was a wrong answer, and the capital of Australia was a miss. Above the worst wrong answer, 0.950 in that run, the red rows go, and most paraphrases turn grey.
+Drag the `similarityThreshold` slider. The table re-scores six labelled questions from one search each at 0.50. In a live run on 2026-10-01 at 0.85, two paraphrases were hits and the tent paraphrase missed at 0.839. The synthetic sleeping bag was a wrong answer at 0.950, and the negation missed at 0.735. Above 0.95 the red row goes too, and by then every paraphrase is already grey.
 
-The strategies table sends two spellings of the stored down-bag prompt through `exact` and `semantic`. `exact` reports `similarity` 1 for the all-caps copy and misses the copy without its question mark. In a live run on 2026-09-30, `semantic` did the reverse.
+The strategies table sends two spellings of the stored down-bag prompt through `exact` and `semantic`. `exact` reports `similarity` 1 for the all-caps copy and misses the copy without its question mark. In a live run on 2026-10-01, `semantic` did the reverse.
 
 Press **Run the cache-aside loop: miss, store for 10 s, hit, expire, 404**. The table shows five requests:
 
 - `POST /entries/search` for the question: `200` with an empty `data`
 - `POST /entries` with `ttlMillis` 10000: `201` with an `entryId`
-- `POST /entries/search` for the question in other words: `200` with the taught entry when the paraphrase clears 0.85 (the score is added under Verified live after the first live run)
+- `POST /entries/search` for the question in other words: `200` with the taught entry, `similarity` 0.943 in a live run on 2026-10-01
 - the same search after a 12-second wait: `200` with an empty `data`
-- `DELETE /entries/{entryId}`: `404` with type `/errors/resource-not-found` in a live run on 2026-09-30
+- `DELETE /entries/{entryId}`: `404` with type `/errors/resource-not-found` in a live run on 2026-10-01
 
 ## Step 6. Generate tools from a data model
 
@@ -156,7 +154,9 @@ Agent Memory answers `201` with `created` naming the five ids `cairn-<run>-m1` t
 {"memories": [{"id": "cairn-<run>-m1", "text": "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.", "ownerId": "cairn-<run>", "namespace": "iris-basics-notebook", "memoryType": "semantic", "topics": ["food", "allergy"]}]}
 ```
 
-Leave the question at *What should the kitchen avoid serving me?* and the `similarityThreshold` slider at 0.3. Agent Memory should return the allergy memory alone, ranked first with 0 content words in common with the question. Move the slider to 0.0 and it should return all five in rank order, and at 0.5 the cell should read `0 memories at or above 0.5`.
+Press the button again in the same kernel. Agent Memory answers `201` with the same five ids and no `errors`, as it did in a live run on 2026-10-01, so a second press makes no duplicate. Because the ids are yours, Clean up can name them without a ledger.
+
+Leave the question at *What should the kitchen avoid serving me?* and the `similarityThreshold` slider at 0.3. In a live run on 2026-10-01 Agent Memory returned the allergy memory alone, ranked first with 0 content words in common. At 0.0 it returned all five in rank order, and at 0.5 the cell read `0 memories at or above 0.5`.
 
 The reply carries no score. `similarityThreshold` is the only cut, and the request body under the table changes with the slider:
 
@@ -164,7 +164,7 @@ The reply carries no score. `similarityThreshold` is the only cut, and the reque
 {"text": "What should the kitchen avoid serving me?", "filter": {"ownerId": {"eq": "cairn-<run>"}, "namespace": {"eq": "iris-basics-notebook"}}, "filterOp": "all", "similarityThreshold": 0.3, "limit": 5}
 ```
 
-The scope lens below it runs the same question at 0.0 under three filters: this owner in this namespace, an owner that does not exist, and a namespace that does not exist. It should return 5, 0, and 0 memories. More than 5 in the first row means extraction has already added memories under this owner, which Clean up removes.
+The scope lens below it runs the same question at 0.0 under three filters: this owner in this namespace, an owner that does not exist, and a namespace that does not exist. In a live run on 2026-10-01 it returned 5, 0, and 0 memories. More than 5 in the first row means extraction has already added memories under this owner, which Clean up removes.
 
 Press **Send 4 session events and assemble the prompt**. Agent Memory answers `201` for each event, and the session read-back shows `ownerId` `cairn-<run>` and `namespace` `iris-basics-notebook`, both taken from the first event. The cell prints the prompt an agent would receive for the last turn:
 
@@ -181,7 +181,7 @@ Long-term memory:
 - ...
 ```
 
-Under it, the top memory should read `#1 of 3 · 0 content words in common`.
+Under it, the top memory read `#1 of 3 · 0 content words in common` in a live run on 2026-10-01.
 
 ## Step 8. Clean up
 
@@ -217,7 +217,7 @@ FT.CREATE idx:cairn:<run>:help ON HASH PREFIX 1 cairn:<run>:help: SCORE 1.0 SCHE
 A LangCache search, `POST /v1/caches/{cacheId}/entries/search`:
 
 ```json
-{"prompt": "My rain jacket stopped beading water. How do I fix that?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
+{"prompt": "What's the right way to launder a goose-down sleeping bag?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
 ```
 
 A Context Retriever surface, `POST /api/v1/context-surfaces`, with the password masked as the notebook shows it:
@@ -339,7 +339,7 @@ Yes. Every entry the notebook stores carries a TTL, and the searches hide other 
 
 ### Where do the numbers in the copy come from?
 
-One live run on 2026-09-30. Yours will differ by model, phrasing, and service version.
+Live passes of this notebook on 2026-10-01 for Redis Search, LangCache, and Agent Memory, and one live run on 2026-09-30 for Context Retriever. Yours will differ by model, phrasing, and service version.
 
 ## Next steps
 
@@ -359,11 +359,32 @@ One live run on 2026-09-30. Yours will differ by model, phrasing, and service ve
 
 ## Verified live
 
-The facts here come from one live run on 2026-09-30 against a Redis Cloud database on Redis 8.6.2 and the three hosted services. Scores vary by model, phrasing, and service version.
+The Redis Search, LangCache, and Agent Memory facts come from two live passes of this notebook on 2026-10-01, on Redis Cloud (Redis 8.6.2). The Context Retriever facts come from one live run of an earlier notebook on 2026-09-30. Scores vary by model, phrasing, and service version.
 
-- Redis Search: `FT.HYBRID ... LOAD 1 @__key` returned the RESP2 pair-list reply the notebook parses. For *trail shoes feel cramped*, `BM25STD` returned no row, while KNN and hybrid ranked the boot guide first.
-- LangCache: the rain-shell paraphrase scored 0.896. The worst wrong answer in the threshold table scored 0.950. An entry stored with `ttlMillis` expired within about a second of the value, and a `DELETE` on the expired entry answered `404` with type `/errors/resource-not-found`.
-- Context Retriever: the surface listed 21 tools for three entities. `get_customer_by_id` with `{"id": "C001"}` returned the record plus a `_retrieval` stamp, and `filter_customer` with no condition answered `isError` with *at least one condition is required*.
-- Agent Memory: the search reply carried no score. The allergy memory came back first for *What should the kitchen avoid serving me?* with 0 words in common.
+2026-10-01, Redis Search:
 
-The schema-violation reply, the cache-aside hit score, and the MCP session's explicit `Accept: */*` under niquests are recorded here after the first live run of this notebook.
+- `FT.HYBRID ... LOAD 1 @__key` returned the RESP2 pair list the notebook parses. For *trail shoes feel cramped*, `BM25STD` ranked nothing, and the vector search and the hybrid both ranked *Finding your boot size* first.
+- `VECTOR_RANGE` at radius 0.5 returned 2 articles for *will it fit my feet* and 0 for *best pizza near me*.
+- Clean up dropped 1 index and unlinked 36 of 36 keys.
+
+2026-10-01, LangCache:
+
+- Every request answered the status the cell expected, including the planned `404`, so the custom `User-Agent` and the pinned `Content-Type` are accepted. Five stores took 0.38 s.
+- LangCache scored the goose-down paraphrase at 0.905 against the down-bag entry. It scored the rain-jacket question at 0.812 against the rain-shell entry, under 0.85, and the same after 8 s, so it is not an indexing lag.
+- Probe scores at 0.50: tent paraphrase 0.839, boots paraphrase 0.899, synthetic bag 0.950 against the down-bag entry, negation 0.735, and no own hit for the capital of Australia.
+- *HOW DO I WASH MY DOWN SLEEPING BAG?* hit under `exact` and missed under `semantic`. The copy without its question mark did the reverse.
+- Cache-aside: step 3 hit at 0.943, step 4 missed after 12 s, and step 5 answered `404` with type `/errors/resource-not-found`.
+- Clean up: five bodiless `DELETE` requests with `Content-Type: application/json` answered `204`.
+
+2026-10-01, Agent Memory:
+
+- `GET /health` answered `200` `healthy`. The bulk write answered `201` with 5 ids in `created`, and a second write in the same kernel answered `201` with the same ids and no `errors`.
+- For *What should the kitchen avoid serving me?* the allergy memory came back alone at 0.3 with 0 content words in common. All five came back at 0.0, and none at 0.5. The scope lens returned 5, 0, and 0.
+- Four session events answered `201`, the read-back carried the first event's `ownerId` and `namespace`, and the top memory read `#1 of 3 · 0 content words in common`.
+- Clean up deleted 1 session and 5 memories with 0 errors and 0 left. A third pass about 45 minutes after the first two sessions found no memory with a service-chosen id under the owner. Those sessions were deleted seconds after their events, so extraction from a session that stays alive is still unobserved.
+
+2026-09-30, Context Retriever, from the earlier notebook:
+
+- The surface listed 21 tools for three entities. `get_customer_by_id` with `{"id": "C001"}` returned the record plus a `_retrieval` stamp, and `filter_customer` with no condition answered `isError` with *at least one condition is required*.
+
+The first live run of this notebook's Context Retriever column is pending: it needs `CTX_ADMIN_KEY` in `.env`. The schema-violation reply to the tag condition and the MCP session's explicit `Accept: */*` under niquests are recorded here after it.
