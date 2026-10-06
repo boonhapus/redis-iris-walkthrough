@@ -9,65 +9,55 @@ with app.setup(hide_code=True):
     import json
     import os
     import platform
-    import re
-    import sys
     import time
     from datetime import datetime, timedelta, timezone
 
+    import anthropic
     import marimo as mo
     import niquests
     import numpy as np
     import redis
-    from redis.backoff import ExponentialBackoff
-    from redis.retry import Retry
 
     from cairn_support import sample_data as cairn
     from cairn_support.embedder import EMBEDDING_MODEL_NAME, embed_texts, load_embedding_model
     from cairn_support.formatting import redis_cli, shared_stems
 
     # One tag for everything this notebook writes from this machine. It is derived from the user
-    # and host names, so a fresh kernel finds what an earlier one wrote and Clean up needs no ledger.
+    # and host names, so Clean up in a fresh kernel finds what an earlier kernel wrote.
     RUN_TAG = hashlib.sha256(f"{getpass.getuser()}@{platform.node()}".encode()).hexdigest()[:8]
     KEY_PREFIX = f"cairn:{RUN_TAG}:"   # every Redis key written by this notebook or by Context Retriever
-    KEY_TTL_SECONDS = 3600             # Redis keys and the agent key expire on their own; Clean up only shortens that
+    KEY_TTL_SECONDS = 3600             # every key expires on its own; Clean up only makes it sooner
 
-    MASKED_HEADERS = {"authorization", "x-api-key"}
+    def iris_session(base_url, headers, timeout=(5, 30)):
+        """An HTTP session for one hosted Iris service: JSON in and out, no retries, no HTTP/3."""
+        return niquests.Session(
+            base_url=base_url,
+            # Content-Type is pinned because niquests would otherwise append ;charset=utf-8.
+            headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "redis-iris-basics", **headers},
+            timeout=timeout,
+            disable_http3=True,
+        )
 
-    def call_service(service, method, path, *, json_body=None, params=None):
-        """One request to a hosted Iris service: (status, parsed body or None, wire).
+    def call_service(service, method, path, *, json_body=None, params=None, ok=(200, 201, 204)):
+        """One request to a hosted Iris service: (status, parsed body, wire).
 
-        `wire` is what went on the wire with the credential header masked, so it is safe to show.
-        Nothing is raised on a 4xx or 5xx: the JSON body (type, title, detail) is the teaching
-        content, so each cell branches on the status itself. Nothing is retried: every call is
-        exactly one request, so the wire view and the request counts in the copy are exact.
+        `wire` is the request as sent with the credential header masked, so it is safe to show. A
+        status outside `ok` raises with the problem type and title only: a problem's detail can echo
+        the request, and one request here carries a database password.
         """
         response = service.request(method, path, json=json_body, params=params)
+        if response.status_code not in ok:
+            problem = response.json() if "json" in response.headers.get("Content-Type", "") else {}   # an error page is not JSON
+            raise RuntimeError(f"{method} {path} answered {response.status_code} {problem.get('type', '')} {problem.get('title', '')}".rstrip())
+        body = response.json() if response.content else None
         sent = response.request
-        body = None
-        if response.content:
-            try:
-                body = response.json()
-            except ValueError:
-                body = response.text
-        headers = {k: "***" if k.lower() in MASKED_HEADERS else v for k, v in sent.headers.items()}
         wire = {
-            "method": sent.method, "url": sent.url, "headers": headers,
+            "method": sent.method, "url": sent.url,
+            "headers": {k: "***" if k.lower() in ("authorization", "x-api-key") else v for k, v in sent.headers.items()},
             "body": json.loads(sent.body) if sent.body else None,
             "status": response.status_code, "ms": round(response.elapsed.total_seconds() * 1000),
         }
         return response.status_code, body, wire
-
-    def connect_redis(url):
-        """One redis-py client with the production checklist applied (redis-py docs, produsage)."""
-        return redis.Redis.from_url(
-            url,
-            protocol=2,                # flat FT.* replies; every reply shape here was verified live under RESP2
-            decode_responses=True,     # strings back; the vector field is never read through a core command
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            retry=Retry(ExponentialBackoff(), 3),  # three retries on ConnectionError and TimeoutError
-            health_check_interval=30,  # PING before reuse after 30 s idle; a notebook idles a lot
-        )
 
 
 @app.cell(column=0, hide_code=True)
@@ -75,752 +65,661 @@ def intro():
     mo.md(rf"""
     # Redis Iris basics
 
-    Agents do not have an intelligence problem. They have a context problem: the right facts, at the
-    right moment, from data you already hold. [Redis Iris](https://redis.io/docs/latest/develop/ai/context-engine/)
-    is the real-time context engine that supplies them: Redis Search underneath, then LangCache,
-    Context Retriever, and Agent Memory as hosted services on Redis Cloud. This notebook takes the four
-    apart, one column each, on Cairn Outfitters, a fictional outdoor-gear shop.
-    Every step shows the exact `redis-cli` command or JSON request behind it. There is no LLM anywhere in it.
+    Agents do not have an intelligence problem. They have a context problem. [Redis Iris](https://redis.io/docs/latest/develop/ai/context-engine/)
+    is the real-time context engine for agents. This notebook gives one column to Redis Search, which
+    Iris runs on, and one to each of three Iris services hosted on Redis Cloud: LangCache, Context
+    Retriever, and Agent Memory. Every column shows three principles on sample data from Cairn
+    Outfitters, a fictional outdoor-gear shop. Each puts its component behind a chat or a console
+    and shows the `redis-cli` command or JSON request for every turn. The chats call Claude (`claude-opus-5-5`).
 
-    | Component, left to right | Its one job here |
+    | Column, left to right | The three principles it shows |
     |---|---|
-    | Redis Search | Answer a question over 36 help articles by keyword, by meaning, and by both |
-    | Redis LangCache | Return a stored answer for a question asked in other words |
-    | Redis Context Retriever | Turn three Python classes into MCP tools an agent calls over your Redis |
-    | Redis Agent Memory | Recall a customer fact with no word in common with the question |
+    | Redis Search | An index follows every write under its prefix. Redis fuses keyword and vector rankings in one command. Filters run inside the vector search. |
+    | Redis LangCache | Your app searches before the LLM and stores after it. The threshold trades wrong answers for misses. A cached answer lives until its time to live (TTL) runs out. |
+    | Redis Context Retriever | The data model generates the tools. The agent can call only what the model defines. Context Retriever is a layer on top of your Redis. |
+    | Redis Agent Memory | Long-term memory recalls facts by meaning. The owner and namespace are the tenant boundary. An agent turn reads both tiers. |
+
+    **Status.** LangCache and Agent Memory are in public preview on Redis Cloud, and Context Retriever is in preview.
 
     **Configuration.** Copy `.env.example` to `.env` next to `pyproject.toml`. marimo loads it
-    when the kernel starts. A column whose variables are missing says so and stops.
+    when the kernel starts. The cells under this one build one client per service. A service with
+    no settings fails in its own client cell, and every cell in its column shows marimo's
+    *An ancestor raised an exception* notice. The other columns still run. The chats in the Search,
+    LangCache, and Agent Memory columns also need `ANTHROPIC_API_KEY`. Without it the Claude client
+    still builds, and each chat message that reaches Claude raises an error in the chat.
 
-    **Safety.** Everything this notebook writes from this machine carries the run tag `{RUN_TAG}`. That means
-    Redis keys under `{KEY_PREFIX}` with a one-hour `EXPIRE`, LangCache entries with `ttlMillis`, a surface
-    named `cairn-{RUN_TAG}`, and memories owned by `cairn-{RUN_TAG}`. The tag is the same every time you
-    open the notebook on this machine. Clean up in a fresh kernel still finds what an earlier kernel
-    wrote. Each column ends with one Clean up button whose label says what it deletes. Nothing is
-    written until you press a button that says what it writes.
+    **Safety.** Nothing is written until you press a seed button, submit the Search form, or send a
+    chat message. A LangCache miss stores Claude's answer, and each Agent Memory message writes two
+    session events: the message and the agent's reply. Until you press a column's seed button, the
+    cells that need its data show marimo's *Ancestor stopped* notice.
+
+    Everything written to Redis, Context Retriever, and Agent Memory carries the run tag `{RUN_TAG}`.
+    Redis keys live under `{KEY_PREFIX}` with a one-hour `EXPIRE`. The Redis Search index has no
+    TTL, and neither does the Context Retriever surface, named `cairn-{RUN_TAG}`. Agent Memory has
+    no TTL per record, so sessions and memories owned by `cairn-{RUN_TAG}` last until the store's
+    defaults expire them. The tag is the same in every kernel on this machine, so those three
+    columns' Clean up buttons find what an earlier kernel wrote.
+
+    LangCache entries carry no tag, and each has a `ttlMillis` of at most 15 minutes. LangCache's
+    Clean up runs after a seed press in this kernel, and it deletes the five gear-care answers and
+    the answers this kernel's chat stored. Each column ends with a Clean up button.
     """)
     return
 
 
-@app.cell(column=0, hide_code=True)
-def rs_title():
-    mo.vstack([
-        mo.md(r"""
-    # Redis Search
-
-    Users ask in their own words, and a keyword index only knows yours. Redis Search keeps one index over
-    the hashes under a key prefix and updates it on every write. It answers by keyword (`BM25STD`), by meaning (a vector field),
-    or by both fused in one command (`FT.HYBRID`, Redis 8.4 and later). Its one job in this column:
-    answer a question over 36 help articles by keyword, by meaning, and by both.
-
-    The other three columns are built on this engine. The embedding model, `potion-base-8M`, runs
-    on your machine, so this column needs one setting, `REDIS_URL`.
-
-    Docs: [Search and query](https://redis.io/docs/latest/develop/ai/search-and-query/).
-    """),
-        mo.mermaid("""flowchart LR
-    A[App] -->|embed locally| V[Vector]
-    V -->|HSET| H[("Hash under cairn:run:help:")]
-    H -.->|index watches the prefix| I[FT index]
-    A -->|"FT.SEARCH / FT.HYBRID"| I"""),
-    ])
-    return
+@app.cell(column=0)
+def redis_client():
+    # redis-py retries a dropped connection by default. The health check PINGs before reusing a
+    # connection that sat idle for 30 s, which a notebook does a lot.
+    REDIS_CLIENT = redis.Redis.from_url(
+        os.environ["REDIS_URL"],
+        protocol=2,               # flat FT.* replies: every reply shape here was verified live under RESP2
+        decode_responses=True,    # strings back; the vector field is never read through a core command
+        health_check_interval=30,
+    )
+    return (REDIS_CLIENT,)
 
 
 @app.cell(column=0)
-def rs_connect():
-    from redis.commands.search.field import NumericField, TagField, TextField, VectorField
-    from redis.commands.search.index_definition import IndexDefinition, IndexType
-    from redis.commands.search.query import Query
-    from redis.exceptions import ResponseError
+def embedding_model():
+    with mo.status.spinner(title=f"Loading {EMBEDDING_MODEL_NAME}", subtitle="about 30 MB the first time"):
+        EMBEDDING_MODEL = load_embedding_model()   # runs on this machine; Redis stores the vectors it makes
+    return (EMBEDDING_MODEL,)
 
-    mo.stop(
-        not os.environ.get("REDIS_URL"),
-        mo.callout(mo.md("Redis Search is not configured. Set `REDIS_URL` in the `.env` next to `pyproject.toml` (see `.env.example`), then restart the kernel."), kind="warn"),
+
+@app.cell(column=0)
+def llm_client():
+    LLM = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY, or a profile from `ant auth login`
+    LLM_MODEL = "claude-opus-5-5"
+
+    def ask_llm(system, messages):
+        """One Claude reply as text. Low effort keeps a chat turn quick, and a declined request
+        is re-run server-side on the model Anthropic recommends for that refusal category. A
+        refusal that survives the fallback raises, so no chat stores it as an answer."""
+        response = LLM.beta.messages.create(
+            model=LLM_MODEL, max_tokens=16000, system=system, messages=messages,
+            output_config={"effort": "low"},
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+        )
+        if response.stop_reason == "refusal":
+            raise RuntimeError(f"Claude declined this request ({response.stop_details.category or 'no category'}).")
+        return "".join(block.text for block in response.content if block.type == "text")
+    return LLM_MODEL, ask_llm
+
+
+@app.cell(column=0)
+def langcache_client():
+    LANGCACHE = iris_session(
+        f"{os.environ['LANGCACHE_HOST'].rstrip('/')}/v1/caches/{os.environ['LANGCACHE_CACHE_ID']}",
+        {"Authorization": f"Bearer {os.environ['LANGCACHE_API_KEY']}"},
     )
-    try:
-        rs_client = connect_redis(os.environ["REDIS_URL"])      # the URL is never a notebook global
-        rs_client.ping()                                        # PING -> PONG
-        rs_redis_version = rs_client.info("server")["redis_version"]   # INFO server
-    except redis.RedisError as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while connecting. Check `REDIS_URL`."), kind="danger"))
-    rs_has_hybrid = tuple(int(part) for part in rs_redis_version.split(".")[:2]) >= (8, 4)
+    return (LANGCACHE,)
+
+
+@app.cell(column=0)
+def context_retriever_client():
+    CONTEXT_RETRIEVER = iris_session(
+        f"{(os.environ.get('CTX_API_URL') or 'https://cloud.redis.io/context-surfaces').rstrip('/')}/api/v1",   # `or`: a blank line in .env keeps the default
+        {"X-API-Key": os.environ["CTX_ADMIN_KEY"]},
+        timeout=(5, 60),   # surface creation and import do real work
+    )
+    return (CONTEXT_RETRIEVER,)
+
+
+@app.cell(column=0)
+def agent_memory_client():
+    AGENT_MEMORY = iris_session(
+        f"{os.environ['MEMORY_API_BASE_URL'].rstrip('/')}/v1/stores/{os.environ['MEMORY_STORE_ID']}",
+        {"Authorization": f"Bearer {os.environ['MEMORY_API_KEY']}"},
+    )
+    MEMORY_OWNER_ID = f"cairn-{RUN_TAG}"   # every memory and session this notebook writes belongs to this owner
+    MEMORY_NAMESPACE = "iris-basics-notebook"
+    return AGENT_MEMORY, MEMORY_NAMESPACE, MEMORY_OWNER_ID
+
+
+@app.cell(column=0)
+def langcache_search_helper(LANGCACHE):
+    def langcache_search(prompt, own_ids, threshold=0.85, strategies=("semantic",)):
+        """One search: (the hits whose id is in own_ids, best first; the wire with every other entry hidden)."""
+        _, body, wire = call_service(LANGCACHE, "POST", "/entries/search", json_body={
+            "prompt": prompt, "similarityThreshold": threshold, "searchStrategies": list(strategies), "maxResults": 5})
+        wire["reply"] = {"data": [hit if hit["id"] in own_ids else {"hidden": "not stored by this press", "similarity": hit["similarity"]} for hit in body["data"]]}
+        return [hit for hit in body["data"] if hit["id"] in own_ids], wire
+    return (langcache_search,)
+
+
+@app.cell(column=1, hide_code=True)
+def rs_title():
+    mo.md(r"""
+    # Redis Search
+
+    Customers ask in their own words, and a keyword index finds only the words your articles use.
+    Redis Search keeps text, tag, numeric, and vector fields in one index over your hashes.
+    Load 36 Cairn Outfitters help articles, then ask the help center, filter it, and add an article to see three principles:
+
+    1. **An index follows every write under its prefix.** `FT.CREATE` names a key prefix once, and Redis indexes each `HSET` under it as part of the write, so no sync job runs.
+    2. **Redis fuses keyword and vector rankings in one command.** Keyword and vector search fail on different questions, and `FT.HYBRID` merges the two with Reciprocal Rank Fusion (RRF).
+    3. **Filters run inside the vector search.** Redis picks the k nearest articles from those that pass a tag or numeric filter, so it returns fewer than k only when fewer pass.
+
+    Redis Search is available in Redis Open Source, Redis Software, and Redis Cloud, and `FT.HYBRID` needs Redis 8.4 or later. Settings: `REDIS_URL`, plus `ANTHROPIC_API_KEY`, which the chat and the cell under it need.
+    Docs: [Redis Search](https://redis.io/docs/latest/develop/ai/search-and-query/), [vectors and filters](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/), and [`FT.HYBRID`](https://redis.io/docs/latest/commands/ft.hybrid/).
+
+    Each line reads source, target, and what passes between them:
+
+    ```text
+    App   -> FT index  FT.CREATE over the prefix cairn:<run>:help:
+    App   -> vector    potion-base-8M embeds on this machine
+    App   -> hash      HSET title, body, category, year, and embedding
+    hash  -> FT index  indexed as part of the HSET
+    App   -> FT index  FT.HYBRID: BM25STD and KNN, fused with RRF, the filter inside both
+    App   -> Claude    the top 3 articles and the question, for the answer
+    ```
+    """)
+    return
+
+
+@app.cell(column=1, hide_code=True)
+def rs_seed_button():
     rs_index_name = f"idx:cairn:{RUN_TAG}:help"
     rs_key_prefix = f"{KEY_PREFIX}help:"
     rs_article_keys = [f"{rs_key_prefix}{article['id']}" for article in cairn.HELP_ARTICLES]   # Clean up never scans
-    rs_article_titles = dict(zip(rs_article_keys, (article["title"] for article in cairn.HELP_ARTICLES)))   # key -> title, for FT.HYBRID rows
-    try:
-        with mo.status.spinner(title=f"Loading {EMBEDDING_MODEL_NAME}", subtitle="about 30 MB the first time"):
-            rs_embedding_model = load_embedding_model()
-    except RuntimeError as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{EMBEDDING_MODEL_NAME}` is not in the Hugging Face cache and could not be downloaded ({_exc}). Connect once, or copy the model files in, then restart the kernel."), kind="danger"))
-    rs_article_vectors = embed_texts(rs_embedding_model, [f"{article['title']}. {article['body']}" for article in cairn.HELP_ARTICLES])
-    rs_embedding_dimension = int(rs_article_vectors.shape[1])
-    rs_load_button = mo.ui.run_button(label="Load the help centre: 1 FT.CREATE, 36 HSET, 36 EXPIRE", kind="success")
+    rs_reader_key = f"{rs_key_prefix}reader"   # the one article the form writes, which Clean up also unlinks by name
+    rs_seed_button = mo.ui.run_button(label="Load the help center: 1 FT.CREATE, 36 HSET, 36 EXPIRE", kind="success")
     mo.vstack([
-        mo.callout(mo.md(f"Connected to Redis {rs_redis_version}. `FT.HYBRID` {'is available' if rs_has_hybrid else 'needs Redis 8.4 or later, so the hybrid rank below becomes a note'}. {EMBEDDING_MODEL_NAME}: {rs_embedding_dimension} dimensions, {rs_embedding_dimension * 4} bytes per vector, computed on this machine."), kind="success"),
-        mo.md(r"""The button below writes one index and 36 hashes to your database, each hash with a one-hour `EXPIRE`. The index watches the prefix `cairn:<run>:help:`, so every `HSET` under it is indexed on write:"""),
-        rs_load_button,
+        mo.md(r"""The button below writes one index and 36 hashes to your database. Each hash carries a one-hour `EXPIRE`, and the index has no TTL, so it stays until Clean up. The index watches the prefix `cairn:<run>:help:`, and the chat appears once it is loaded:"""),
+        rs_seed_button,
     ])
-    return (
-        IndexDefinition,
-        IndexType,
-        NumericField,
-        Query,
-        ResponseError,
-        TagField,
-        TextField,
-        VectorField,
-        rs_article_keys,
-        rs_article_titles,
-        rs_article_vectors,
-        rs_client,
-        rs_embedding_dimension,
-        rs_embedding_model,
-        rs_has_hybrid,
-        rs_index_name,
-        rs_key_prefix,
-        rs_load_button,
-        rs_redis_version,
-    )
+    return rs_article_keys, rs_index_name, rs_key_prefix, rs_reader_key, rs_seed_button
 
 
-@app.cell(column=0)
-def rs_load(
-    IndexDefinition,
-    IndexType,
-    NumericField,
-    ResponseError,
-    TagField,
-    TextField,
-    VectorField,
-    rs_article_keys,
-    rs_article_vectors,
-    rs_client,
-    rs_embedding_dimension,
-    rs_index_name,
-    rs_key_prefix,
-    rs_load_button,
-):
-    mo.stop(not rs_load_button.value, mo.callout(mo.md("Press *Load the help centre: 1 FT.CREATE, 36 HSET, 36 EXPIRE* above."), kind="info"))
-    rs_schema = (
-        TextField("title", weight=2.0),
-        TextField("body"),
-        TagField("category"),
-        NumericField("year", sortable=True),
-        VectorField("embedding", "HNSW", {"TYPE": "FLOAT32", "DIM": rs_embedding_dimension, "DISTANCE_METRIC": "COSINE"}),
+@app.cell(column=1)
+def rs_seed(EMBEDDING_MODEL, REDIS_CLIENT, rs_article_keys, rs_index_name, rs_key_prefix, rs_seed_button):
+    from redis.commands.search.field import NumericField, TagField, TextField, VectorField
+    from redis.commands.search.index_definition import IndexDefinition, IndexType
+    from redis.commands.search.query import Query
+
+    mo.stop(not rs_seed_button.value)
+    _vectors = embed_texts(EMBEDDING_MODEL, [f"{article['title']}. {article['body']}" for article in cairn.HELP_ARTICLES])
+    _schema = (
+        TextField("title", weight=2.0), TextField("body"), TagField("category"), NumericField("year", sortable=True),
+        VectorField("embedding", "HNSW", {"TYPE": "FLOAT32", "DIM": _vectors.shape[1], "DISTANCE_METRIC": "COSINE"}),
     )
-    rs_index_definition = IndexDefinition(prefix=[rs_key_prefix], index_type=IndexType.HASH)
+    _definition = IndexDefinition(prefix=[rs_key_prefix], index_type=IndexType.HASH)
+    rs_index = REDIS_CLIENT.ft(rs_index_name)
     try:
-        rs_client.ft(rs_index_name).create_index(rs_schema, definition=rs_index_definition)   # FT.CREATE
-    except ResponseError as _exc:
-        if "already exists" not in str(_exc).lower():   # pressing Load again is an update
+        _created = rs_index.create_index(_schema, definition=_definition)   # FT.CREATE
+    except redis.ResponseError as _exc:
+        if "already exists" not in str(_exc).lower():   # a second press rewrites the same 36 keys
             raise
-    _first_hset_argv = None
-    for _start in range(0, len(cairn.HELP_ARTICLES), 12):   # three chunks of 12, under the free tier's 100 ops/s
-        _pipe = rs_client.pipeline(transaction=False)
-        for _article, _vector in zip(cairn.HELP_ARTICLES[_start:_start + 12], rs_article_vectors[_start:_start + 12]):
+        _created = str(_exc)
+    _rows, _first_hset = [], None
+    for _start in range(0, len(cairn.HELP_ARTICLES), 12):   # three pipelines of 12, under the free tier's 100 ops/s
+        _pipe = REDIS_CLIENT.pipeline(transaction=False)
+        for _article, _vector in zip(cairn.HELP_ARTICLES[_start:_start + 12], _vectors[_start:_start + 12]):
             _key = f"{rs_key_prefix}{_article['id']}"
-            _pipe.hset(_key, mapping={
-                "title": _article["title"], "body": _article["body"], "category": _article["category"],
-                "year": _article["year"], "embedding": _vector.astype(np.float32).tobytes(),   # DIM x 4 raw bytes
-            })
+            _pipe.hset(_key, mapping={"title": _article["title"], "body": _article["body"], "category": _article["category"],
+                                      "year": _article["year"], "embedding": _vector.astype(np.float32).tobytes()})   # DIM x 4 raw bytes
             _pipe.expire(_key, KEY_TTL_SECONDS)
-        _first_hset_argv = _first_hset_argv or _pipe.command_stack[0][0]   # Pipeline.command_stack holds one (argv, options) pair per queued command; [0][0] is the first HSET's argv
+        _first_hset = _first_hset or _pipe.command_stack[0][0]   # read before execute() clears the stack
         _pipe.execute()
+        _info = rs_index.info()   # FT.INFO, straight after the pipeline
+        _rows.append({"HSET sent": _start + 12, "num_docs": int(_info["num_docs"]), "hash_indexing_failures": int(_info["hash_indexing_failures"])})
         time.sleep(0.25)
-    _info = rs_client.ft(rs_index_name).info()   # FT.INFO
-    rs_documents_indexed = int(_info["num_docs"])
-    _indexing_failures = int(_info["hash_indexing_failures"])
-    rs_help_centre_loaded = True
+    _in_step = sum(row["num_docs"] == row["HSET sent"] for row in _rows)
     mo.vstack([
-        mo.hstack([mo.stat(rs_documents_indexed, label="num_docs"), mo.stat(_indexing_failures, label="hash_indexing_failures")]),
-        mo.md(f"```\n{redis_cli(['FT.CREATE', rs_index_name, *rs_index_definition.args, 'SCHEMA', *[arg for field in rs_schema for arg in field.redis_args()]])}\n{redis_cli(_first_hset_argv)}\n{redis_cli(['EXPIRE', rs_article_keys[0], KEY_TTL_SECONDS])}\n```"),
-        mo.md(f"""Redis returns `OK` for the `FT.CREATE` and indexes each hash as it lands. `FT.INFO` reports `num_docs` {rs_documents_indexed} and `hash_indexing_failures` {_indexing_failures}: a hash that fails to index is counted there, not dropped silently. Pressing Load again rewrites the same 36 keys and restarts their hour."""),
+        mo.ui.table(_rows, selection=None, show_download=False, pagination=False),
+        mo.md(f"""Redis answered `{_created}` to the `FT.CREATE`, and after it the app's only writes are `HSET` and `EXPIRE`. The `FT.INFO` straight after each pipeline finds `num_docs` equal to the hashes sent in {_in_step} of {len(_rows)} rows. A second press before Clean up rewrites keys the index holds, so the first row shows the full count."""),
+        mo.md(f"```\n{redis_cli(['FT.CREATE', rs_index_name, *_definition.args, 'SCHEMA', *[arg for field in _schema for arg in field.redis_args()]])}\n{redis_cli(_first_hset)}\n{redis_cli(['EXPIRE', rs_article_keys[0], KEY_TTL_SECONDS])}\n{redis_cli(['FT.INFO', rs_index_name])}\n```"),
     ])
-    return (rs_help_centre_loaded,)
+    return Query, rs_index
 
 
-@app.cell(column=0)
-def rs_full_text(Query, rs_client, rs_help_centre_loaded, rs_index_name):
-    mo.stop(not rs_help_centre_loaded, mo.callout(mo.md("Load the help centre first."), kind="info"))
-    _query = Query("hiking boots").scorer("BM25STD").with_scores().return_fields("title", "category").paging(0, 5)
-    rs_full_text_result = rs_client.ft(rs_index_name).search(_query)   # FT.SEARCH
-    mo.vstack([
-        mo.md(r"""This cell runs one keyword search for *hiking boots*, scored with `BM25STD`. Redis returns the match count and the top five rows with their scores:"""),
-        mo.md(f"```\n{redis_cli(['FT.SEARCH', rs_index_name, *_query.get_args()])}\n```"),
-        mo.md(f"{rs_full_text_result.total} match{'' if rs_full_text_result.total == 1 else 'es'}"),
-        mo.ui.table(
-            [{"title": doc.title, "category": doc.category, "score": round(float(doc.score), 3)} for doc in rs_full_text_result.docs],
-            selection=None, show_download=False, pagination=False,
-        ),
-        mo.md(r"""A title match counts double because the schema gave `title` weight 2."""),
-    ])
-    return
+@app.cell(column=1)
+def rs_chat(EMBEDDING_MODEL, Query, REDIS_CLIENT, ask_llm, rs_index, rs_index_name):
+    _all_categories = sorted({article["category"] for article in cairn.HELP_ARTICLES})
+    rs_categories = mo.ui.multiselect(options=_all_categories, value=_all_categories, label="Categories (none means all)")
+    rs_year_floor = mo.ui.slider(2022, 2026, value=2022, label="Year floor", show_value=True)
+    rs_turns = []   # one dict per question: the filter, every command, the ranks, and the timings
 
+    def rs_prefilter(categories, year_floor):
+        return f"(@category:{{{'|'.join(categories or _all_categories)}}} @year:[{year_floor} 2026])"
 
-@app.cell(column=0)
-def rs_search_controls(rs_help_centre_loaded):
-    mo.stop(not rs_help_centre_loaded)
-    rs_question = mo.ui.text(value="will it fit my feet", label="Ask the help centre", full_width=True)
-    mo.vstack([
-        mo.md(r"""Redis runs the same query vector two ways. `KNN 3` returns the three nearest articles whatever their distance, and `VECTOR_RANGE` returns only what lies within a radius, which can be nothing:"""),
-        rs_question,
-        mo.md(r"""In a live run on 2026-10-01 the range returned 2 articles for the default question. Ask *best pizza near me*: it returned 0 at this radius."""),
-    ])
-    return (rs_question,)
+    def rs_knn(prefilter, k):
+        return Query(f"{prefilter}=>[KNN {k} @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "year", "vector_score").paging(0, k)
 
+    def _rank(keys, key):
+        return keys.index(key) + 1 if key in keys else "-"
 
-@app.cell(column=0)
-def rs_knn_versus_range(
-    Query,
-    rs_client,
-    rs_embedding_model,
-    rs_help_centre_loaded,
-    rs_index_name,
-    rs_question,
-):
-    mo.stop(not rs_help_centre_loaded)
-    mo.stop(not rs_question.value.strip(), mo.callout(mo.md("Type a question above."), kind="info"))
-    rs_query_vector_bytes = embed_texts(rs_embedding_model, [rs_question.value])[0].astype(np.float32).tobytes()
-    _knn = Query("*=>[KNN 3 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "vector_score").paging(0, 3)
-    _range = Query("@embedding:[VECTOR_RANGE $radius $vector]=>{$YIELD_DISTANCE_AS: vector_score}").sort_by("vector_score").return_fields("title", "category", "vector_score").paging(0, 10)
-    _knn_params = {"vector": rs_query_vector_bytes}
-    _range_params = {"radius": 0.5, "vector": rs_query_vector_bytes}   # edit the radius here. 0.5 is a starting point for this model
-    rs_knn_result = rs_client.ft(rs_index_name).search(_knn, _knn_params)
-    rs_range_result = rs_client.ft(rs_index_name).search(_range, _range_params)
-    _knn_table = mo.ui.table(
-        [{"title": doc.title, "category": doc.category, "vector_score": round(float(doc.vector_score), 3)} for doc in rs_knn_result.docs],
-        selection=None, show_download=False, pagination=False,
-    )
-    if rs_range_result.total:
-        _range_view = mo.ui.table(
-            [{"title": doc.title, "category": doc.category, "vector_score": round(float(doc.vector_score), 3)} for doc in rs_range_result.docs],
-            selection=None, show_download=False, pagination=False,
-        )
-    else:
-        _range_view = mo.callout(mo.md("0 articles within radius 0.5. KNN could never say this, and this empty answer is what LangCache turns into a cache miss in the next column."), kind="warn", title="MISS")
-    mo.vstack([
-        mo.md(f"`KNN 3` for *{rs_question.value}*"),
-        _knn_table,
-        mo.md(f"`VECTOR_RANGE` radius 0.5 for *{rs_question.value}*"),
-        _range_view,
-        mo.accordion({"redis-cli": mo.md(f"```\n{redis_cli(['FT.SEARCH', rs_index_name, *_knn.get_args(), *rs_client.ft(rs_index_name).get_params_args(_knn_params)])}\n{redis_cli(['FT.SEARCH', rs_index_name, *_range.get_args(), *rs_client.ft(rs_index_name).get_params_args(_range_params)])}\n```")}),
-        mo.md(r"""KNN always fills three rows, and the range answers with what is close enough, or with nothing. `vector_score` is the cosine distance, 0 for an identical vector, so the smallest number is the closest article. LangCache's `similarity` in the next column runs the other way."""),
-    ])
-    return
-
-
-@app.cell(column=0)
-def rs_prefiltered(
-    Query,
-    rs_client,
-    rs_embedding_model,
-    rs_help_centre_loaded,
-    rs_index_name,
-):
-    mo.stop(not rs_help_centre_loaded)
-    _params = {"vector": embed_texts(rs_embedding_model, ["where is my parcel"])[0].astype(np.float32).tobytes()}
-    _unfiltered = Query("*=>[KNN 5 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "year", "vector_score").paging(0, 5)
-    _filtered = Query("(@category:{returns|shipping} @year:[2024 2026])=>[KNN 5 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title", "category", "year", "vector_score").paging(0, 5)
-    _unfiltered_result = rs_client.ft(rs_index_name).search(_unfiltered, _params)
-    _filtered_result = rs_client.ft(rs_index_name).search(_filtered, _params)
-    _params_args = rs_client.ft(rs_index_name).get_params_args(_params)
-    mo.vstack([
-        mo.md(r"""This cell runs the same `KNN 5` twice for *where is my parcel*, once over every article and once over `returns` and `shipping` articles from 2024 on. The filtered query string is the whole lesson:"""),
-        mo.md(f"```\n{redis_cli(['FT.SEARCH', rs_index_name, *_unfiltered.get_args(), *_params_args])}\n{redis_cli(['FT.SEARCH', rs_index_name, *_filtered.get_args(), *_params_args])}\n```"),
-        mo.md(r"""**Every article**"""),
-        mo.ui.table([{"title": doc.title, "category": doc.category, "year": doc.year, "vector_score": round(float(doc.vector_score), 3)} for doc in _unfiltered_result.docs], selection=None, show_download=False, pagination=False),
-        mo.md(r"""**Returns and shipping, 2024 to 2026**"""),
-        mo.ui.table([{"title": doc.title, "category": doc.category, "year": doc.year, "vector_score": round(float(doc.vector_score), 3)} for doc in _filtered_result.docs], selection=None, show_download=False, pagination=False),
-        mo.md(r"""The filter runs inside the vector search, so all five rows qualify, instead of a top five filtered afterwards."""),
-    ])
-    return
-
-
-@app.cell(column=0)
-def rs_engine_preset(rs_help_centre_loaded):
-    mo.stop(not rs_help_centre_loaded)
-    rs_preset = mo.ui.dropdown(options={preset["label"]: preset["query"] for preset in cairn.SEARCH_PRESETS}, value="Same meaning, different words", label="Question")
-    mo.vstack([
-        mo.md(r"""Keyword search matches words and vector search matches meaning, and each fails where the other wins. The cell below sends one question through `BM25STD`, through KNN, and through `FT.HYBRID`, which fuses both rankings on the server:"""),
-        rs_preset,
-    ])
-    return (rs_preset,)
-
-
-@app.cell(column=0)
-def rs_engine_results(
-    Query,
-    ResponseError,
-    rs_article_titles,
-    rs_client,
-    rs_embedding_model,
-    rs_has_hybrid,
-    rs_help_centre_loaded,
-    rs_index_name,
-    rs_key_prefix,
-    rs_preset,
-    rs_redis_version,
-):
-    mo.stop(not rs_help_centre_loaded)
-    rs_engine_question = rs_preset.value
-    rs_engine_target = next(preset["target"] for preset in cairn.SEARCH_PRESETS if preset["query"] == rs_engine_question)
-    _vector = embed_texts(rs_embedding_model, [rs_engine_question])[0].astype(np.float32).tobytes()
-    _bm25 = Query(rs_engine_question).scorer("BM25STD").return_fields("title").paging(0, 10)
-    _knn = Query("*=>[KNN 10 @embedding $vector AS vector_score]").sort_by("vector_score").return_fields("title").paging(0, 10)
-    _rankings = {"BM25 rank": [doc.id for doc in rs_client.ft(rs_index_name).search(_bm25).docs]}
-    _rankings["vector rank"] = [doc.id for doc in rs_client.ft(rs_index_name).search(_knn, {"vector": _vector}).docs]
-    _lines = [
-        redis_cli(["FT.SEARCH", rs_index_name, *_bm25.get_args()]),
-        redis_cli(["FT.SEARCH", rs_index_name, *_knn.get_args(), *rs_client.ft(rs_index_name).get_params_args({"vector": _vector})]),
-    ]
-    _hybrid_note = mo.callout(mo.md(f"`FT.HYBRID` needs Redis 8.4 or later. This database is {rs_redis_version}."), kind="info")
-    if rs_has_hybrid:
-        _hybrid_argv = [
-            "FT.HYBRID", rs_index_name, "SEARCH", rs_engine_question, "SCORER", "BM25STD",
-            "VSIM", "@embedding", "$vector", "KNN", 2, "K", 10, "COMBINE", "RRF", 4, "WINDOW", 20, "CONSTANT", 60,   # the documented defaults, made visible
-            "LOAD", 1, "@__key", "LIMIT", 0, 10, "PARAMS", 2, "vector", _vector,
+    def _model(messages, config):
+        question = messages[-1].content
+        categories, year_floor = rs_categories.value or _all_categories, rs_year_floor.value   # read at call time, so moving a control keeps the chat
+        prefilter = rs_prefilter(categories, year_floor)
+        words = "".join(ch if ch.isalnum() else " " for ch in question)   # - | @ { } and the like are query syntax, so only letters and digits pass
+        params = {"vector": embed_texts(EMBEDDING_MODEL, [question])[0].tobytes()}
+        hybrid = [
+            "FT.HYBRID", rs_index_name, "SEARCH", f"{words} {prefilter}", "SCORER", "BM25STD",
+            "VSIM", "@embedding", "$vector", "KNN", 2, "K", 10, "FILTER", prefilter,   # FILTER: the vector side's pre-filter
+            "COMBINE", "RRF", 4, "WINDOW", 20, "CONSTANT", 60,
+            "LOAD", 1, "@__key", "LIMIT", 0, 10, "PARAMS", 2, "vector", params["vector"],
         ]
-        _lines.append(redis_cli(_hybrid_argv))
-        try:
-            _reply = rs_client.execute_command(*_hybrid_argv)   # RESP2: a flat pair list whose results are field lists
-            _fields = dict(zip(_reply[::2], _reply[1::2]))
-            _rankings["hybrid rank"] = [dict(zip(row[::2], row[1::2]))["__key"] for row in _fields["results"]]
-            _hybrid_note = None
-        except (ResponseError, KeyError, TypeError, ValueError) as _exc:   # a server error, or a reply shape verified only on 8.6.2
-            _hybrid_note = mo.callout(mo.md(f"`FT.HYBRID` answered an error or a shape this cell does not parse (`{type(_exc).__name__}`) on Redis {rs_redis_version}, so the table shows two engines."), kind="info")
-    _target_key = f"{rs_key_prefix}{rs_engine_target}"
-    _hybrid_position = _rankings["hybrid rank"].index(_target_key) + 1 if _target_key in _rankings.get("hybrid rank", []) else None
-    _ranked_keys = list(dict.fromkeys([*_rankings.get("hybrid rank", []), *_rankings["vector rank"], *_rankings["BM25 rank"]]))
-    rs_engine_rows = [
-        {"article": ("* " if key == _target_key else "") + rs_article_titles.get(key, key), **{engine: (ranking.index(key) + 1 if key in ranking else "-") for engine, ranking in _rankings.items()}}
-        for key in _ranked_keys
-    ]
-    _lessons = {
-        "size-boots": "*Trail shoes feel cramped* shares no word with the boot-sizing guide. In a live run on 2026-10-01 `BM25STD` returned nothing, and the vector search and `FT.HYBRID` both ranked it first.",
-        "warranty-resole": "*Trailhead* is a product name the model has never seen. In a live run on 2026-09-30 the keyword engine won, and `FT.HYBRID` kept the right article first.",
-        "care-waterproof": "*waterproofng* matches no word. In a live run on 2026-09-30 its vector still landed on waterproofing, and `FT.HYBRID` kept it first.",
-    }
+        started = time.perf_counter()
+        reply = REDIS_CLIENT.execute_command(*hybrid)   # RESP2: a flat pair list whose results are field lists
+        hybrid_ms = round((time.perf_counter() - started) * 1000)
+        hybrid_keys = [dict(zip(row[::2], row[1::2]))["__key"] for row in dict(zip(reply[::2], reply[1::2]))["results"]]
+        bm25 = Query(f"{words} {prefilter}").scorer("BM25STD").return_fields("title").paging(0, 10)
+        bm25_keys = [doc.id for doc in rs_index.search(bm25).docs]
+        knn_keys = [doc.id for doc in rs_index.search(rs_knn(prefilter, 10), params).docs]
+        top5 = rs_index.search(rs_knn("*", 5), params).docs
+        inside5 = rs_index.search(rs_knn(prefilter, 5), params).docs
+        pipe = REDIS_CLIENT.pipeline(transaction=False)
+        for key in hybrid_keys[:3]:
+            pipe.hmget(key, "title", "body", "category", "year")
+        articles = pipe.execute()
+        system = (
+            "You answer customers for Cairn Outfitters, an outdoor gear shop. Use only the help articles below, "
+            "and name each article you use by its title. If they do not answer the question, say so.\n\n"
+            + "\n\n".join(f"{title}\n{body}" for title, body, _, _ in articles)
+        )
+        started = time.perf_counter()
+        answer = ask_llm(system, [{"role": "user", "content": question}])   # the question and its articles only, not the chat history
+        claude_ms = round((time.perf_counter() - started) * 1000)
+        rs_turns.append({
+            "question": question, "filter": prefilter,
+            "rows": [{"article": title, "category": category, "year": int(year), "BM25STD": _rank(bm25_keys, key),
+                      "KNN": _rank(knn_keys, key), "FT.HYBRID": _rank(hybrid_keys, key)}
+                     for key, (title, _, category, year) in zip(hybrid_keys, articles)],
+            "matched": {"BM25STD": len(bm25_keys), "KNN": len(knn_keys)},
+            "top 5, then filter in the app": sum(doc.category in categories and int(doc.year) >= year_floor for doc in top5),
+            "filter inside KNN 5": len(inside5),
+            "ms": {"FT.HYBRID": hybrid_ms, "Claude": claude_ms},
+            "commands": [
+                redis_cli(hybrid),
+                redis_cli(["FT.SEARCH", rs_index_name, *bm25.get_args()]),
+                redis_cli(["FT.SEARCH", rs_index_name, *rs_knn(prefilter, 10).get_args(), *rs_index.get_params_args(params)]),
+                redis_cli(["FT.SEARCH", rs_index_name, *rs_knn("*", 5).get_args(), *rs_index.get_params_args(params)]),
+                redis_cli(["FT.SEARCH", rs_index_name, *rs_knn(prefilter, 5).get_args(), *rs_index.get_params_args(params)]),
+                *[redis_cli(["HMGET", key, "title", "body", "category", "year"]) for key in hybrid_keys[:3]],
+            ],
+        })
+        return answer + "\n\n*Sent to Claude, in `FT.HYBRID` order:* " + ", ".join(title for title, _, _, _ in articles)
+
+    rs_chat = mo.ui.chat(_model, prompts=[
+        *[preset["query"] for preset in cairn.SEARCH_PRESETS],
+        "Where is my parcel?",
+        "Can I return a gift I got in December?",
+    ])
     mo.vstack([
-        mo.md(f"Question: **{rs_engine_question}**. The starred row is the article that answers it."),
-        mo.ui.table(rs_engine_rows, selection=None, show_download=False, pagination=False),
-        *([_hybrid_note] if _hybrid_note else []),
-        mo.md(_lessons[rs_engine_target] + (f" Here `FT.HYBRID` ranks the starred article {'#' + str(_hybrid_position) if _hybrid_position else 'outside the top ten'}." if "hybrid rank" in _rankings else "")),
-        mo.accordion({"redis-cli": mo.md("```\n" + "\n".join(_lines) + "\n```")}),
+        mo.md(r"""Redis runs each question below through `FT.HYBRID`, with the category and year filters inside the query. Claude answers from the top three articles, and the reply lists them:"""),
+        mo.hstack([rs_categories, rs_year_floor], justify="start", gap=2),
+        rs_chat,
+    ])
+    return rs_categories, rs_chat, rs_knn, rs_prefilter, rs_turns, rs_year_floor
+
+
+@app.cell(column=1)
+def rs_last_turn(rs_chat, rs_turns):
+    _turn = rs_turns[-1] if rs_chat.value and rs_turns else None
+    _first = _turn and _turn["rows"][:1]
+
+    def _place(rank):
+        return "outside the top ten" if rank == "-" else f"at {rank}"
+
+    mo.md("Ask the help center a question above, and this cell shows what Redis did with it.") if _turn is None else mo.vstack([
+        mo.md(f"The table below ranks each article Claude received for *{_turn['question']}* under `BM25STD`, k-nearest neighbor (KNN) search, and `FT.HYBRID`, all with the same filter:"),
+        mo.ui.table(_turn["rows"], selection=None, show_download=False, pagination=False),
+        mo.md(
+            (f"`FT.HYBRID` ranks *{_first[0]['article']}* first, `BM25STD` puts it {_place(_first[0]['BM25STD'])}, and KNN puts it {_place(_first[0]['KNN'])}. " if _first else "`FT.HYBRID` returned no article, so the keys have expired. Press Load again. ")
+            + f"Of a possible ten, `BM25STD` returned {_turn['matched']['BM25STD']} and KNN returned {_turn['matched']['KNN']}. `-` means outside the top ten."
+        ),
+        mo.md(f"With the filter `{_turn['filter']}`, a top 5 filtered in the app kept {_turn['top 5, then filter in the app']} rows, and `KNN 5` with the filter inside returned {_turn['filter inside KNN 5']}."),
+        mo.md(f"`FT.HYBRID` answered in {_turn['ms']['FT.HYBRID']} ms, and Claude in {_turn['ms']['Claude']} ms."),
+        mo.accordion({"redis-cli": mo.md("```\n" + "\n".join(_turn["commands"]) + "\n```")}),
     ])
     return
 
 
-@app.cell(column=0, hide_code=True)
-def rs_cleanup_button():
-    rs_cleanup_button = mo.ui.run_button(label="Clean up: FT.DROPINDEX and UNLINK 36 keys", kind="danger")
+@app.cell(column=1)
+def rs_filter_sweep(EMBEDDING_MODEL, Query, rs_categories, rs_index, rs_index_name, rs_knn, rs_prefilter):
+    _categories = rs_categories.value or sorted({article["category"] for article in cairn.HELP_ARTICLES})
+    _params = {"vector": embed_texts(EMBEDDING_MODEL, ["where is my parcel"])[0].tobytes()}
+    _top5 = rs_index.search(rs_knn("*", 5), _params).docs
+    _rows = []
+    for _year in range(2022, 2027):
+        _rows.append({
+            "year floor": _year,
+            "articles that pass": rs_index.search(Query(rs_prefilter(_categories, _year)).no_content().paging(0, 0)).total,
+            "top 5, then filter in the app": sum(doc.category in _categories and int(doc.year) >= _year for doc in _top5),
+            "filter inside KNN 5": len(rs_index.search(rs_knn(rs_prefilter(_categories, _year), 5), _params).docs),
+        })
+    _params_args = rs_index.get_params_args(_params)
     mo.vstack([
-        mo.md(r"""Clean up drops the index with `FT.DROPINDEX` and no `DD`, then unlinks the 36 keys by name. Nothing is scanned, and every key would expire within the hour in any case:"""),
+        mo.md(r"""The cell below runs `KNN 5` for *where is my parcel* once with no filter, then once per year floor with the categories chosen above:"""),
+        mo.ui.table(_rows, selection=None, show_download=False, pagination=False),
+        mo.md(r"""Filtering the top five in the app drops the rows that fail, so it can return fewer than five while more articles pass. With the filter in front of `=>`, Redis keeps reading nearest neighbors until five articles pass or none are left."""),
+        mo.md(f"```\n{redis_cli(['FT.SEARCH', rs_index_name, *rs_knn('*', 5).get_args(), *_params_args])}\n{redis_cli(['FT.SEARCH', rs_index_name, *rs_knn(rs_prefilter(_categories, 2024), 5).get_args(), *_params_args])}\n{redis_cli(['FT.SEARCH', rs_index_name, *Query(rs_prefilter(_categories, 2024)).no_content().paging(0, 0).get_args()])}\n```"),
+    ])
+    return
+
+
+@app.cell(column=1, hide_code=True)
+def rs_article_form(rs_index):
+    rs_article_form = mo.ui.dictionary({
+        "title": mo.ui.text(value="Holiday gift returns", label="Title", full_width=True),
+        "body": mo.ui.text_area(value="Gifts bought from November 15 to December 31 can be returned until January 31. Bring the gift receipt or the order number.", label="Body", full_width=True),
+        "category": mo.ui.dropdown(options=sorted({article["category"] for article in cairn.HELP_ARTICLES}), value="returns", label="Category"),
+        "year": mo.ui.slider(2022, 2026, value=2026, label="Year", show_value=True),   # the bounds every chat query filters on
+    }).form(submit_button_label="Add the article: 1 HSET, 1 EXPIRE")
+    mo.vstack([
+        # Reading rs_index makes this cell a child of rs_seed: a new Load builds a new, unsubmitted form,
+        # so rs_add_article stops instead of replaying the last submit.
+        mo.md(f"""The form below writes one more hash for `{rs_index.index_name}` to index, with a one-hour `EXPIRE`. Each submit replaces it. Submit it, then ask the chat about it:"""),
+        rs_article_form,
+    ])
+    return (rs_article_form,)
+
+
+@app.cell(column=1)
+def rs_add_article(EMBEDDING_MODEL, REDIS_CLIENT, rs_article_form, rs_index, rs_index_name, rs_reader_key):
+    mo.stop(rs_article_form.value is None)
+    _article = rs_article_form.value
+    _fields = {"title": _article["title"], "body": _article["body"], "category": _article["category"], "year": int(_article["year"]),
+               "embedding": embed_texts(EMBEDDING_MODEL, [f"{_article['title']}. {_article['body']}"])[0].tobytes()}
+    _before = int(rs_index.info()["num_docs"])   # FT.INFO
+    REDIS_CLIENT.hset(rs_reader_key, mapping=_fields)
+    REDIS_CLIENT.expire(rs_reader_key, KEY_TTL_SECONDS)
+    _after = int(rs_index.info()["num_docs"])   # FT.INFO
+    mo.vstack([
+        mo.ui.table([{"key": rs_reader_key, "num_docs before": _before, "num_docs after": _after}], selection=None, show_download=False, pagination=False),
+        mo.md(f"""`num_docs` went from {_before} to {_after}, and the app wrote only the hash. The next question in the chat searches this article too. A second submit replaces it."""),
+        mo.md(f"```\n{redis_cli(['FT.INFO', rs_index_name])}\n{redis_cli(['HSET', rs_reader_key, *[part for item in _fields.items() for part in item]])}\n{redis_cli(['EXPIRE', rs_reader_key, KEY_TTL_SECONDS])}\n{redis_cli(['FT.INFO', rs_index_name])}\n```"),
+    ])
+    return
+
+
+@app.cell(column=1, hide_code=True)
+def rs_cleanup_button():
+    rs_cleanup_button = mo.ui.run_button(label="Clean up: FT.DROPINDEX and UNLINK by name", kind="danger")
+    mo.vstack([
+        mo.md(r"""Clean up drops the index with `FT.DROPINDEX` and no `DD`, then unlinks the 36 keys and the form's article, by name. Nothing is scanned. The keys would expire within the hour anyway, but the index stays until Clean up drops it:"""),
         rs_cleanup_button,
     ])
     return (rs_cleanup_button,)
 
 
-@app.cell(column=0)
-def rs_cleanup(
-    ResponseError,
-    rs_article_keys,
-    rs_cleanup_button,
-    rs_client,
-    rs_index_name,
-):
+@app.cell(column=1)
+def rs_cleanup(REDIS_CLIENT, rs_article_keys, rs_cleanup_button, rs_index_name, rs_reader_key):
     mo.stop(not rs_cleanup_button.value)
     try:
-        rs_client.ft(rs_index_name).dropindex()   # FT.DROPINDEX with no DD, so the documents stay
+        REDIS_CLIENT.ft(rs_index_name).dropindex()   # FT.DROPINDEX with no DD, so the documents stay
         _index_report = "Dropped 1 index"
-    except ResponseError as _exc:
-        if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
+    except redis.ResponseError as _exc:
+        if not any(_phrase in str(_exc).lower() for _phrase in ("not found", "unknown index", "no such index")):   # 8.6: SEARCH_INDEX_NOT_FOUND; older builds: Unknown index name
             raise
         _index_report = "The index was already gone"
-    rs_keys_removed = rs_client.unlink(*rs_article_keys)   # UNLINK key1 ... key36, by name
+    _keys = [*rs_article_keys, rs_reader_key]
+    _removed = REDIS_CLIENT.unlink(*_keys)   # UNLINK key1 ... keyN, by name
     mo.vstack([
-        mo.callout(mo.md(f"{_index_report}. Unlinked {rs_keys_removed} of {len(rs_article_keys)} keys: Redis returns the count of keys that existed."), kind="success"),
-        mo.md(f"```\n{redis_cli(['FT.DROPINDEX', rs_index_name])}\n{redis_cli(['UNLINK', *rs_article_keys[:2]])} ... ({len(rs_article_keys)} keys)\n```"),
-        mo.md(r"""`DD` would delete every key under the prefix, and this notebook never trusts a prefix over a list it holds."""),
-    ])
-    return
-
-
-@app.cell(column=1, hide_code=True)
-def lc_title():
-    mo.vstack([
-        mo.md(r"""
-    # Redis LangCache
-
-    Users rarely ask the same question the same way twice, and an exact-match cache misses every
-    rewording. Redis LangCache matches prompts by meaning: it embeds the prompt, searches the cache,
-    and returns the stored answer when the similarity clears a threshold. Its one job in this
-    column: return a stored answer for a question asked in other words.
-
-    A match is a score above a line, so a wrong answer for a question that only sounds similar is
-    possible. The threshold is the dial, and this column turns it. LangCache is in public preview on
-    Redis Cloud.
-
-    Settings: `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`. Docs:
-    [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
-    [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
-    """),
-        mo.mermaid("""flowchart LR
-    P[Prompt] --> S["POST /entries/search"]
-    S -->|"similarity >= threshold"| H[Stored answer]
-    S -->|"data: empty"| L[Call the LLM]
-    L --> W["POST /entries with ttlMillis"]
-    W -.-> S"""),
-        mo.accordion({
-            "The same calls with the `langcache` SDK (not installed here)": mo.md(r"""
-    ```python
-    from langcache import LangCache
-
-    with LangCache(server_url="https://<host>", cache_id="<cache id>", api_key="<api key>") as cache:
-        cache.search(prompt="How do I wash a down sleeping bag?", similarity_threshold=0.85)
-        cache.set(prompt="...", response="...", ttl_millis=900_000)
-        cache.delete_by_id(entry_id="<entryId>")
-    ```
-
-    This notebook sends the JSON itself so you can read it.
-    """),
-        }),
-    ])
-    return
-
-
-@app.cell(column=1)
-def lc_configure():
-    mo.stop(not all(os.environ.get(name) for name in ("LANGCACHE_HOST", "LANGCACHE_CACHE_ID", "LANGCACHE_API_KEY")), mo.callout(mo.md("LangCache is not configured. Set `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY` in the `.env` next to `pyproject.toml` (see `.env.example`), then restart the kernel."), kind="warn"))
-    _host = os.environ["LANGCACHE_HOST"].strip().rstrip("/")
-    if "://" not in _host:
-        _host = "https://" + _host
-    lc_service = niquests.Session(
-        base_url=f"{_host}/v1/caches/{os.environ['LANGCACHE_CACHE_ID'].strip()}",
-        headers={
-            "Authorization": f"Bearer {os.environ['LANGCACHE_API_KEY'].strip()}",   # the key lives here and nowhere else
-            "Accept": "application/json",
-            "Content-Type": "application/json",   # pinned: niquests' default adds ;charset=utf-8. Accepted by LangCache on 2026-10-01
-            "User-Agent": "redis-iris-basics",
-        },
-        timeout=(5, 30),        # seconds: connect, read
-        disable_http3=True,     # HTTP/1.1 or HTTP/2 only, so the wire view reads the same on every machine
-    )
-    lc_entry_ttl_milliseconds = 900_000   # 15 minutes: every entry this column stores expires on its own
-
-    def lc_own_hits(reply, own_ids):
-        """This kernel's hits, and a copy of every hit that is safe to show."""
-        hits = reply.get("data", []) if isinstance(reply, dict) else []
-        mine = [hit for hit in hits if hit.get("id") in own_ids]
-        shown = [hit if hit.get("id") in own_ids else {"hidden": "another app's entry", "similarity": hit.get("similarity")} for hit in hits]
-        return mine, shown
-
-    try:
-        lc_check_status, _body, lc_check_wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": "Cairn Outfitters connection check", "maxResults": 1})
-    except niquests.RequestException as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching LangCache. Check `LANGCACHE_HOST`."), kind="danger"))
-    _type = _body.get("type", "") if isinstance(_body, dict) else ""
-    _hint = {401: "check `LANGCACHE_API_KEY`", 404: "check `LANGCACHE_CACHE_ID`"}.get(lc_check_status, "read the body below")
-    mo.stop(lc_check_status != 200, mo.callout(mo.vstack([mo.md(f"LangCache answered `{lc_check_status}` `{_type}`: {_hint}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    lc_store_button = mo.ui.run_button(label="Store 5 gear-care answers with ttlMillis 900000", kind="success")
-    mo.vstack([
-        mo.callout(mo.md(f"Connected: LangCache answered `200` in {lc_check_wire['ms']} ms."), kind="success"),
-        mo.accordion({"Request as sent (credential masked)": mo.json(lc_check_wire)}),
-        mo.md(r"""The button below stores five gear-care answers, each with `ttlMillis` 900000 so it expires in 15 minutes whether or not you press Clean up. LangCache answers `201` with an `entryId`:"""),
-        lc_store_button,
-    ])
-    return lc_entry_ttl_milliseconds, lc_own_hits, lc_service, lc_store_button
-
-
-@app.cell(column=1)
-def lc_store(lc_entry_ttl_milliseconds, lc_service, lc_store_button):
-    if not lc_store_button.value:
-        lc_stored_entries, lc_store_wire = [], None
-        _output = mo.callout(mo.md("Press *Store 5 gear-care answers with ttlMillis 900000* above."), kind="info")
-    else:
-        lc_stored_entries, lc_store_wire, _first_body, _problems = [], None, None, []
-        for _row in cairn.GEAR_CARE_ANSWERS:
-            _status, _body, _wire = call_service(lc_service, "POST", "/entries", json_body={"prompt": _row["prompt"], "response": _row["response"], "ttlMillis": lc_entry_ttl_milliseconds})
-            lc_store_wire, _first_body = lc_store_wire or _wire, _first_body or _body
-            if _status == 201 and isinstance(_body, dict) and _body.get("entryId"):
-                lc_stored_entries.append({"key": _row["key"], "prompt": _row["prompt"], "entryId": _body["entryId"]})
-            else:
-                _problems.append({"key": _row["key"], "status": _status, "type": _body.get("type", "") if isinstance(_body, dict) else ""})
-        _parts = [
-            mo.ui.table(lc_stored_entries, selection=None, pagination=False),
-            mo.accordion({"First request as sent (credential masked)": mo.json(lc_store_wire), "Reply": mo.json(_first_body or {})}),
-            mo.md(r"""LangCache embeds each prompt as it is stored and answers `201` with the `entryId` you will delete later. Those ids are the only handle on the entries, because a cache cannot be listed."""),
-        ]
-        if _problems:
-            _parts.append(mo.callout(mo.vstack([mo.md(f"LangCache refused {len(_problems)} of the 5 stores. The rows that answered `201` are kept."), mo.json(_problems)]), kind="danger"))
-        _output = mo.vstack(_parts)
-    _output
-    return (lc_stored_entries,)
-
-
-@app.cell(column=1)
-def lc_anatomy_of_a_hit(lc_own_hits, lc_service, lc_stored_entries):
-    mo.stop(not lc_stored_entries, mo.callout(mo.md("Store the answers first."), kind="info"))
-    _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": "What's the right way to launder a goose-down sleeping bag?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5})
-    _mine, _shown = lc_own_hits(_body, {entry["entryId"] for entry in lc_stored_entries})
-    _type = _body.get("type", "") if isinstance(_body, dict) else ""
-    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"LangCache answered `{_status}` `{_type}`: read the body below."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    mo.vstack([
-        mo.md(r"""This cell asks *What's the right way to launder a goose-down sleeping bag?* at `similarityThreshold` 0.85, the console default for a new service. The stored prompt is *How do I wash my down sleeping bag?*, and LangCache returns every entry whose similarity clears that line:"""),
-        mo.callout(mo.md(f"LangCache answered `{_status}` with {len(_mine)} of this kernel's entries above the line in {_wire['ms']} ms."), kind="success" if _mine else "warn"),
-        mo.accordion({"Request as sent (credential masked)": mo.json(_wire), "Reply (other apps' entries hidden)": mo.json({"data": _shown})}, multiple=True, expanded=True),
-        mo.md(r"""`similarity` is the cosine similarity of the two prompt embeddings. In a live run on 2026-10-01 LangCache returned the down-bag answer at 0.905, although *launder* and *wash* share no word. A miss is `200` with an empty `data`, never a `404`."""),
-        mo.md(r"""In the same run LangCache scored *My rain jacket stopped beading water. How do I fix that?* at 0.812 against the rain-shell answer, under the line. Which questions clear the line is what the slider below is for."""),
-    ])
-    return
-
-
-@app.cell(column=1)
-def lc_probes_and_slider(lc_own_hits, lc_service, lc_stored_entries):
-    mo.stop(not lc_stored_entries)
-    _own_keys = {entry["entryId"]: entry["key"] for entry in lc_stored_entries}
-    lc_probe_scores, _first_wire = [], None
-    for _probe in cairn.THRESHOLD_PROBES:
-        _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _probe["text"], "similarityThreshold": 0.5, "searchStrategies": ["semantic"], "maxResults": 5})
-        _first_wire = _first_wire or _wire
-        _mine, _shown = lc_own_hits(_body, set(_own_keys))
-        _best = max(_mine, key=lambda hit: hit["similarity"], default=None)
-        lc_probe_scores.append({
-            "text": _probe["text"], "kind": _probe["kind"], "target": _probe["target"],
-            "status": _status, "type": _body.get("type", "") if isinstance(_body, dict) else "",
-            "best_key": _own_keys[_best["id"]] if _best else None,
-            "similarity": _best["similarity"] if _best else None,
-        })
-    lc_threshold = mo.ui.slider(0.5, 1.0, step=0.01, value=0.85, debounce=True, show_value=True, label="similarityThreshold")
-    mo.vstack([
-        mo.md(r"""This cell searches six labelled questions once each at `similarityThreshold` 0.50, the slider's floor, so every score the slider can cut is on the table. The slider re-applies the cut on your machine, the same cut the server applies when you send the value:"""),
-        mo.accordion({"First request as sent (credential masked)": mo.json(_first_wire)}),
-        lc_threshold,
-    ])
-    return lc_probe_scores, lc_threshold
-
-
-@app.cell(column=1)
-def lc_threshold_table(lc_probe_scores, lc_threshold):
-    _cut = round(lc_threshold.value, 2)
-    _rows = []
-    for _probe in lc_probe_scores:
-        _above = _probe["similarity"] is not None and _probe["similarity"] >= _cut
-        if _probe["status"] != 200:
-            _verdict = f"{_probe['status']} {_probe['type']}".strip()   # the search failed, so this row scores nothing
-        elif _above and _probe["best_key"] == _probe["target"]:
-            _verdict = "HIT"
-        elif _above:
-            _verdict = "WRONG ANSWER"
-        else:
-            _verdict = "MISS"
-        _rows.append({
-            "question": _probe["text"], "kind": _probe["kind"], "best match": _probe["best_key"] or "-",
-            "similarity": round(_probe["similarity"], 3) if _probe["similarity"] is not None else "-", "verdict": _verdict,
-        })
-    _tints = {"HIT": "rgba(46, 160, 67, 0.3)", "WRONG ANSWER": "rgba(248, 81, 73, 0.3)", "MISS": "rgba(110, 118, 129, 0.3)"}   # anything else is amber
-    mo.vstack([
-        mo.md(r"""Raise the slider until the red rows go, and watch the grey ones multiply:"""),
-        mo.ui.table(_rows, selection=None, pagination=False, style_cell=lambda row_id, column, value: {"backgroundColor": _tints.get(value, "rgba(210, 153, 34, 0.3)")} if column == "verdict" else {}),
-        mo.md(r"""In a live run on 2026-10-01 the worst wrong answer scored 0.950: the synthetic bag was served the down-bag answer. The negation scored 0.735 and the tent paraphrase 0.839, both under 0.85. Scores vary by model and phrasing, and the trade-off does not."""),
-    ])
-    return
-
-
-@app.cell(column=1)
-def lc_strategies(lc_own_hits, lc_service, lc_stored_entries):
-    mo.stop(not lc_stored_entries)
-    _own_keys = {entry["entryId"]: entry["key"] for entry in lc_stored_entries}
-    _rows, _first_wire = [], None
-    for _variant in cairn.STRATEGY_VARIANTS:   # both variants respell the stored down-bag prompt, so "bag" is the one right entry
-        _row = {"variant": _variant["label"], "prompt sent": _variant["text"]}
-        for _strategy in ("exact", "semantic"):
-            _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _variant["text"], "similarityThreshold": 0.85, "searchStrategies": [_strategy], "maxResults": 5})
-            _first_wire = _first_wire or _wire
-            _mine, _shown = lc_own_hits(_body, set(_own_keys))
-            _best = max(_mine, key=lambda hit: hit["similarity"], default=None)
-            _type = _body.get("type", "") if isinstance(_body, dict) else ""
-            _verdict = f"{_status} {_type}".strip() if _status != 200 else ("MISS" if _best is None else f"HIT {_best['similarity']:.2f}")
-            _row[_strategy] = "HIT (wrong entry)" if _best and _own_keys[_best["id"]] != "bag" else _verdict
-        _rows.append(_row)
-    mo.vstack([
-        mo.md(r"""`searchStrategies` picks the matcher: `exact` is a case-insensitive string compare that reports `similarity` 1, and `semantic` is the embedding. This cell sends two spellings of a stored prompt through each:"""),
-        mo.ui.table(_rows, selection=None, pagination=False),
-        mo.accordion({"First request as sent (credential masked)": mo.json(_first_wire)}),
-        mo.md(r"""The default is `semantic` alone. In a live run on 2026-10-01, *HOW DO I WASH MY DOWN SLEEPING BAG?* hit under `exact` and missed under `semantic`. Dropping the question mark did the reverse."""),
-    ])
-    return
-
-
-@app.cell(column=1, hide_code=True)
-def lc_cache_aside_button():
-    lc_cache_aside_button = mo.ui.run_button(label="Run the cache-aside loop: miss, store for 10 s, hit, expire, 404", kind="success")
-    mo.vstack([
-        mo.md(r"""The button below plays the cache-aside loop with you as the model. It runs a miss, a store with `ttlMillis` 10000, a reworded search that should hit, a 12-second wait, a second miss, and a `DELETE` that finds nothing:"""),
-        lc_cache_aside_button,
-    ])
-    return (lc_cache_aside_button,)
-
-
-@app.cell(column=1)
-def lc_cache_aside(
-    lc_cache_aside_button,
-    lc_own_hits,
-    lc_service,
-    lc_stored_entries,
-):
-    mo.stop(not lc_cache_aside_button.value, mo.callout(mo.md("Press *Run the cache-aside loop: miss, store for 10 s, hit, expire, 404* above."), kind="info"))
-    _script = cairn.CACHE_ASIDE_SCRIPT
-    _own = {entry["entryId"] for entry in lc_stored_entries}
-    _search = {"similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
-    _steps, _wires = [], []
-    _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _script["prefix"] + _script["ask"], **_search})
-    _mine, _shown = lc_own_hits(_body, _own)
-    _steps.append({"step": "1 ask", "request": "POST /entries/search", "status": _status, "similarity": f"hit {_mine[0]['similarity']:.3f}" if _mine else "miss", "ms": _wire["ms"]})
-    _wires.append(_wire)
-    _status, _body, _wire = call_service(lc_service, "POST", "/entries", json_body={"prompt": _script["prefix"] + _script["ask"], "response": _script["answer"], "ttlMillis": 10_000})
-    _taught_id = _body.get("entryId") if isinstance(_body, dict) else None
-    _type = _body.get("type", "") if isinstance(_body, dict) else ""
-    mo.stop(_status != 201 or not _taught_id, mo.callout(mo.vstack([mo.md(f"LangCache answered `{_status}` `{_type}` to the store, so the loop stops here. Read the body below."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    _steps.append({"step": "2 store the answer for 10 s", "request": "POST /entries", "status": _status, "similarity": "-", "ms": _wire["ms"]})
-    _wires.append(_wire)
-    _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _script["prefix"] + _script["again"], **_search})
-    _mine, _shown = lc_own_hits(_body, _own | {_taught_id})   # steps 3 and 4 credit the taught entry alone, never a stored one that also cleared the line
-    _steps.append({"step": "3 ask again in other words", "request": "POST /entries/search", "status": _status, "similarity": next((f"hit {hit['similarity']:.3f}" for hit in _mine if hit.get("id") == _taught_id), "miss"), "ms": _wire["ms"]})
-    _wires.append(_wire)
-    with mo.status.spinner(title="Waiting 12 s for ttlMillis to fire"):
-        time.sleep(12)
-    _status, _body, _wire = call_service(lc_service, "POST", "/entries/search", json_body={"prompt": _script["prefix"] + _script["again"], **_search})
-    _mine, _shown = lc_own_hits(_body, _own | {_taught_id})
-    _steps.append({"step": "4 ask again after 12 s", "request": "POST /entries/search", "status": _status, "similarity": next((f"hit {hit['similarity']:.3f}" for hit in _mine if hit.get("id") == _taught_id), "miss"), "ms": _wire["ms"]})
-    _wires.append(_wire)
-    _status, _body, _wire = call_service(lc_service, "DELETE", f"/entries/{_taught_id}")
-    _type = _body.get("type", "") if isinstance(_body, dict) else ""
-    _steps.append({"step": "5 delete the taught entry", "request": "DELETE /entries/{entryId}", "status": "204: not expired yet, deleted now" if _status == 204 else f"{_status} {_type}".strip(), "similarity": "-", "ms": _wire["ms"]})
-    _wires.append(_wire)
-    mo.vstack([
-        mo.ui.table(_steps, selection=None, pagination=False),
-        mo.accordion({"Requests as sent (credential masked)": mo.json(_wires)}),
-        mo.md(r"""The miss at step 1 is where your app would call the model, and step 2 is you storing its answer. In a live run on 2026-10-01 the reworded question hit at 0.943 and the last `DELETE` answered `404`. That `404` is why this notebook can rely on TTL alone. Every prompt is prefixed *At Cairn Outfitters:* so the entry stays clear of other apps' questions on a shared cache."""),
-    ])
-    return
-
-
-@app.cell(column=1, hide_code=True)
-def lc_cleanup_button():
-    lc_cleanup_button = mo.ui.run_button(label="Clean up: DELETE 5 entries by id", kind="danger")
-    mo.vstack([
-        mo.md(r"""Clean up sends one `DELETE /entries/{entryId}` per id the last Store press returned. A `204` is a deletion, and a `404` of type `resource-not-found` or `entry/not-found` means the TTL expired it first:"""),
-        lc_cleanup_button,
-    ])
-    return (lc_cleanup_button,)
-
-
-@app.cell(column=1)
-def lc_cleanup(lc_cleanup_button, lc_service, lc_stored_entries):
-    mo.stop(not lc_cleanup_button.value)
-    _gone, _problems, _wires = [], [], []
-    for _entry in lc_stored_entries:
-        # This bodiless DELETE carries the session's pinned Content-Type. LangCache answered 204 to five of them on 2026-10-01 (checklist row 4).
-        try:
-            _status, _body, _wire = call_service(lc_service, "DELETE", f"/entries/{_entry['entryId']}")
-        except niquests.RequestException as _exc:   # one lost connection does not stop the other deletes
-            _status, _body, _wire = type(_exc).__name__, {}, {"error": type(_exc).__name__}
-        _wires.append(_wire)
-        _type = _body.get("type", "") if isinstance(_body, dict) else ""
-        if _status == 204 or (_status == 404 and re.search(r"/(entry/not-found|resource[-/]not-found)$", _type)):
-            _gone.append(_status)
-        else:
-            _problems.append({"key": _entry["key"], "status": _status, "type": _type})
-    _summary = mo.md(f"Deleted {_gone.count(204)}, already expired {_gone.count(404)}." if lc_stored_entries else "Nothing stored in this run.")
-    mo.vstack([
-        mo.callout(_summary, kind="success") if not _problems else mo.callout(mo.vstack([_summary, mo.json(_problems)]), kind="danger"),
-        mo.accordion({"Requests as sent (credential masked)": mo.json(_wires)}),
-        mo.md(r"""LangCache cannot list a cache. An entry left by an earlier Store press or a crashed kernel is reached only by its TTL, and every entry stored here carried one."""),
+        mo.callout(mo.md(f"{_index_report}. Unlinked {_removed} of {len(_keys)} keys. `UNLINK` returns the count of keys that existed. The chat and the filter table need a new Load."), kind="success"),
+        mo.md(f"```\n{redis_cli(['FT.DROPINDEX', rs_index_name])}\n{redis_cli(['UNLINK', *_keys[:2]])} ... ({len(_keys)} keys)\n```"),
+        mo.md(r"""`DD` would delete every key under the prefix."""),
     ])
     return
 
 
 @app.cell(column=2, hide_code=True)
-def cr_title():
+def lc_title():
+    mo.md(r"""
+    # Redis LangCache
+
+    Customers rarely ask the same question the same way twice, and an exact-match cache misses every rewording.
+    Redis LangCache matches prompts by meaning, so a reworded question can get a stored answer without an LLM call.
+    Store five Cairn Outfitters gear-care answers, then ask Cairn support below and move the threshold to see three principles:
+
+    1. **Your app searches before the LLM and stores after it.** LangCache embeds every prompt itself, and your app calls the LLM only on a miss and then stores the answer.
+    2. **The threshold trades wrong answers for misses.** LangCache serves any entry whose similarity clears `similarityThreshold`, so a question that only sounds similar can get a wrong answer.
+    3. **A cached answer lives until its time to live (TTL) runs out.** Until `ttlMillis` passes or your app deletes it, LangCache serves the answer unchanged, so the TTL caps how stale it gets.
+
+    LangCache is in public preview on Redis Cloud. Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, plus `ANTHROPIC_API_KEY`, which the chat needs on a miss. Docs:
+    [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
+    [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/),
+    [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/), and
+    [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
+
+    Each line reads source, target, and what passes between them:
+
+    ```text
+    App       -> LangCache        POST /entries/search with the prompt text
+    LangCache -> embedding model  the prompt, embedded on the service side
+    LangCache -> App              data: [entries above the threshold], or data: []
+    App       -> Claude           the question, only when data is empty
+    App       -> LangCache        POST /entries with the answer and ttlMillis
+    ```
+    """)
+    return
+
+
+@app.cell(column=2, hide_code=True)
+def lc_seed_button():
+    lc_seed_button = mo.ui.run_button(label="Store 5 answers for 15 minutes: 5 POST /entries, 16 searches", kind="success")
     mo.vstack([
-        mo.md(r"""
-    # Redis Context Retriever
-
-    An agent that writes its own queries against your database is a governance problem. Redis
-    Context Retriever takes a data model you declare in Python. It provisions indexes in your own
-    Redis and generates MCP tools whose arguments are constrained by that model. Its one job in
-    this column: turn three Python classes into MCP tools an agent calls over your Redis.
-
-    The agent gets `get_customer_by_id` and `filter_customer`, never a raw command. Context
-    Retriever is in preview. This column needs an admin key (`CTX_ADMIN_KEY`) and, in `REDIS_URL`, a
-    scratch database with Search and JSON that the hosted service can reach. The service is given
-    that database's password.
-
-    Docs: [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/).
-    """),
-        mo.mermaid("""flowchart LR
-    M[ContextModel classes] -->|export_data_model| J[data_model JSON]
-    J -->|"POST /context-surfaces"| S["Surface + agent key"]
-    S -->|"writes JSON, builds indexes"| R[(Your Redis)]
-    A[Agent] -->|"tools/call over MCP"| S"""),
+        mo.md(r"""The button below runs the cache-aside loop on five gear-care answers. Each press sends a search, five stores with `ttlMillis` 900000, and the question again in other words, then 14 searches for the threshold table. The chat and the threshold table appear after the first press:"""),
+        lc_seed_button,
     ])
+    return (lc_seed_button,)
+
+
+@app.cell(column=2)
+def lc_seed(LANGCACHE, langcache_search, lc_seed_button):
+    mo.stop(not lc_seed_button.value)
+    # Step 1 asks the down-bag question before this press stores it, so every entry it finds is hidden.
+    _, _ask_wire = langcache_search(cairn.GEAR_CARE_ANSWERS[1]["prompt"], set())
+    _others = len(_ask_wire["reply"]["data"])
+    _steps = [{"step": "1 ask", "request": "POST /entries/search", "status": _ask_wire["status"], "result": f"hit on {_others} hidden {'entry' if _others == 1 else 'entries'}" if _others else "miss", "ms": _ask_wire["ms"]}]
+
+    lc_entry_keys, _store_wires = {}, []
+    for _row in cairn.GEAR_CARE_ANSWERS:
+        _, _body, _wire = call_service(LANGCACHE, "POST", "/entries", json_body={
+            "prompt": _row["prompt"], "response": _row["response"], "ttlMillis": 900_000})   # 15 minutes
+        lc_entry_keys[_body["entryId"]] = _row["key"]
+        _store_wires.append({**_wire, "reply": _body})
+    _steps.append({"step": "2 store 5 answers", "request": "POST /entries x5", "status": " ".join(str(_wire["status"]) for _wire in _store_wires), "result": "5 entryIds", "ms": sum(_wire["ms"] for _wire in _store_wires)})
+
+    _hits, _again_wire = langcache_search(cairn.THRESHOLD_PROBES[0]["text"], lc_entry_keys)
+    _steps.append({"step": "3 ask in other words", "request": "POST /entries/search", "status": _again_wire["status"], "result": f"hit: {lc_entry_keys[_hits[0]['id']]} at {_hits[0]['similarity']:.3f}" if _hits else "miss", "ms": _again_wire["ms"]})
+
+    mo.vstack([
+        mo.ui.table(_steps, selection=None, pagination=False),
+        mo.accordion({"Requests as sent (credential masked, other entries hidden)": mo.json([_ask_wire, _store_wires[0], _again_wire])}),
+        mo.md(r"""A miss is `200` with an empty `data`, never a `404`. Step 2 stores five answers written in advance, and the chat below stores Claude's answers the same way."""),
+        mo.md(r"""Each request carries only text. LangCache embeds it on the service side, while the Redis Search column embeds on this machine. In a live run on 2026-10-05 step 3 hit the down-bag answer at 0.905, although *launder* and *wash* share no word."""),
+        mo.md(r"""LangCache derives each `entryId` from the prompt text, so a second press reuses the same five ids. In a scratch check on 2026-10-05 a second store of one prompt answered `201` with the same id and replaced the response and TTL. Step 1 of that press then hits the earlier down-bag entry and any close answer the chat stored, all shown hidden."""),
+    ])
+    return (lc_entry_keys,)
+
+
+@app.cell(column=2)
+def lc_chat_store():
+    lc_chat_entries = {}   # every answer the chat stored, by entryId; its own cell, so a seed press that resets the chat keeps them for Clean up
+    return (lc_chat_entries,)
+
+
+@app.cell(column=2)
+def lc_chat(LANGCACHE, ask_llm, langcache_search, lc_chat_entries, lc_entry_keys):
+    lc_threshold = mo.ui.slider(0.5, 1.0, step=0.01, value=0.85, show_value=True, label="`similarityThreshold`")
+    lc_strategy = mo.ui.dropdown(["semantic", "exact"], value="semantic", label="`searchStrategies`")
+    lc_ttl = mo.ui.dropdown({"10 s": 10_000, "1 minute": 60_000, "15 minutes": 900_000}, value="1 minute", label="`ttlMillis` for an answer stored on a miss")
+    lc_turns = []   # one dict per turn
+    _targets = {probe["text"]: probe["target"] for probe in cairn.THRESHOLD_PROBES}
+
+    def _model(messages, config):
+        question = messages[-1].content
+        own = {**lc_entry_keys, **{entry_id: entry["prompt"] for entry_id, entry in lc_chat_entries.items()}}
+        _, wire = langcache_search(question, own, threshold=lc_threshold.value, strategies=(lc_strategy.value,))
+        _, candidates_wire = langcache_search(question, own, threshold=0.5)   # where the line sits, for the cell below
+        turn = {
+            "question": question, "search": f"{lc_strategy.value}, {lc_threshold.value:.2f}", "decision": "miss, no answer stored",
+            "served": "-", "similarity": "-", "entry age s": "-", "ttlMillis": "-", "cache ms": wire["ms"], "Claude ms": "-", "store ms": "-",
+            "candidates": [{"entry": own[hit["id"]] if "id" in hit else hit["hidden"], "similarity": round(hit["similarity"], 3),
+                            "clears the threshold under semantic": "yes" if hit["similarity"] >= lc_threshold.value else "no"} for hit in candidates_wire["reply"]["data"]],
+            "wires": [wire, candidates_wire],
+        }
+        lc_turns.append(turn)
+        top = wire["reply"]["data"][0] if wire["reply"]["data"] else None   # what LangCache would serve
+
+        if top and "hidden" in top:   # an entry this notebook did not store: show none of it, and store nothing over it
+            turn.update(decision="hit on a hidden entry", similarity=round(top["similarity"], 3))
+            return f"LangCache returned an entry from another writer or an earlier kernel, at {top['similarity']:.3f}. The notebook hides it and stores nothing."
+
+        if top:
+            label = own[top["id"]]
+            right = question not in _targets or label in (_targets[question], question)
+            turn.update(decision="hit" if right else "wrong answer", served=label, similarity=round(top["similarity"], 3), ttlMillis=900_000)
+            if top["id"] in lc_chat_entries:
+                turn["ttlMillis"] = lc_chat_entries[top["id"]]["ttlMillis"]
+                turn["entry age s"] = round(time.monotonic() - lc_chat_entries[top["id"]]["stored"], 1)
+            return f"{top['response']}\n\n*LangCache {turn['decision']}: `{label}` at {top['similarity']:.3f} in {wire['ms']} ms.*"
+
+        started = time.perf_counter()
+        answer = ask_llm("You are Cairn Outfitters gear-care support. Answer in at most three sentences.",
+                         [{"role": "user", "content": question}])   # the question alone, so the stored answer fits anyone who asks it
+        turn["Claude ms"] = round((time.perf_counter() - started) * 1000)
+        _, body, store_wire = call_service(LANGCACHE, "POST", "/entries", json_body={"prompt": question, "response": answer, "ttlMillis": lc_ttl.value})
+        if body["entryId"] in lc_chat_entries:   # the chat stored this question before and the search missed it, so the TTL ran out or Clean up deleted it
+            turn["entry age s"] = round(time.monotonic() - lc_chat_entries[body["entryId"]]["stored"], 1)
+        lc_chat_entries[body["entryId"]] = {"prompt": question, "ttlMillis": lc_ttl.value, "stored": time.monotonic()}
+        turn["decision"], turn["ttlMillis"], turn["store ms"] = "miss", lc_ttl.value, store_wire["ms"]
+        turn["wires"].append({**store_wire, "reply": body})
+        return f"{answer}\n\n*LangCache miss in {wire['ms']} ms, so Claude answered in {turn['Claude ms']} ms. Stored with `ttlMillis` {lc_ttl.value}.*"
+
+    lc_chat = mo.ui.chat(_model, prompts=[probe["text"] for probe in cairn.THRESHOLD_PROBES] + [
+        cairn.CACHE_ASIDE_SCRIPT["prefix"] + cairn.CACHE_ASIDE_SCRIPT["ask"], cairn.CACHE_ASIDE_SCRIPT["prefix"] + cairn.CACHE_ASIDE_SCRIPT["again"]])
+    mo.vstack([
+        mo.md(r"""The chat below is Cairn support. Each question searches LangCache at the similarity threshold and strategy you set, and a hit returns the stored answer. A miss goes to Claude, and the notebook stores its answer with the `ttlMillis` you pick:"""),
+        mo.hstack([lc_threshold, lc_strategy, lc_ttl], justify="start", wrap=True),
+        lc_chat,
+    ])
+    return lc_chat, lc_strategy, lc_threshold, lc_ttl, lc_turns
+
+
+@app.cell(column=2)
+def lc_last_turn(lc_chat, lc_turns):
+    if not lc_chat.value:
+        _output = mo.md("Ask Cairn support a question, or pick a suggested prompt, and this cell shows what LangCache did.")
+    else:
+        _turn = lc_turns[-1]
+        _claude = f"then Claude answered in {_turn['Claude ms']} ms" if _turn["decision"] == "miss" else "and no Claude call followed"
+        _output = mo.vstack([
+            mo.md(f"""Last turn: **{_turn['decision']}**. LangCache answered the search (`{_turn['search']}`) in {_turn['cache ms']} ms, {_claude}. A second `semantic` search at 0.50 returns at most five of the closest entries and marks which clear your threshold:"""),
+            mo.ui.table(_turn["candidates"], selection=None, pagination=False),
+            mo.md(r"""Every turn so far, oldest first. A hit on an answer the chat stored, or a miss that stores it again, shows the answer's age next to its `ttlMillis`:"""),
+            mo.ui.table([{key: value for key, value in turn.items() if key not in ("candidates", "wires")} for turn in lc_turns], selection=None, pagination=False),
+            mo.accordion({"Last turn's requests as sent (credential masked, other entries hidden)": mo.json(_turn["wires"])}),
+            mo.md(r"""Claude sees only the question, so a stored answer fits anyone who asks it. Pick 10 s, ask a question the cache misses, and ask it again before and after 10 s. A new service's default TTL is no expiration, so an answer stored without `ttlMillis` is served until your app deletes it."""),
+        ])
+    _output
     return
 
 
 @app.cell(column=2)
-def cr_configure():
-    from urllib.parse import unquote, urlsplit
-
-    mo.stop(not (os.environ.get("CTX_ADMIN_KEY") and os.environ.get("REDIS_URL")), mo.callout(mo.md("Context Retriever is not configured. Set `CTX_ADMIN_KEY` and `REDIS_URL` in the `.env` next to `pyproject.toml` (see `.env.example`), then restart the kernel."), kind="warn"))
-    cr_api_url = (os.environ.get("CTX_API_URL") or "https://cloud.redis.io/context-surfaces").rstrip("/")   # `or`: a blank line in .env keeps the default
-    cr_mcp_url_default = os.environ.get("CTX_MCP_URL") or "https://gcp-us-east4.context-surfaces.redis.io/mcp"   # fallback only; the live address comes from the agent-key listing
-    cr_surface_name = f"cairn-{RUN_TAG}"
-    cr_admin_service = niquests.Session(
-        base_url=f"{cr_api_url}/api/v1",
-        headers={"X-API-Key": os.environ["CTX_ADMIN_KEY"].strip(), "Accept": "application/json", "Content-Type": "application/json", "User-Agent": "redis-iris-basics"},
-        timeout=(5, 60),        # surface creation and import do real work
-        disable_http3=True,
-    )
-
-    def cr_data_source():
-        """The data_source block of the create request, built from REDIS_URL at call time so the password is never a global."""
-        _url = urlsplit(os.environ["REDIS_URL"])
-        return {"type": "redis", "connection_config": {
-            "addr": f"{_url.hostname}:{_url.port or 6379}",
-            "username": unquote(_url.username or "default"),
-            "password": unquote(_url.password or ""),
-            "db": int(_url.path.lstrip("/") or 0),
-            "tls_enabled": _url.scheme == "rediss",   # TLS is the scheme; redis-py's connection_kwargs never carry an ssl key
-            "pool_size": 2, "min_idle_conns": 0,      # a free database allows 30 connections
-        }}
-
-    try:
-        cr_check_status, _body, cr_check_wire = call_service(cr_admin_service, "GET", "/context-surfaces", params={"page_size": 1})   # read-only key check
-        cr_redis = connect_redis(os.environ["REDIS_URL"])
-        cr_redis.ping()
-    except niquests.RequestException as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching the admin API. Check your connection, or `CTX_API_URL` if you set it."), kind="danger"))
-    except redis.RedisError as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while connecting. Check `REDIS_URL`."), kind="danger"))
-    mo.stop(cr_check_status != 200, mo.callout(mo.vstack([mo.md(f"Context Retriever's admin API answered `{cr_check_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {'check `CTX_ADMIN_KEY`' if cr_check_status == 401 else 'check `CTX_API_URL`' if cr_check_status == 404 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    mo.vstack([mo.callout(mo.md("Context Retriever accepted this key, and Redis answered `PONG`."), kind="success"), mo.accordion({"Request as sent (credential masked)": mo.json(cr_check_wire)})])
-    return (
-        cr_admin_service,
-        cr_data_source,
-        cr_mcp_url_default,
-        cr_redis,
-        cr_surface_name,
-    )
+def lc_threshold_sweep(langcache_search, lc_entry_keys):
+    lc_probe_scores, lc_sweep_wire = [], None
+    for _probe in cairn.THRESHOLD_PROBES:
+        _exact, _ = langcache_search(_probe["text"], lc_entry_keys, strategies=("exact",))
+        _semantic, _wire = langcache_search(_probe["text"], lc_entry_keys, threshold=0.5)   # one low search feeds every threshold the slider can set
+        lc_sweep_wire = lc_sweep_wire or _wire
+        lc_probe_scores.append({**_probe, "exact": _exact[:1], "semantic": _semantic[:1]})
+    return lc_probe_scores, lc_sweep_wire
 
 
 @app.cell(column=2)
+def lc_threshold_table(lc_entry_keys, lc_probe_scores, lc_sweep_wire, lc_threshold):
+    def _verdict(hits, target):
+        if not hits or hits[0]["similarity"] < lc_threshold.value:
+            return "miss"
+        return "hit" if lc_entry_keys[hits[0]["id"]] == target else "wrong answer"   # a None target is always wrong
+
+    _column = f"semantic at {lc_threshold.value:.2f}"
+    _rows = [{
+        "question": _probe["text"], "kind": _probe["kind"],
+        "served": lc_entry_keys[_probe["semantic"][0]["id"]] if _probe["semantic"] else "-",
+        "similarity": round(_probe["semantic"][0]["similarity"], 3) if _probe["semantic"] else "-",
+        "exact": _verdict(_probe["exact"], _probe["target"]), _column: _verdict(_probe["semantic"], _probe["target"]),
+    } for _probe in lc_probe_scores]
+    _rows.append({"question": "hits / wrong answers", "kind": "", "served": "", "similarity": "", **{
+        _key: f"{sum(_row[_key] == 'hit' for _row in _rows)} / {sum(_row[_key] == 'wrong answer' for _row in _rows)}" for _key in ("exact", _column)}})
+    _tints = {"hit": "rgba(46, 160, 67, 0.3)", "wrong answer": "rgba(248, 81, 73, 0.3)", "miss": "rgba(110, 118, 129, 0.3)"}
+    mo.vstack([
+        mo.md(r"""The table below scores seven labeled questions against this notebook's five entries, with one `exact` and one `semantic` search at 0.50 each. Moving the slider re-applies the similarity threshold to those scores without a new request:"""),
+        lc_threshold,
+        mo.ui.table(_rows, selection=None, pagination=False, style_cell=lambda row_id, column, value: {"backgroundColor": _tints[value]} if value in _tints else {}),
+        mo.accordion({"First semantic request as sent (credential masked, other entries hidden)": mo.json(lc_sweep_wire)}),
+        mo.md(r"""In a live run on 2026-10-05 the synthetic bag scored 0.950 against the down-bag answer, above every paraphrase. No similarity threshold in that run could keep a hit and remove that wrong answer."""),
+        mo.md(r"""Under `exact` only the all-caps copy can hit, and in that run `semantic` returned no entry for it at 0.50. The docs recommend starting at the tight end of 0.8 to 0.9, then loosening while you spot-check matches."""),
+    ])
+    return
+
+
+@app.cell(column=2, hide_code=True)
+def lc_cleanup_button():
+    lc_cleanup_button = mo.ui.run_button(label="Clean up: DELETE the 5 answers and the chat's answers by id", kind="danger")
+    mo.vstack([
+        mo.md(r"""Clean up sends one `DELETE /entries/{entryId}` for each of the five gear-care prompts and for each answer the chat stored. A `204` is a deletion, and a `404` means the TTL or an earlier Clean up removed the entry first:"""),
+        lc_cleanup_button,
+    ])
+    return (lc_cleanup_button,)
+
+
+@app.cell(column=2)
+def lc_cleanup(LANGCACHE, lc_chat_entries, lc_cleanup_button, lc_entry_keys):
+    mo.stop(not lc_cleanup_button.value)
+    _statuses, _wires = [], []
+    for _entry_id in [*lc_entry_keys, *lc_chat_entries]:   # one id per prompt: LangCache derives it from the prompt text, so this deletes that prompt's entry whoever stored it
+        _status, _, _wire = call_service(LANGCACHE, "DELETE", f"/entries/{_entry_id}", ok=(204, 404))
+        _statuses.append(_status)
+        _wires.append(_wire)
+    mo.vstack([
+        mo.callout(mo.md(f"Deleted {_statuses.count(204)}, already gone {_statuses.count(404)}."), kind="success"),
+        mo.accordion({"Requests as sent (credential masked)": mo.json(_wires)}),
+        mo.md(r"""Because LangCache derives each id from the prompt text, Clean up deletes the entries for these prompts, whoever stored them. On a cache of your own, that means this notebook. Every entry this column stores also carries a TTL."""),
+    ])
+    return
+
+
+@app.cell(column=3, hide_code=True)
+def cr_title():
+    mo.md(r"""
+    # Redis Context Retriever
+
+    An agent that writes its own queries can run any query your database allows, including one planted in a ticket it reads.
+    Redis Context Retriever gives the agent a fixed set of MCP tools instead, generated from a data model you declare once.
+    Create a surface from three Cairn classes, then call its tools from the console to see three principles:
+
+    1. **The data model generates the tools.** Three Python classes become the MCP tools the surface lists, and each field's `index` kind decides which tools exist.
+    2. **The agent can call only what the model defines.** A console sends the tool and JSON arguments you choose, with three presets that step outside the model, and a table shows each answer.
+    3. **Context Retriever is a layer on top of your Redis.** It writes JSON documents and one index per entity into your database, and the documents stay after Clean up deletes the surface.
+
+    Context Retriever is in preview on Redis Cloud, and it does not support Redis Flex or Active-Active databases.
+    Settings: `CTX_ADMIN_KEY`, plus a `REDIS_URL` for a scratch database with Search and JSON that the hosted service can reach.
+    Create sends that database's password to the service, which keeps it until Clean up deletes the surface.
+    Docs: [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/) and
+    [concepts](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/concepts/).
+
+    Each line reads source, target, and what passes between them:
+
+    ```text
+    Python classes  -> data_model JSON  export_data_model, in this kernel
+    data_model JSON -> surface          POST /context-surfaces, with your database password
+    surface         -> your Redis       JSON documents, one index per entity, a read per tool call
+    notebook        -> surface          tools/list once, then one tools/call per console submit, with an agent key
+    ```
+    """)
+    return
+
+
+@app.cell(column=3)
 def cr_data_model():
     from typing import Any
     from context_surfaces import ContextField, ContextModel, ContextRelationship, export_data_model
-
-    mo.stop(sys.version_info >= (3, 14), mo.callout(mo.md("`ContextModel` needs Python 3.13 or older. Run `uv run marimo edit iris_basics.py`."), kind="warn"))
 
     # The service names its tools after these classes (get_customer_by_id), so they carry no cr_ prefix.
     class Customer(ContextModel):
@@ -835,7 +734,7 @@ def cr_data_model():
         orders: Any = ContextRelationship(description="Orders this customer placed", target="Order", source_field="customer_id")
 
     class Product(ContextModel):
-        """An item in the Cairn catalogue."""
+        """An item in the Cairn catalog."""
 
         __redis_key_template__ = f"{KEY_PREFIX}product:{{sku}}"
         sku: str = ContextField(description="Stock keeping unit such as P100", is_key_component=True)
@@ -861,11 +760,10 @@ def cr_data_model():
     cr_record_keys = [cls.__redis_key_template__.format(**row) for entity, cls in cr_entity_classes.items() for row in cairn.SHOP_RECORDS[entity]]
     mo.vstack([
         mo.md(r"""
-    This cell declares the whole data model as three Python classes, and nothing has been sent
-    yet. Each field's `index` kind decides which tools the service generates, and
-    `__redis_key_template__` is where each record will be written in your database:
-    """),
-        mo.md(r"""
+    This cell declares the data model as three Python classes and sends nothing.
+    `__redis_key_template__` names the key each record gets in your Redis.
+    Each field's `index` kind decides which tools the service generates:
+
     | You declare | The service generates |
     |---|---|
     | `is_key_component=True` | `get_<entity>_by_id` |
@@ -873,565 +771,499 @@ def cr_data_model():
     | A `numeric` field | `summarize_<entity>` |
     | A `tag` or `numeric` field | `filter_<entity>`, with that field in its menu |
     | A `text` field | `search_<entity>_by_text` |
-    | A `ContextRelationship` | a name `expand_results` accepts |
+    | A `ContextRelationship` | no tool, only an entry under `relationships` in the exported data model |
     | Any model | `intersect_results`, `union_results`, `except_results`, and `expand_results` |
     """),
-        mo.accordion({"export_data_model output (3 entities)": mo.json(cr_data_model)}),
+        mo.accordion({f"export_data_model output ({cr_data_model['entity_count']} entities)": mo.json(cr_data_model)}),
     ])
     return cr_data_model, cr_entity_classes, cr_record_keys
 
 
-@app.cell(column=2, hide_code=True)
+@app.cell(column=3, hide_code=True)
 def cr_create_button():
-    cr_create_button = mo.ui.run_button(label="Create the surface, an agent key, and load 20 records (sends your database password)", kind="success")
+    cr_surface_name = f"cairn-{RUN_TAG}"
+    cr_create_button = mo.ui.run_button(label="Create the surface: 6 admin requests, with your database password", kind="success")
     mo.vstack([
         mo.md(r"""
-    The button below makes six admin calls, and the service keeps your database password until you delete
-    the surface. One `POST /context-surfaces` carries the data model and the password, then one agent key
-    with a one-hour `expires_at`, one `GET` for the surface's `mcp_url`, and one `POST .../data` per entity:
+    The button below sends six admin requests:
+
+    1. `POST /context-surfaces` with the data model and your database password.
+    2. `POST .../agent-keys` for an agent key that expires in one hour.
+    3. `GET .../agent-keys` for the surface's MCP address.
+    4. `POST .../data` three times, once per entity.
     """),
         cr_create_button,
+        mo.md("The service keeps the password until Clean up deletes the surface. If you press Create again, Clean up still deletes every surface with this name."),
     ])
-    return (cr_create_button,)
+    return cr_create_button, cr_surface_name
 
 
-@app.cell(column=2)
+@app.cell(column=3)
 def cr_create(
-    cr_admin_service,
+    CONTEXT_RETRIEVER,
+    REDIS_CLIENT,
     cr_create_button,
     cr_data_model,
-    cr_data_source,
     cr_entity_classes,
-    cr_mcp_url_default,
     cr_record_keys,
-    cr_redis,
     cr_surface_name,
 ):
-    cr_surface_id, cr_surface_status, cr_mcp_service, cr_mcp_url, cr_agent_key_expires = None, None, None, None, None
-    cr_indexes_before, cr_import_counts, cr_create_wire, cr_create_problem = set(), {}, None, None
-    if not cr_create_button.value:
-        _output = mo.callout(mo.md("Press *Create the surface, an agent key, and load 20 records (sends your database password)* above."), kind="info")
-    else:
-        _step, _status = "create", None
-        try:   # nothing raises once a request may have gone out, so cr_surface_name reaches Clean up in this kernel
-            cr_indexes_before = set(cr_redis.execute_command("FT._LIST"))
-            # Never retried (niquests default retries=0): a replayed create would make a second surface holding your password.
-            _status, _body, _wire = call_service(cr_admin_service, "POST", "/context-surfaces", json_body={
-                "name": cr_surface_name,
-                "description": "Made by the Redis Iris basics notebook. Safe to delete.",
-                "metadata": {"created_by": "iris-basics-notebook", "run": RUN_TAG},
-                "data_model": cr_data_model, "data_source": cr_data_source(),
+    from urllib.parse import unquote, urlsplit
+
+    mo.stop(not cr_create_button.value)
+    _url = urlsplit(os.environ["REDIS_URL"])   # cell-local, so the password is never a global
+    # Never retried (niquests' default): a replayed create would make a second surface holding your password.
+    _status, _surface, _wire = call_service(CONTEXT_RETRIEVER, "POST", "/context-surfaces", json_body={
+        "name": cr_surface_name,
+        "description": "Made by the Redis Iris basics notebook. Safe to delete.",
+        "metadata": {"created_by": "iris-basics-notebook", "run": RUN_TAG},
+        "data_model": cr_data_model,
+        "data_source": {"type": "redis", "connection_config": {
+            "addr": f"{_url.hostname}:{_url.port or 6379}",
+            "username": unquote(_url.username or "default"),
+            "password": unquote(_url.password or ""),
+            "db": int(_url.path.lstrip("/") or 0),
+            "tls_enabled": _url.scheme == "rediss",
+            "pool_size": 2, "min_idle_conns": 0,   # a free database allows 30 connections
+        }},
+    })
+    _wire["body"]["data_source"]["connection_config"]["password"] = "***"   # mask on the line after the call, before anything can show it
+    cr_surface_id = _surface["id"]
+    _expires = (datetime.now(timezone.utc) + timedelta(seconds=KEY_TTL_SECONDS)).isoformat(timespec="seconds")
+    _, _key, _ = call_service(CONTEXT_RETRIEVER, "POST", f"/context-surfaces/{cr_surface_id}/agent-keys", json_body={"name": f"{cr_surface_name}-agent", "expires_at": _expires})
+    _, _keys, _ = call_service(CONTEXT_RETRIEVER, "GET", f"/context-surfaces/{cr_surface_id}/agent-keys", params={"page_size": 50})
+    cr_mcp_url = next(item["mcp_url"] for item in _keys["agent_keys"] if item["id"] == _key["id"])
+    # The agent key lives in this session's headers and nowhere else. Accept: */* is what the live run sent.
+    cr_mcp = iris_session(cr_mcp_url, {"X-API-Key": _key["key"], "Accept": "*/*"})
+    _imported = {}
+    try:
+        for _entity, _model in cr_entity_classes.items():
+            _, _reply, _ = call_service(CONTEXT_RETRIEVER, "POST", f"/context-surfaces/{cr_surface_id}/data", json_body={
+                "entity": _entity,
+                "records": [_model(**row).model_dump() for row in cairn.SHOP_RECORDS[_entity]],
+                "options": {"on_conflict": "overwrite", "on_error": "fail_fast"},
             })
-            _wire["body"]["data_source"]["connection_config"]["password"] = "***"   # mask before this dict is bound to anything else
-            cr_create_wire, _step = _wire, "reply"
-        except (niquests.RequestException, redis.RedisError) as _exc:
-            cr_create_problem = f"{type(_exc).__name__} at step {_step}"
-        if cr_create_problem:
-            _output = mo.callout(mo.md(f"`{cr_create_problem}`. The service may still have made the surface, so press Clean up below: it finds every surface named `{cr_surface_name}`."), kind="warn")
-        elif _status != 201:
-            # The request carried the password and validation errors commonly echo their input, so the reply is never rendered: only the status and three cut strings, after checking the password is not in the body.
-            _password = cr_data_source()["connection_config"]["password"]
-            _safe = isinstance(_body, dict) and (not _password or _password not in json.dumps(_body))
-            _fields = {name: str(_body.get(name, ""))[:200] for name in ("type", "title", "detail")} if _safe else {}
-            _output = mo.callout(mo.md(f"Context Retriever's admin API answered `{_status}` `{_fields.get('type', '')}`. {_fields.get('title', '')} {_fields.get('detail', '')}".strip() + (" The reply is not shown because it may echo the request." if not _safe else "")), kind="danger")
-        else:
-            try:
-                cr_surface_id, cr_surface_status, _step = _body["id"], _body["status"], "agent key"     # provisioning_indices live
-                _expires = (datetime.now(timezone.utc) + timedelta(seconds=KEY_TTL_SECONDS)).isoformat(timespec="seconds")
-                _key_status, _key_body, _key_wire = call_service(cr_admin_service, "POST", f"/context-surfaces/{cr_surface_id}/agent-keys", json_body={"name": f"{cr_surface_name}-agent", "expires_at": _expires})
-                if _key_status != 201 or not isinstance(_key_body, dict):   # the status and type are the teaching content; _key_body itself carries the key and is never shown
-                    raise RuntimeError(f"{_key_status} {_key_body.get('type', '') if isinstance(_key_body, dict) else ''}".strip())
-                cr_agent_key_expires, _step = _key_body.get("expires_at", _expires), "mcp_url"
-                _list_status, _list_body, _list_wire = call_service(cr_admin_service, "GET", f"/context-surfaces/{cr_surface_id}/agent-keys", params={"page_size": 50})
-                cr_mcp_url = next((item["mcp_url"] for item in ((_list_body.get("agent_keys") if isinstance(_list_body, dict) else None) or []) if item.get("id") == _key_body["id"] and item.get("mcp_url")), cr_mcp_url_default)
-                # The key goes here and nowhere else. niquests.Session(headers=) replaces the defaults, so the live-verified Accept: */* is set by hand (a 406 means "application/json, text/event-stream" instead, and the safety test changes with it).
-                cr_mcp_service = niquests.Session(headers={"X-API-Key": _key_body["key"], "Accept": "*/*", "Content-Type": "application/json", "User-Agent": "redis-iris-basics"}, timeout=(5, 30), disable_http3=True)
-                try:
-                    for _entity, _entity_class in cr_entity_classes.items():
-                        _step = f"import {_entity}"
-                        _import_status, _import_body, _import_wire = call_service(cr_admin_service, "POST", f"/context-surfaces/{cr_surface_id}/data", json_body={"entity": _entity, "records": [_entity_class(**row).model_dump() for row in cairn.SHOP_RECORDS[_entity]], "options": {"on_conflict": "overwrite", "on_error": "fail_fast"}})
-                        _import_body = _import_body if isinstance(_import_body, dict) else {}
-                        if not (200 <= _import_status < 300) or _import_body.get("failed"):
-                            raise RuntimeError(f"{_import_status} {_import_body.get('type', '')} failed={_import_body.get('failed')}")
-                        cr_import_counts[_entity] = _import_body["imported"]
-                    _step = "EXPIRE"
-                finally:   # whatever the imports landed gets its TTL, even when a later import failed
-                    for _key in cr_record_keys:
-                        cr_redis.expire(_key, KEY_TTL_SECONDS)     # the service sets no TTL on what it writes
-            except Exception as _exc:   # a RuntimeError above carries the status and type; anything else shows its class only
-                cr_create_problem = f"{_exc if type(_exc) is RuntimeError else type(_exc).__name__} at step {_step}"
-            _summary = mo.callout(mo.md(f"Surface `{cr_surface_id}` (status `{cr_surface_status}`), agent key expires at {cr_agent_key_expires}, imported {' + '.join(str(count) for count in cr_import_counts.values())} records, {len(cr_record_keys)} keys set to expire in 1 h."), kind="success") if cr_create_problem is None else mo.callout(mo.md(f"`{cr_create_problem}`. Press Clean up below: it finds every surface named `{cr_surface_name}`."), kind="warn")
-            _output = mo.vstack([_summary, mo.accordion({"Create request as sent (password masked)": mo.json(cr_create_wire)}), mo.md("Context Retriever answers `201` with the surface id and a status, and the import lands as JSON documents at the key templates you declared. The notebook sets a one-hour `EXPIRE` on those 20 keys because the service sets none. Pressing Create again makes a second surface with the same name, and Clean up deletes both.")])
-    _output
-    return cr_indexes_before, cr_mcp_service, cr_mcp_url, cr_surface_id
+            _imported[_entity] = f"{_reply['imported']} imported, {_reply['failed']} failed"
+    finally:   # the service sets no TTL on what it writes
+        _expired = sum(REDIS_CLIENT.expire(_record_key, KEY_TTL_SECONDS) for _record_key in cr_record_keys)
+    mo.vstack([
+        mo.callout(mo.md(f"Context Retriever answered `{_status}` with surface `{cr_surface_id}`, status `{_surface['status']}`. The agent key expires at {_expires}."), kind="success"),
+        mo.md("\n".join(f"- `{entity}`: {counts}" for entity, counts in _imported.items())),
+        mo.accordion({"Create request as sent (credential and password masked)": mo.json(_wire)}),
+        mo.md(f"The service sets no TTL on what it writes. The notebook sent a one-hour `EXPIRE` to each of the {len(cr_record_keys)} keys, and Redis answered `1` for {_expired}:"),
+        mo.md("```\n" + redis_cli(["EXPIRE", cr_record_keys[0], KEY_TTL_SECONDS]) + "\n```"),
+    ])
+    return cr_mcp, cr_mcp_url, cr_surface_id
 
 
-@app.cell(column=2)
-def cr_tools(cr_mcp_service, cr_mcp_url):
-    mo.stop(cr_mcp_service is None, mo.callout(mo.md("Create the surface first."), kind="info"))
-    _status, _body, cr_tools_wire = call_service(cr_mcp_service, "POST", cr_mcp_url, json_body={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-    mo.stop(_status != 200 or not isinstance(_body, dict) or "result" not in _body, mo.callout(mo.vstack([mo.md(f"Context Retriever's MCP endpoint answered `{_status}` to `tools/list`: {'the agent key expires one hour after Create, so press Create again' if _status == 401 else 'read the body below'}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-    cr_tools_list = _body["result"]["tools"]
-    _rows = [{
+@app.cell(column=3)
+def cr_tools(cr_mcp, cr_mcp_url):
+    # The absolute URL as the path: niquests sends it unchanged, where "" would drop a trailing slash.
+    _, _body, _wire = call_service(cr_mcp, "POST", cr_mcp_url, json_body={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+    _rows = sorted(({
+        "entity": next((name for name in ("customer", "product", "order") if name in tool["name"].split("_")), "set tools"),
         "tool": tool["name"],
         "description": tool.get("description", ""),
-        "arguments": ", ".join(name + ("*" if name in tool.get("inputSchema", {}).get("required", []) else "") for name in tool.get("inputSchema", {}).get("properties", {})),
-    } for tool in cr_tools_list]
+        "arguments": ", ".join(name + ("*" if name in tool["inputSchema"].get("required", []) else "") for name in tool["inputSchema"]["properties"]),
+    } for tool in _body["result"]["tools"]), key=lambda row: row["entity"])
+    _counts = {row["entity"]: sum(other["entity"] == row["entity"] for other in _rows) for row in _rows}
+    cr_tool_names = sorted(tool["name"] for tool in _body["result"]["tools"])
     mo.vstack([
-        mo.md(r"""
-    This cell asks the surface what it can do, with one JSON-RPC `tools/list` over MCP
-    authenticated by the agent key. Every row is a tool the service generated from the data model,
-    and nothing here was hand-written:
-    """),
-        mo.ui.table(_rows, selection=None, pagination=False, label=f"{len(_rows)} tools from 3 entities"),
-        mo.md("In a live run on 2026-09-30 this account's surface listed 21 tools for three entities. Required arguments are starred."),
-        mo.accordion({"Request as sent (credential masked)": mo.json(cr_tools_wire)}),
+        mo.md("This cell sends one JSON-RPC `tools/list` over MCP with the agent key. Every row is a tool the service generated from the three classes above:"),
+        mo.ui.table(_rows, selection=None, pagination=False, label=f"{len(_rows)} tools: " + ", ".join(f"{entity} {count}" for entity, count in _counts.items())),
+        mo.md("Required arguments are starred. In a live run on 2026-09-30 this account's surface listed 21 tools. Order has no `text` field, so the service generated no `search_order_by_text`."),
+        mo.accordion({"Request as sent (credential masked)": mo.json(_wire)}),
     ])
-    return (cr_tools_list,)
+    return (cr_tool_names,)
 
 
-@app.cell(column=2)
-def cr_call_tool(cr_mcp_service, cr_mcp_url, cr_tools_list):
-    mo.stop(cr_mcp_service is None)
-    _schema = next((tool.get("inputSchema", {}) for tool in cr_tools_list if tool["name"] == "get_customer_by_id"), {})
-    mo.stop("id" not in _schema.get("required", []), mo.callout(mo.md(f"`get_customer_by_id` now requires `{_schema.get('required', [])}` rather than `id`. Change the argument in this cell to match."), kind="warn"))
-    _request = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_customer_by_id", "arguments": {"id": "C001"}}}
-    _status, _body, cr_call_wire = call_service(cr_mcp_service, "POST", cr_mcp_url, json_body=_request)
-    _result = (_body.get("result") or {}) if isinstance(_body, dict) else {}
-    _text = "".join(part.get("text", "") for part in _result.get("content") or [])
-    _hint = "the agent key expires one hour after Create, so press Create again" if _status == 401 else (_text or json.dumps(_body)[:200])
-    mo.stop(_status != 200 or not _result or _result.get("isError"), mo.callout(mo.md(f"Context Retriever's MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}` and no record: {_hint}."), kind="danger"))
-    mo.stop(not _text.lstrip().startswith("{"), mo.callout(mo.md(f"`get_customer_by_id` answered text, not a JSON record: {_text[:200]}"), kind="warn"))
-    cr_customer_record = json.loads(_text)
+@app.cell(column=3)
+def cr_console(cr_tool_names):
+    # One example per generated tool, from the Cairn records: id, a tag field and value, a numeric field.
+    _entities = {"customer": ("C001", "tier", "gold", "lifetime_value"), "product": ("P102", "category", "camping", "price"), "order": ("O1001", "status", "delivered", "total")}
+    _examples = {}
+    for _entity, (_id, _tag, _value, _number) in _entities.items():
+        _examples |= {
+            f"get_{_entity}_by_id": {"id": _id},
+            f"list_{_entity}": {"limit": 5},
+            f"count_{_entity}": {"function": "count", "group_by": _tag},
+            f"summarize_{_entity}": {"field": _number, "function": "avg"},
+            f"filter_{_entity}": {"tag_conditions": [{"field": _tag, "value": _value}]},
+        }
+    _sets = [{"entity": "Customer", "tag_conditions": [{"field": "tier", "value": "gold"}]}, {"entity": "Customer", "tag_conditions": [{"field": "region", "value": "emea"}]}]
+    _examples |= {
+        "search_customer_by_text": {"query": "Ada"}, "search_product_by_text": {"query": "tent"},
+        "intersect_results": {"sets": _sets}, "union_results": {"sets": _sets}, "except_results": {"sets": _sets},
+        "expand_results": {"set": _sets[0], "relationship": "orders"},
+    }
+    # Three calls that step outside the model: a tool rule, an argument it never offered, and the tool list.
+    _presets = {
+        "filter_customer, no condition": ("filter_customer", {"limit": 5, "offset": 0}),
+        "filter_customer, a tag condition on a numeric field": ("filter_customer", {"tag_conditions": [{"field": "lifetime_value", "value": "4200"}]}),
+        "run_query, a raw query no generated tool takes": ("run_query", {"query": "KEYS *"}),
+    }
+    cr_example = mo.ui.dropdown(
+        options={**{name: (name, _examples.get(name, {})) for name in cr_tool_names}, **_presets},   # a tool with no example here starts from {}
+        value="get_customer_by_id", label="Tool or preset", searchable=True,
+    )
+    cr_calls = []   # one dict per submitted call. A change to the dropdown or the form never re-runs this cell
     mo.vstack([
-        mo.md(r"""
-    This cell calls one generated tool the way an agent would: `get_customer_by_id` with
-    `{"id": "C001"}`. The service reads the JSON document from your Redis and returns the record
-    plus a `_retrieval` stamp:
-    """),
-        mo.hstack([mo.json(_request, label="JSON-RPC request"), mo.json(cr_customer_record, label="result.content[0].text, parsed")], widths="equal"),
-        mo.md("The `_retrieval` stamp names the surface that served it and when. The agent sent an argument, not a key or a query."),
+        mo.md(f"The console below sends one read-only `tools/call` per submit, with an agent key that expires one hour after Create. When it expires, press Clean up, then Create. Pick one of the {len(cr_tool_names)} generated tools, or a preset that steps outside the model:"),
+        cr_example,
     ])
+    return cr_calls, cr_example
+
+
+@app.cell(column=3)
+def cr_call_form(cr_example):
+    _tool, _arguments = cr_example.value
+    cr_call_form = mo.md("**Tool** {tool}\n\n**Arguments, as JSON** {arguments}").batch(
+        tool=mo.ui.text(value=_tool, full_width=True),
+        arguments=mo.ui.code_editor(value=json.dumps(_arguments, indent=2), language="json", min_height=120),
+    ).form(submit_button_label="Send tools/call (read-only)")
+    mo.vstack([
+        cr_call_form,
+        mo.md("You can edit the tool name and the arguments before you send. The table below labels each answer as data, a tool error, or a JSON-RPC error. Any HTTP status other than 200 or 400 raises an error in the cell instead."),
+    ])
+    return (cr_call_form,)
+
+
+@app.cell(column=3)
+def cr_last_call(cr_call_form, cr_calls, cr_mcp, cr_mcp_url, cr_tool_names):
+    if cr_call_form.value is not None:   # None until this form's first submit
+        _tool, _arguments = cr_call_form.value["tool"], json.loads(cr_call_form.value["arguments"])
+        # A JSON-RPC error may ride on a 200 or a 400, so both are answers here.
+        _status, _body, _wire = call_service(cr_mcp, "POST", cr_mcp_url, json_body={"jsonrpc": "2.0", "id": len(cr_calls) + 2, "method": "tools/call", "params": {"name": _tool, "arguments": _arguments}}, ok=(200, 400))
+        _error = _body.get("error")   # a JSON-RPC error carries no result
+        _text = _error["message"] if _error else "".join(part["text"] for part in _body["result"]["content"])
+        _answer = f"JSON-RPC error {_error['code']}" if _error else "tool error" if _body["result"].get("isError") else "data"
+        cr_calls.append({"row": {"call": len(cr_calls) + 1, "tool": _tool, "in tools/list": _tool in cr_tool_names, "arguments": json.dumps(_arguments), "HTTP": _status, "answer": _answer, "reply": _text[:160]}, "text": _text, "wire": _wire})
+    mo.vstack([
+        mo.md("This cell sends the form's tool and arguments as one JSON-RPC `tools/call` over MCP with the agent key. The table lists every call to this surface, newest first:"),
+        mo.ui.table([call["row"] for call in reversed(cr_calls)], selection=None, pagination=False, label=f"{len(cr_calls)} {'call' if len(cr_calls) == 1 else 'calls'} to this surface"),
+        mo.md(f"**Call {len(cr_calls)}, `{cr_calls[-1]['row']['tool']}`: reply text as returned**"),
+        mo.plain_text(cr_calls[-1]["text"]),
+        mo.accordion({f"Call {len(cr_calls)} as sent (credential masked)": mo.json(cr_calls[-1]["wire"])}),
+        mo.md("In a live run on 2026-09-30 the no-condition call came back as a tool error, `at least one condition is required`. The table prints each answer as the service sends it. A `get_customer_by_id` reply carries a `_retrieval` stamp that names the surface that served the record."),
+    ]) if cr_calls else mo.md("Send a tool call above, and this cell shows what the surface answered.")
     return
 
 
-@app.cell(column=2)
-def cr_rejected_call(cr_mcp_service, cr_mcp_url):
-    mo.stop(cr_mcp_service is None)
-    _request_a = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "filter_customer", "arguments": {"limit": 5, "offset": 0}}}
-    _request_b = {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "filter_customer", "arguments": {"tag_conditions": [{"field": "lifetime_value", "value": "4200"}]}}}
-    _views, cr_rejected_wires = [], {}
-    for _label, _request in (("Request A, no condition", _request_a), ("Request B, a tag condition on a numeric field", _request_b)):
-        _status, _body, _wire = call_service(cr_mcp_service, "POST", cr_mcp_url, json_body=_request)
-        _rejected = isinstance(_body, dict) and isinstance(_body.get("error"), dict)   # a JSON-RPC error may ride on a 200 or a 400
-        _hint = "the agent key expires one hour after Create, so press Create again (Clean up deletes both surfaces)" if _status == 401 else "read the body below"
-        mo.stop(not _rejected and (_status != 200 or not isinstance(_body, dict)), mo.callout(mo.vstack([mo.md(f"Context Retriever's MCP endpoint answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: {_hint}."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-        _result = _body.get("result") or {}
-        if _rejected:
-            _error = _body["error"]
-            _views.append(mo.callout(mo.md(f"`{_error.get('code')}` {_error.get('message')}"), kind="danger", title=f"{_label}: rejected before anything reached Redis"))
-        elif _result.get("isError"):
-            _views.append(mo.callout(mo.md(f"`isError` true: {''.join(part.get('text', '') for part in _result.get('content') or [])}"), kind="danger", title=f"{_label}: the tool refused it"))
-        else:
-            _views.append(mo.callout(mo.json(_body), kind="warn", title=f"{_label}: accepted, so the schema was not enforced here"))
-        cr_rejected_wires[f"{_label} (HTTP {_status})"] = mo.json(_wire)
-    mo.vstack([
-        mo.md(r"""
-    This cell sends two calls the schema should refuse: `filter_customer` with no
-    condition, then a tag condition on the numeric field `lifetime_value`. The service's own answer
-    to each is printed as it arrives:
-    """),
-        *_views,
-        mo.md("In a live run on 2026-09-30 the first call came back as a tool error, `at least one condition is required`. The second is the schema's job to refuse, with a JSON-RPC `-32602` or a tool error. The answer above is this service's, live, not a recorded one."),
-        mo.accordion(cr_rejected_wires),
-    ])
-    return
-
-
-@app.cell(column=2)
-def cr_peek(cr_indexes_before, cr_record_keys, cr_redis, cr_surface_id):
-    mo.stop(cr_surface_id is None)
-    cr_first_document = cr_redis.json().get(cr_record_keys[0])
-    cr_new_indexes = sorted(name for name in set(cr_redis.execute_command("FT._LIST")) - cr_indexes_before if cr_surface_id in name)   # the service names its indexes idx:<surface-id>:<hash>:<entity>
+@app.cell(column=3)
+def cr_peek(REDIS_CLIENT, cr_record_keys, cr_surface_id):
+    _indexes = sorted(name for name in REDIS_CLIENT.execute_command("FT._LIST") if cr_surface_id in name)   # the service names them idx:<surface-id>:<hash>:<entity>
     _rows, _commands = [], [redis_cli(["JSON.GET", cr_record_keys[0]]), redis_cli(["FT._LIST"])]
-    for _name in cr_new_indexes:
-        _info = cr_redis.ft(_name).info()
+    for _name in _indexes:
+        _info = REDIS_CLIENT.ft(_name).info()
         _definition = dict(zip(_info["index_definition"][::2], _info["index_definition"][1::2]))   # RESP2 hands index_definition back as a flat list
-        _rows.append({"index": _name, "documents": _info["num_docs"], "prefix": ", ".join(_definition.get("prefixes", []))})
+        _rows.append({"index": _name, "documents": _info["num_docs"], "prefix": ", ".join(_definition["prefixes"])})
         _commands.append(redis_cli(["FT.INFO", _name]))
     mo.vstack([
-        mo.md(r"""
-    This cell reads your own database with `JSON.GET` and `FT.INFO`, to show where the service put the data:
-    """),
-        mo.json(cr_first_document or {"missing": cr_record_keys[0]}, label=cr_record_keys[0]),
+        mo.md("This cell reads your own database with `JSON.GET`, `FT._LIST`, and `FT.INFO`, to show where the service put the data:"),
+        mo.json(REDIS_CLIENT.json().get(cr_record_keys[0]), label=cr_record_keys[0]),
         mo.ui.table(_rows, selection=None, pagination=False, label=f"{len(_rows)} indexes the service built"),
         mo.md("```\n" + "\n".join(_commands) + "\n```"),
-        mo.md("The agent never saw Redis. Context Retriever wrote these JSON documents into your database, built one index per entity, and the tool call above read them back through the service."),
+        mo.md("Context Retriever wrote these JSON documents at your key templates and built one index per entity in your database. The console's tool calls above read them back through the service."),
     ])
     return
 
 
-@app.cell(column=2, hide_code=True)
-def cr_cleanup_button():
+@app.cell(column=3, hide_code=True)
+def cr_cleanup_button(cr_surface_name):
     cr_cleanup_button = mo.ui.run_button(label="Clean up: DELETE the surface and UNLINK 20 keys", kind="danger")
     mo.vstack([
-        mo.md(rf"""
-    Clean up deletes every surface named `cairn-{RUN_TAG}` on this account, which also revokes their agent
-    keys. It then unlinks the 20 keys by name and drops any index those surfaces left under the run prefix,
-    without `DD`. A surface has no TTL and holds your password, so this button matters more than the other three:
-    """),
+        mo.md(f"Clean up deletes every surface named `{cr_surface_name}` on this account, which also revokes their agent keys. It then counts what the delete left in your Redis and unlinks the 20 keys by name. A surface has no TTL and holds your password, so press this button when you finish:"),
         cr_cleanup_button,
     ])
     return (cr_cleanup_button,)
 
 
-@app.cell(column=2)
+@app.cell(column=3)
 def cr_cleanup(
-    cr_admin_service,
+    CONTEXT_RETRIEVER,
+    REDIS_CLIENT,
     cr_cleanup_button,
     cr_record_keys,
-    cr_redis,
-    cr_surface_id,
     cr_surface_name,
 ):
     mo.stop(not cr_cleanup_button.value)
-    _targets, _replies, _list_status, _page, _has_more = set(), {}, None, 1, True
-    try:
-        while _has_more and _page <= 20:   # pages of 50. The listing itself is never shown: it names other surfaces
-            _list_status, _body, _wire = call_service(cr_admin_service, "GET", "/context-surfaces", params={"page": _page, "page_size": 50})
-            _body = _body if isinstance(_body, dict) else {}
-            _targets |= {surface["id"] for surface in _body.get("context_surfaces") or [] if surface.get("name") == cr_surface_name}
-            _has_more, _page = bool((_body.get("pagination") or {}).get("has_next")), _page + 1
-    except niquests.RequestException as _exc:   # the Redis steps below still run
-        _list_status, _has_more = type(_exc).__name__, False
-    for _surface in sorted(_targets | {cr_surface_id} - {None}):
-        try:
-            _status, _body, _wire = call_service(cr_admin_service, "DELETE", f"/context-surfaces/{_surface}")   # 200, 204 and 404 all mean gone
-        except niquests.RequestException as _exc:
-            _status, _body = type(_exc).__name__, {}
-        _reply = {"status": _status} if _status in (200, 204, 404) or not isinstance(_body, dict) else {name: str(_body.get(name, ""))[:200] for name in ("type", "title", "detail", "message")}   # a gone reply shows its status alone: the shape is unverified and the surface held the password
-        _replies[f"DELETE {_surface} answered {_status}"] = {"surface": _surface, "gone": _status in (200, 204, 404), "reply": _reply}
-    cr_keys_removed, cr_indexes_dropped = cr_redis.unlink(*cr_record_keys), []
-    for _name in [name for name in cr_redis.execute_command("FT._LIST") if any(value["surface"] in name for value in _replies.values() if value["gone"])]:   # a surface whose DELETE failed keeps its indexes
-        try:
-            _definition = cr_redis.ft(_name).info()["index_definition"]
-            if all(prefix.startswith(KEY_PREFIX) for prefix in dict(zip(_definition[::2], _definition[1::2])).get("prefixes") or [""]):   # no prefixes entry fails the check
-                cr_redis.ft(_name).dropindex()     # never delete_documents=True: the keys go by name above
-                cr_indexes_dropped.append(_name)
-        except redis.ResponseError as _exc:
-            if not re.search(r"index[_ ]not[_ ]found|unknown index|no such index", str(_exc), re.I):
-                raise
+    _surfaces, _page, _more = [], 1, True
+    while _more:   # the listing names other surfaces on the account, so it is never shown
+        _, _body, _ = call_service(CONTEXT_RETRIEVER, "GET", "/context-surfaces", params={"page": _page, "page_size": 50})
+        _surfaces += [surface["id"] for surface in _body["context_surfaces"] if surface["name"] == cr_surface_name]
+        _more, _page = _body["pagination"]["has_next"], _page + 1
+    # Statuses only: the reply shape is unverified, and the surface held your password.
+    _statuses = [call_service(CONTEXT_RETRIEVER, "DELETE", f"/context-surfaces/{surface}", ok=(200, 204, 404))[0] for surface in _surfaces]
+    _indexes_left = [name for name in REDIS_CLIENT.execute_command("FT._LIST") if any(surface in name for surface in _surfaces)]
+    _documents_left = REDIS_CLIENT.exists(*cr_record_keys)
+    _unlinked = REDIS_CLIENT.unlink(*cr_record_keys)
+    _answers = ", ".join(f"`{status}`" for status in _statuses) or "nothing, because none was listed"
+    _already_gone = _statuses.count(404)
+    _deleted = len(_statuses) - _already_gone
     mo.vstack([
-        mo.callout(mo.md(("" if _list_status == 200 else f"The surface listing answered `{_list_status}`, so only the id this kernel knows was tried. ") + f"Deleted {sum(value['gone'] for value in _replies.values())} of {len(_replies)} surfaces named `{cr_surface_name}`. Unlinked {cr_keys_removed} of {len(cr_record_keys)} keys and dropped {len(cr_indexes_dropped)} indexes left under `{KEY_PREFIX}`." + (f" The listing has more pages than Clean up reads, so a surface from an earlier kernel may remain under the name `{cr_surface_name}`." if _has_more else "")), kind="success" if _list_status == 200 and not _has_more and all(value["gone"] for value in _replies.values()) else "danger"),
-        mo.md("```\n" + "\n".join([redis_cli(["UNLINK", *cr_record_keys])] + [redis_cli(["FT.DROPINDEX", name]) for name in cr_indexes_dropped]) + "\n```"),
-        mo.accordion({key: mo.json(value["reply"]) for key, value in _replies.items()}),
-        mo.md("The documents in your database stay when a surface is deleted, which is why the notebook unlinks them by name. In a live run on 2026-09-30 the service dropped its own indexes with the surface, so the `FT.DROPINDEX` pass is the check that it did."),
+        mo.callout(mo.md(f"Context Retriever deleted {_deleted} {'surface' if _deleted == 1 else 'surfaces'} named `{cr_surface_name}` and found {_already_gone} already gone (`DELETE` answered {_answers}). Your Redis still holds {len(_indexes_left)} of their indexes. {_documents_left} of the {len(cr_record_keys)} documents remained, so the notebook unlinked {_unlinked}."), kind="success"),
+        mo.md("```\n" + "\n".join([redis_cli(["FT._LIST"]), redis_cli(["EXISTS", *cr_record_keys]), redis_cli(["UNLINK", *cr_record_keys])]) + "\n```"),
+        mo.md("Deleting a surface leaves the data in your database, as the Context Retriever docs state."),
     ])
     return
 
 
-@app.cell(column=3, hide_code=True)
+@app.cell(column=4, hide_code=True)
 def am_title():
-    mo.vstack([
-        mo.md(r"""
+    mo.md(r"""
     # Redis Agent Memory
 
-    An agent that forgets a user's allergy between sessions is not unintelligent. It has no memory.
-    Redis Agent Memory gives it two tiers: session memory, the ordered events of the conversation, and
-    long-term memory, facts recalled by meaning across sessions. Its one job in this
-    column: recall a customer fact with no word in common with the question.
+    An agent that forgets a customer's nut allergy between conversations can suggest the wrong trail snack next time.
+    Redis Agent Memory keeps each conversation in session memory and durable facts in long-term memory, written by the app or extracted from session events.
+    Write five memories about Dana, a made-up Cairn customer, then chat as Dana and change what the agent recalls to see three principles:
 
-    Facts reach long-term memory two ways: your app writes them directly, or the service extracts
-    them from sessions in the background, minutes later. Every call carries an owner id and a
-    namespace, because the store is shared by every app that points at it. Agent Memory is in public
-    preview.
+    1. **Long-term memory recalls facts by meaning.** Questions that share no word with the fact they are after still find it, ranked best first with no score in the reply.
+    2. **The owner and namespace are the tenant boundary.** The API key opens the whole store, and Agent Memory returns only memories matching the `ownerId` and `namespace` the app sends.
+    3. **An agent turn reads both tiers.** The app fetches the session by id in event order, searches long-term memory with the latest message, and joins both into one prompt.
 
-    Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`. Docs:
-    [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/),
+    Agent Memory is in public preview on Redis Cloud. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `ANTHROPIC_API_KEY`, which the chat and the cell under it need.
+    Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/),
+    [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/), and
     [REST quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/rest-api-quickstart/).
-    """),
-        mo.mermaid("""flowchart LR
-    A[App] -->|"POST /session-memory/events"| S[Session memory]
-    S -.->|"extraction, minutes later"| L[Long-term memory]
-    A -->|"POST /long-term-memory"| L
-    A -->|"POST /long-term-memory/search"| L"""),
-    ])
+
+    Each line reads source, target, and what passes between them:
+
+    ```text
+    App            -> long-term memory  POST /long-term-memory, five memories with ids the app chooses
+    App            -> session memory    POST /session-memory/events, the customer's message
+    App            -> long-term memory  POST /long-term-memory/search, the message, filtered by owner and namespace
+    App            -> session memory    GET /session-memory/{sessionId}, events in order
+    App            -> Claude            the session events and the recalled memories, one call
+    App            -> session memory    POST /session-memory/events, the agent's reply
+    session memory -> long-term memory  background extraction, every 5 minutes by default
+    ```
+    """)
     return
 
 
-@app.cell(column=3)
-def am_configure():
-    mo.stop(
-        not all(os.environ.get(name) for name in ("MEMORY_API_BASE_URL", "MEMORY_STORE_ID", "MEMORY_API_KEY")),
-        mo.callout(mo.md("Agent Memory is not configured. Set `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY` in the `.env` next to `pyproject.toml` (see `.env.example`), then restart the kernel."), kind="warn"),
-    )
-    am_owner_id = f"cairn-{RUN_TAG}"                 # the tenant boundary on a shared store
-    am_namespace = "iris-basics-notebook"
-    am_memory_ids = [f"{am_owner_id}-m{n}" for n in range(1, len(cairn.DANA_FACTS) + 1)]   # chosen here, not by the service
-    # A session is one conversation, so its id is per kernel. Clean up lists sessions by owner, so it finds earlier ones too.
-    am_session_id = f"{am_owner_id}-s{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
-    am_service = niquests.Session(
-        base_url=f"{os.environ['MEMORY_API_BASE_URL'].strip().rstrip('/')}/v1/stores/{os.environ['MEMORY_STORE_ID'].strip()}",
-        headers={"Authorization": f"Bearer {os.environ['MEMORY_API_KEY'].strip()}", "Accept": "application/json",
-                 "Content-Type": "application/json", "User-Agent": "redis-iris-basics"},   # Content-Type pinned, accepted by Agent Memory on 2026-10-01
-        timeout=(5, 30),
-        disable_http3=True,
-    )
-    try:
-        am_health_status, am_health_body, am_health_wire = call_service(am_service, "GET", "/health")
-    except niquests.RequestException as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
-    mo.stop(
-        not isinstance(am_health_body, dict),
-        mo.callout(mo.md("Agent Memory answered with a page or an empty body, not JSON. `MEMORY_API_BASE_URL` is the store's data-plane URL, not a console page. See `.env.example`."), kind="danger"),
-    )
-    _hint = {401: "check `MEMORY_API_KEY`", 404: "check `MEMORY_STORE_ID`"}.get(am_health_status, "read the body below")
-    mo.stop(
-        am_health_status != 200,
-        mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{am_health_status}` `{am_health_body.get('type', '')}`: {_hint}."), mo.json(am_health_body)]), kind="danger"),
-    )
+@app.cell(column=4, hide_code=True)
+def am_seed_button():
+    am_seed_button = mo.ui.run_button(label="Write 5 memories about Dana: 1 POST /long-term-memory", kind="success")
     mo.vstack([
-        mo.callout(mo.md(f"Store `{am_health_body.get('status')}`. The memories this column writes carry `ownerId` `{am_owner_id}` and `namespace` `{am_namespace}`, and the session events carry the same namespace. Every search and Clean up names the owner. On a store other apps share, owner and namespace are the tenant boundary."), kind="success"),
-        mo.accordion({"Request as sent (credential masked)": mo.json(am_health_wire), "Reply": mo.json(am_health_body)}),
+        mo.md("The button below writes five memories about Dana in one bulk `POST /long-term-memory`. Each memory carries an `id`, `ownerId`, and `namespace` chosen here:"),
+        am_seed_button,
     ])
-    return am_memory_ids, am_namespace, am_owner_id, am_service, am_session_id
+    return (am_seed_button,)
 
 
-@app.cell(column=3, hide_code=True)
-def am_write_button():
-    am_write_button = mo.ui.run_button(label="Write 5 memories about Dana in one POST", kind="success")
-    mo.vstack([
-        mo.md("The button below writes five facts about Dana, a made-up Cairn customer, in one bulk `POST /long-term-memory`. The ids, the owner, and the namespace are chosen here rather than by the service:"),
-        am_write_button,
-    ])
-    return (am_write_button,)
-
-
-@app.cell(column=3)
-def am_write(
-    am_memory_ids,
-    am_namespace,
-    am_owner_id,
-    am_service,
-    am_write_button,
+@app.cell(column=4)
+def am_seed(
+    AGENT_MEMORY,
+    MEMORY_NAMESPACE,
+    MEMORY_OWNER_ID,
+    am_seed_button,
 ):
-    mo.stop(not am_write_button.value, mo.callout(mo.md("Press *Write 5 memories about Dana in one POST* above."), kind="info"))
-    try:
-        _status, _body, am_write_wire = call_service(
-            am_service, "POST", "/long-term-memory",
-            json_body={"memories": [
-                {"id": memory_id, "text": fact["text"], "ownerId": am_owner_id, "namespace": am_namespace, "memoryType": "semantic", "topics": fact["topics"]}
-                for memory_id, fact in zip(am_memory_ids, cairn.DANA_FACTS)
-            ]},
-        )
-    except niquests.RequestException as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
-    _reply = _body if isinstance(_body, dict) else {}
-    _hint = {401: "check `MEMORY_API_KEY`", 404: "check `MEMORY_STORE_ID`", 424: "a dependency of the store failed, not 0 results"}.get(_status, "read the body below")
-    mo.stop(_status != 201, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_reply.get('type', '')}`: {_hint}."), mo.json(_reply if _reply else {"body": _body})]), kind="danger"))
-    _created, _errors = _reply.get("created") or [], _reply.get("errors") or []   # `errors` rides on a 201 when some records failed
-    am_memories_written = True
-    mo.vstack([
-        mo.ui.table([{"id": memory["id"], "text": memory["text"], "topics": ", ".join(memory["topics"])} for memory in am_write_wire["body"]["memories"]], selection=None, pagination=False),
-        *([mo.callout(mo.vstack([mo.md(f"{len(_errors)} of the 5 records answered an error."), mo.json(_errors)]), kind="danger")] if _errors else []),
-        mo.accordion({"Request as sent (credential masked)": mo.json(am_write_wire), "Reply": mo.json(_reply)}),
-        mo.md(f"Agent Memory answered `201` with {len(_created)} ids in `created`, and in a live run on 2026-10-01 the memories were searchable at once. A second press in the same kernel answered `201` with the same five ids and no `errors` in that run, so the write is an upsert. Because the ids are yours, Clean up can name them without a ledger."),
-    ])
-    return (am_memories_written,)
-
-
-@app.cell(column=3)
-def am_search_controls(am_memories_written):
-    mo.stop(not am_memories_written, mo.callout(mo.md("Write the memories first."), kind="info"))
-    am_question = mo.ui.text(value=cairn.MEMORY_QUESTIONS[0]["text"], label="Ask", full_width=True)
-    am_threshold = mo.ui.slider(0.0, 1.0, step=0.05, value=0.3, debounce=True, show_value=True, label="similarityThreshold")
-    mo.vstack([
-        mo.md("The reply of `POST /long-term-memory/search` carries no score, so `similarityThreshold` is the only cut. Everything at or above it comes back in rank order, and everything below is cut:"),
-        am_question,
-        am_threshold,
-        mo.md("Two more questions with no word in common with their memory: *My toes feel squashed on long descents.* and *Somewhere freezing to visit next year?*"),
-    ])
-    return am_question, am_threshold
-
-
-@app.cell(column=3)
-def am_search(
-    am_memories_written,
-    am_namespace,
-    am_owner_id,
-    am_question,
-    am_service,
-    am_threshold,
-):
-    mo.stop(not am_memories_written)
-    am_search_body = {
-        "text": am_question.value,
-        "filter": {"ownerId": {"eq": am_owner_id}, "namespace": {"eq": am_namespace}},
-        "filterOp": "all", "similarityThreshold": round(am_threshold.value, 2), "limit": 5,
-    }
-    try:
-        _status, _body, am_search_wire = call_service(am_service, "POST", "/long-term-memory/search", json_body=am_search_body)
-    except niquests.RequestException as _exc:
-        mo.stop(True, mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory. Check `MEMORY_API_BASE_URL`."), kind="danger"))
-    _reply = _body if isinstance(_body, dict) else {}
-    _hint = {424: "a dependency of the store failed, not 0 results"}.get(_status, "read the body below")
-    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_reply.get('type', '')}`: {_hint}."), mo.json(_reply if _reply else {"body": _body})]), kind="danger"))
-    am_recalled_memories = _reply.get("items", [])
-    _rows = [
-        {"rank": rank, "memory": item["text"], "topics": ", ".join(item.get("topics") or []), "content words in common": len(shared_stems(am_question.value, item["text"]))}
-        for rank, item in enumerate(am_recalled_memories, 1)
+    mo.stop(not am_seed_button.value)
+    am_memories = [
+        {"id": f"{MEMORY_OWNER_ID}-m{n}", "text": fact["text"], "ownerId": MEMORY_OWNER_ID,
+         "namespace": MEMORY_NAMESPACE, "memoryType": "semantic", "topics": fact["topics"]}
+        for n, fact in enumerate(cairn.DANA_FACTS, 1)
     ]
+    _status, _body, _wire = call_service(AGENT_MEMORY, "POST", "/long-term-memory", json_body={"memories": am_memories})
     mo.vstack([
-        mo.ui.table(_rows, selection=None, pagination=False) if _rows else mo.callout(mo.md(f"0 memories at or above {am_search_body['similarityThreshold']}."), kind="warn"),
-        mo.json(am_search_body, label="Request body"),
-        mo.md("Agent Memory answers with the memories at or above the threshold, best first, and says nothing about how close they were."),
-        mo.md("In a live run on 2026-10-01 the allergy memory came back first at 0.0 with 0 content words in common. It was alone at 0.3 and absent at 0.5. Content words are word stems with stopwords removed. Another store or model may place the cut elsewhere, so start around 0.3 and move it."),
-        mo.accordion({"Request as sent (credential masked)": mo.json(am_search_wire), "Reply": mo.json(_reply)}),
+        mo.ui.table(am_memories, selection=None, pagination=False),
+        mo.md(
+            f"Agent Memory answered `{_status}`, and `created` lists {len(_body['created'])} of the {len(am_memories)} ids sent. "
+            "The ids are chosen here, so a second press writes the same five memories. "
+            "In a live run on 2026-10-05 a second write answered `201` with the same five ids, and the owner still held 5 memories."
+        ),
+        mo.accordion({"Request as sent (credential masked)": mo.json(_wire), "Reply": mo.json(_body)}),
     ])
-    return
+    return (am_memories,)
 
 
-@app.cell(column=3)
-def am_scope_lens(
-    am_memories_written,
-    am_namespace,
-    am_owner_id,
-    am_question,
-    am_service,
+@app.cell(column=4)
+def am_chat(
+    AGENT_MEMORY,
+    MEMORY_NAMESPACE,
+    MEMORY_OWNER_ID,
+    ask_llm,
 ):
-    mo.stop(not am_memories_written)
-    _scopes = [
-        ("this owner, this namespace", am_owner_id, am_namespace, 5),
-        ("an owner that does not exist", "nobody-owns-this-id", am_namespace, 0),
-        ("a namespace that does not exist", am_owner_id, "no-such-namespace", 0),
-    ]
-    _rows, _wires = [], {}
-    for _scope, _owner, _scope_namespace, _expected in _scopes:
-        _status, _body, _wire = call_service(
-            am_service, "POST", "/long-term-memory/search",
-            json_body={"text": am_question.value, "filter": {"ownerId": {"eq": _owner}, "namespace": {"eq": _scope_namespace}}, "filterOp": "all", "similarityThreshold": 0.0, "limit": 100},
-        )
-        mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: read the body below."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-        _rows.append({"scope": _scope, "filter as sent": json.dumps(_wire["body"]["filter"]), "memories returned": len((_body if isinstance(_body, dict) else {}).get("items", [])), "expected": _expected})
-        _wires[f"Request {len(_rows)}, {_scope} (credential masked)"] = mo.json(_wire)
-    mo.vstack([
-        mo.md("The same question runs under three filters. The owner and the namespace, both sent on every call, are what scope a shared store:"),
-        mo.ui.table(_rows, selection=None, pagination=False),
-        mo.md("`namespace eq` never matches a record that has no namespace at all, which is why Clean up below lists by owner alone. More than 5 in the first row means extraction has added memories under this owner, which Clean up removes."),
-        mo.accordion(_wires),
-    ])
-    return
+    # The controls live in this cell, so moving one never re-runs it and the chat history stays.
+    am_threshold = mo.ui.slider(0.0, 1.0, step=0.05, value=0.0, debounce=True, show_value=True, label="`similarityThreshold`")
+    am_scope = mo.ui.dropdown(
+        options={
+            "Dana: this notebook's owner and namespace": {"ownerId": {"eq": MEMORY_OWNER_ID}, "namespace": {"eq": MEMORY_NAMESPACE}},
+            "Another customer: a different ownerId": {"ownerId": {"eq": f"{MEMORY_OWNER_ID}-other"}, "namespace": {"eq": MEMORY_NAMESPACE}},
+            "Another app: a different namespace": {"ownerId": {"eq": MEMORY_OWNER_ID}, "namespace": {"eq": "no-such-namespace"}},
+        },
+        value="Dana: this notebook's owner and namespace",
+        label="Recall scope",
+    )
+    am_turns = []         # one record per completed turn, read by the cells below
+    _session_ids = []     # the first message, or the first after the chat is cleared, starts a session
 
-
-@app.cell(column=3, hide_code=True)
-def am_session_button():
-    am_session_button = mo.ui.run_button(label="Send 4 session events and assemble the prompt", kind="success")
-    mo.vstack([
-        mo.md("The button below posts four session events, two of them facts worth remembering, then searches long-term memory with the last turn. It assembles the prompt an agent would receive, and a session's owner and namespace come from its first event only:"),
-        am_session_button,
-        mo.md("Extraction runs in the background on the store's cadence, every 5 minutes by default and configurable from 60 to 600 seconds. It can turn the two facts into long-term memories with ids the service chooses."),
-    ])
-    return (am_session_button,)
-
-
-@app.cell(column=3)
-def am_session(
-    am_namespace,
-    am_owner_id,
-    am_service,
-    am_session_button,
-    am_session_id,
-):
-    mo.stop(not am_session_button.value, mo.callout(mo.md("Press *Send 4 session events and assemble the prompt* above."), kind="info"))
-    _wires, _question = {}, cairn.SESSION_TURNS[-1]["text"]
-    for _turn in cairn.SESSION_TURNS:
-        _status, _body, _wire = call_service(am_service, "POST", "/session-memory/events", json_body={
-            "sessionId": am_session_id, "actorId": am_owner_id if _turn["role"] == "USER" else "cairn-agent",
-            "role": _turn["role"], "content": [{"text": _turn["text"]}], "namespace": am_namespace,
-            "createdAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),   # the app's own time, so it must order the four events
+    def _post_event(session_id, role, text):
+        _, _, wire = call_service(AGENT_MEMORY, "POST", "/session-memory/events", json_body={
+            "sessionId": session_id, "actorId": MEMORY_OWNER_ID if role == "USER" else "cairn-agent",
+            "role": role, "content": [{"text": text}], "namespace": MEMORY_NAMESPACE,
+            "createdAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "metadata": {"source": "iris-basics"},
         })
-        mo.stop(_status != 201, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_body.get('type', '') if isinstance(_body, dict) else ''}`: read the body below."), mo.json(_body if isinstance(_body, dict) else {"body": _body})]), kind="danger"))
-        _wires[f"Event {len(_wires) + 1}, {_turn['role']} (credential masked)"] = mo.json(_wire)
-    _last_event_id = ((_body if isinstance(_body, dict) else {}).get("event") or {}).get("eventId")   # the question just sent, kept out of the short-term tier by id rather than by position
-    _status, _session, _wire = call_service(am_service, "GET", f"/session-memory/{am_session_id}")
-    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_session.get('type', '') if isinstance(_session, dict) else ''}`: read the body below."), mo.json(_session if isinstance(_session, dict) else {"body": _session})]), kind="danger"))
-    _wires["Session read-back (credential masked)"] = mo.json(_wire)
-    _status, _found, _wire = call_service(am_service, "POST", "/long-term-memory/search", json_body={"text": _question, "filter": {"ownerId": {"eq": am_owner_id}, "namespace": {"eq": am_namespace}}, "filterOp": "all", "similarityThreshold": 0.0, "limit": 3})
-    mo.stop(_status != 200, mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{_status}` `{_found.get('type', '') if isinstance(_found, dict) else ''}`: read the body below."), mo.json(_found if isinstance(_found, dict) else {"body": _found})]), kind="danger"))
-    _wires["Long-term memory search (credential masked)"] = mo.json(_wire)
-    _session, _found = (_session if isinstance(_session, dict) else {}), (_found if isinstance(_found, dict) else {})   # a 200 with an empty or non-JSON body is not a dict
-    _events, _recalled = _session.get("events", []), _found.get("items", [])
-    _history = [event for event in _events if event.get("eventId") != _last_event_id] if _last_event_id else _events[:-1]
-    am_prompt_context = "\n".join([
-        "Retrieved memory context:",
-        "Session summary:", (_session.get("summary") or {}).get("text") or "(none yet: this store summarises only when that is switched on and the session is long enough)",
-        "Short-term memory:", *[f"{event['role']}: {event['content'][0]['text']}" for event in _history],
-        "Long-term memory:", *[f"- {item['text']}" for item in _recalled],
+        return wire
+
+    def _model(messages, _config):
+        question = messages[-1].content
+        if len(messages) == 1:
+            _session_ids.append(f"{MEMORY_OWNER_ID}-s{datetime.now(timezone.utc):%Y%m%d%H%M%S}")
+        session_id = _session_ids[-1]
+
+        # 1. App -> session memory: POST /session-memory/events, the customer's message
+        customer_wire = _post_event(session_id, "USER", question)
+
+        # 2. App -> long-term memory: POST /long-term-memory/search, filtered by the scope and threshold above
+        search = {"text": question, "filter": am_scope.value, "filterOp": "all", "similarityThreshold": am_threshold.value, "limit": 3}
+        _, found, search_wire = call_service(AGENT_MEMORY, "POST", "/long-term-memory/search", json_body=search)
+
+        # 3. App -> session memory: GET /session-memory/{sessionId}, events in order
+        _, session, read_wire = call_service(AGENT_MEMORY, "GET", f"/session-memory/{session_id}")
+
+        # 4. App -> Claude: the session events and the recalled memories, one call
+        system = "\n".join([
+            "You are the Cairn Outfitters support agent. Answer the customer in two or three sentences.",
+            "Long-term memory recalled for this customer:",
+            *[f"- {item['text']}" for item in found["items"]],
+        ])
+        history = [{"role": event["role"].lower(), "content": event["content"][0]["text"]} for event in session["events"]]
+        started = time.perf_counter()
+        reply = ask_llm(system, history)
+        llm_ms = round((time.perf_counter() - started) * 1000)
+
+        # 5. App -> session memory: POST /session-memory/events, the agent's reply
+        agent_wire = _post_event(session_id, "ASSISTANT", reply)
+
+        am_turns.append({
+            "question": question, "sessionId": session_id, "search": search, "found": found, "session": session,
+            "system": system, "history": history, "llm_ms": llm_ms,
+            "wires": {"Customer turn": customer_wire, "Long-term memory search": search_wire,
+                      "Session read-back": read_wire, "Agent turn": agent_wire},
+        })
+        return reply
+
+    am_chat = mo.ui.chat(_model, prompts=[
+        *[question["text"] for question in cairn.MEMORY_QUESTIONS],
+        cairn.SESSION_TURNS[0]["text"],   # the two facts Dana states in the sample conversation
+        cairn.SESSION_TURNS[2]["text"],
     ])
     mo.vstack([
-        mo.md(f"Session `{am_session_id}`: `ownerId` `{_session.get('ownerId')}`, `namespace` `{_session.get('namespace')}`."),
-        mo.ui.table([{"role": event["role"], "actor": event["actorId"], "text": event["content"][0]["text"], "createdAt": event["createdAt"]} for event in _events], selection=None, pagination=False),
-        mo.md("**What the agent receives for the last turn**"),
-        mo.plain_text(am_prompt_context),
-        mo.md(f"Top memory for the last turn: #1 of {len(_recalled)} · {len(shared_stems(_question, _recalled[0]['text']))} content words in common.") if _recalled else mo.callout(mo.md("0 memories came back for the last turn. Write the memories first."), kind="warn"),
-        mo.md("The session read-back shows the owner and namespace the first event fixed. The assembled prompt is what the two tiers are for."),
-        mo.accordion(_wires),
+        mo.md("The chat below is the Cairn agent, and you are Dana. Each message becomes a session event, then a long-term memory search under these two controls:"),
+        mo.hstack([am_scope, am_threshold], justify="start", gap=2),
+        am_chat,
+        mo.md("Agent Memory also extracts facts from session events in the background, every 5 minutes by default. It can turn what Dana tells the agent into long-term memories."),
+    ])
+    return am_chat, am_scope, am_threshold, am_turns
+
+
+@app.cell(column=4)
+def am_last_turn(am_chat, am_turns):
+    am_chat.value   # reading the chat re-runs this cell after every reply
+    if not am_turns:
+        _view = mo.md("Ask the Cairn agent a question above, and this cell shows what the agent received.")
+    else:
+        _turn = am_turns[-1]
+        _events = [{"role": event["role"], "actor": event["actorId"], "text": event["content"][0]["text"], "createdAt": event["createdAt"]}
+                   for event in _turn["session"]["events"]]
+        _recalled = [{"rank": rank, "memory": item["text"], "content words in common with the message": len(shared_stems(_turn["question"], item["text"]))}
+                     for rank, item in enumerate(_turn["found"]["items"], 1)]
+        _prompt = "\n".join([_turn["system"], "", *[f"{message['role']}: {message['content']}" for message in _turn["history"]]])
+        _view = mo.vstack([
+            mo.md(
+                f"**Session memory.** Agent Memory returned session `{_turn['sessionId']}` by id, in event order. "
+                f"Its `ownerId` is `{_turn['session']['ownerId']}` and its `namespace` is `{_turn['session']['namespace']}`. "
+                "The API reference says a session takes both from its first event."
+            ),
+            mo.ui.table(_events, selection=None, pagination=False),
+            mo.md(
+                f"**Long-term memory.** The search for the message returned {len(_recalled)} of at most 3 memories "
+                f"at `similarityThreshold` {_turn['search']['similarityThreshold']}, with this filter: `{json.dumps(_turn['search']['filter'])}`"
+            ),
+            mo.ui.table(_recalled, selection=None, pagination=False),
+            mo.md(
+                f"**What Claude received.** The app made one call. Session events: {len(_turn['history'])}. Recalled memories: {len(_recalled)}. "
+                f"Claude answered in {_turn['llm_ms']} ms."
+            ),
+            mo.plain_text(_prompt),
+            mo.accordion({
+                **{f"{step} as sent (credential masked)": mo.json(wire) for step, wire in _turn["wires"].items()},
+                "Long-term memory search reply": mo.json(_turn["found"]),
+            }),
+        ])
+    _view
+    return
+
+
+@app.cell(column=4)
+def am_recall(
+    AGENT_MEMORY,
+    am_memories,
+    am_scope,
+    am_threshold,
+):
+    _rows = []
+    for _question in cairn.MEMORY_QUESTIONS:
+        _, _body, _wire = call_service(AGENT_MEMORY, "POST", "/long-term-memory/search", json_body={
+            "text": _question["text"], "filter": am_scope.value,
+            "filterOp": "all", "similarityThreshold": am_threshold.value, "limit": 100,
+        })
+        _ids = [item["id"] for item in _body["items"]]
+        _fact = am_memories[_question["target"] - 1]
+        _rank = f"#{_ids.index(_fact['id']) + 1} of {len(_ids)}" if _fact["id"] in _ids else f"not in the {len(_ids)} returned"
+        _rows.append({"question": _question["text"], "fact it is after": _fact["text"],
+                      "content words in common": len(shared_stems(_question["text"], _fact["text"])), "rank": _rank})
+    mo.vstack([
+        mo.md("The cell below asks three questions, each sharing no content word with the fact it is after. It uses the scope and similarity threshold set above the chat. At the default 0.0 every memory comes back ranked:"),
+        mo.ui.table(_rows, selection=None, pagination=False),
+        mo.md(
+            "Content words are word stems with stopwords removed. "
+            "The reply ranks memories best first with no score, and `similarityThreshold` cuts on a similarity it never shows. "
+            "Under the other two scopes every row reads `not in the 0 returned`, with the same API key. "
+            "The key alone reaches every record in the store, and `GET /session-memory?includeAll=true` lists every session in it."
+        ),
+        mo.accordion({"Last request as sent (credential masked)": mo.json(_wire), "Last reply": mo.json(_body)}),
     ])
     return
 
 
-@app.cell(column=3, hide_code=True)
+@app.cell(column=4, hide_code=True)
 def am_cleanup_button():
-    am_cleanup_button = mo.ui.run_button(label="Clean up: delete this owner's sessions and memories", kind="danger")
+    am_cleanup_button = mo.ui.run_button(label="Clean up: DELETE this owner's sessions and memories", kind="danger")
     mo.vstack([
-        mo.md("Clean up deletes this owner's sessions, lists up to 100 memories by owner alone, checks each `ownerId` here, deletes by id, and lists again. After session events, press it again ten minutes later, past the extraction cadence above, since extracted memories otherwise last a year by default:"),
+        mo.md("Agent Memory sets no TTL per record. By default, the store expires sessions after 1 hour and long-term memories after 365 days. Clean up deletes this owner's sessions, lists its memories by owner alone, and deletes only those whose `ownerId` is this notebook's:"),
         am_cleanup_button,
+        mo.md("After chatting, press it again ten minutes later to catch extracted memories."),
     ])
     return (am_cleanup_button,)
 
 
-@app.cell(column=3)
+@app.cell(column=4)
 def am_cleanup(
+    AGENT_MEMORY,
+    MEMORY_OWNER_ID,
     am_cleanup_button,
-    am_memory_ids,
-    am_owner_id,
-    am_service,
-    am_session_id,
 ):
     mo.stop(not am_cleanup_button.value)
-    _hints = {401: "check `MEMORY_API_KEY`", 424: "a dependency of the store failed, not 0 results", 429: "press Clean up again in a moment"}
-    def _danger(status, body, step, then):
-        return mo.callout(mo.vstack([mo.md(f"Agent Memory answered `{status}` `{body.get('type', '') if isinstance(body, dict) else ''}` on the {step}: {_hints.get(status, 'read the body below')}. {then}"), mo.json(body if isinstance(body, dict) else {"body": body})]), kind="danger")
-    _step, _session_replies, _deleted, _delete_errors = "owner listing", [], [], []
-    try:
-        _session_list_status, _body, _wire = call_service(am_service, "GET", "/session-memory", params={"filterOwnerId": am_owner_id, "limit": 1000})   # one page: sessions expire on the store's one-hour default
-    except niquests.RequestException as _exc:
-        _session_list_status, _body = type(_exc).__name__, None
-    for _session in [session for session in (_body.get("items", []) if _session_list_status == 200 and isinstance(_body, dict) else [am_session_id]) if str(session).startswith(f"{am_owner_id}-s")]:   # only ids this notebook shaped
-        try:
-            _session_replies.append(call_service(am_service, "DELETE", f"/session-memory/{_session}")[0])   # 404 is gone already, or never made in this kernel
-        except niquests.RequestException as _exc:   # one lost connection does not stop the other deletes
-            _session_replies.append(type(_exc).__name__)
-    try:   # one page of 100 by owner alone, no namespace: extracted memories may carry none, and the five chosen ids are added below in case the listing lags
-        _status, _body, _wire = call_service(am_service, "POST", "/long-term-memory/search", json_body={"text": "", "filter": {"ownerId": {"eq": am_owner_id}}, "limit": 100})
-        mo.stop(_status != 200, _danger(_status, _body, _step, "No memory was deleted."))
-        _listed = _body.get("items", []) if isinstance(_body, dict) else []
-        mo.stop(any(item.get("ownerId") != am_owner_id for item in _listed), mo.callout(mo.md(f"The listing returned a memory not owned by `{am_owner_id}`, so the filter was not applied as sent. No memory was deleted."), kind="danger"))
-        _ids, _step = list(dict.fromkeys([item["id"] for item in _listed] + am_memory_ids)), "delete"
-        for _start in range(0, len(_ids), 100):
-            _status, _body, _delete_wire = call_service(am_service, "DELETE", "/long-term-memory", json_body={"memoryIds": _ids[_start:_start + 100]})
-            _delete_reply = _body if isinstance(_body, dict) else {}   # `deleted`, plus `errors` when an id failed
-            mo.stop(_status != 200, _danger(_status, _body, _step, "No listing was re-run."))
-            _deleted, _delete_errors = _deleted + _delete_reply.get("deleted", []), _delete_errors + (_delete_reply.get("errors") or [])   # a chosen id never written may be among the errors
-        _step = "second listing"
-        _status, _body, _wire = call_service(am_service, "POST", "/long-term-memory/search", json_body={"text": "", "filter": {"ownerId": {"eq": am_owner_id}}, "limit": 100})
-    except niquests.RequestException as _exc:
-        mo.stop(_step != "second listing", mo.callout(mo.md(f"`{type(_exc).__name__}` while reaching Agent Memory on the {_step}. Check `MEMORY_API_BASE_URL`. {'No memory was deleted' if _step == 'owner listing' else 'No listing was re-run'}."), kind="danger"))
-        _status, _body, _wire = type(_exc).__name__, None, {}
-    _left = _body.get("items", []) if isinstance(_body, dict) else []
-    _summary = mo.md(("" if _session_list_status == 200 else f"The session listing answered `{_session_list_status}`, so only this kernel's session id was tried. ") + f"Deleted {_session_replies.count(204)} session{'' if _session_replies.count(204) == 1 else 's'} ({_session_replies.count(404)} already gone) and {len(_deleted)} memories ({len(set(_deleted) - set(am_memory_ids))} with ids the service chose). {len(_delete_errors)} ids answered an error, shown below. {len(_left)} left under `{am_owner_id}`." + ("" if _status == 200 else f" The second listing answered `{_status}`.") + ("" if _status == 200 and not _left else " Press Clean up again."))
-    mo.vstack([mo.callout(_summary, kind="warn" if _delete_errors or _left or _status != 200 or _session_list_status != 200 else "success"), mo.accordion({"Last DELETE as sent (credential masked)": mo.json(_delete_wire), "Last DELETE reply": mo.json(_delete_reply), "Second listing as sent (credential masked)": mo.json(_wire)})])
+    # filterOwnerId, never includeAll: includeAll lists every session in the shared store.
+    _, _sessions, _ = call_service(AGENT_MEMORY, "GET", "/session-memory", params={"filterOwnerId": MEMORY_OWNER_ID, "limit": 1000})
+    _gone = []
+    for _session_id in _sessions["items"]:
+        if _session_id.startswith(f"{MEMORY_OWNER_ID}-s"):   # only sessions this notebook named
+            _status, _, _ = call_service(AGENT_MEMORY, "DELETE", f"/session-memory/{_session_id}", ok=(204, 404))
+            _gone.append(_status)
+    # Owner alone, no namespace and no threshold: namespace eq never matches a memory without one.
+    _, _listed, _wire = call_service(AGENT_MEMORY, "POST", "/long-term-memory/search",
+                                     json_body={"text": "", "filter": {"ownerId": {"eq": MEMORY_OWNER_ID}}, "limit": 100})
+    _ids = [item["id"] for item in _listed["items"] if item.get("ownerId") == MEMORY_OWNER_ID]   # only this notebook's memories
+    _deleted = call_service(AGENT_MEMORY, "DELETE", "/long-term-memory", json_body={"memoryIds": _ids})[1]["deleted"] if _ids else []
+    _extracted = sum(not memory_id.startswith(f"{MEMORY_OWNER_ID}-m") for memory_id in _deleted)
+    mo.vstack([
+        mo.callout(mo.md(f"Sessions deleted: {_gone.count(204)} of {len(_gone)} listed. Memories deleted: {len(_deleted)}, {_extracted} of them extracted from sessions. Press again to confirm 0 are left."), kind="success"),
+        mo.accordion({"Owner listing as sent (credential masked)": mo.json(_wire)}),
+    ])
     return
 
 

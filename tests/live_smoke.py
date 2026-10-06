@@ -44,7 +44,9 @@ import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOK_PATH = ROOT / "iris_basics.py"
+NOTEBOOK_PATH = Path(os.environ.get("IRIS_BASICS_NOTEBOOK", ROOT / "iris_basics.py"))   # or a builder's preview
+if not NOTEBOOK_PATH.is_absolute():
+    NOTEBOOK_PATH = ROOT / NOTEBOOK_PATH
 
 # The ten names the notebook reads. Their values are only ever compared against the printed line.
 CONFIG_NAMES = (

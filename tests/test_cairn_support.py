@@ -92,15 +92,23 @@ def test_gear_care_answers_have_unique_keys():
 
 def test_threshold_probes_target_a_stored_answer_or_none():
     keys = {entry["key"] for entry in data.GEAR_CARE_ANSWERS}
-    assert len(data.THRESHOLD_PROBES) == 6
+    assert len(data.THRESHOLD_PROBES) == 7
     for probe in data.THRESHOLD_PROBES:
         assert set(probe) == {"text", "kind", "target"}
         assert probe["target"] is None or probe["target"] in keys
 
 
-def test_strategy_variants_and_cache_aside_script():
-    assert len(data.STRATEGY_VARIANTS) == 2
-    assert all(set(variant) == {"label", "text"} for variant in data.STRATEGY_VARIANTS)
+def test_threshold_probes_the_cache_aside_step_relies_on():
+    # lc_cache_aside asks GEAR_CARE_ANSWERS[1] first, then THRESHOLD_PROBES[0] as the same question in other words.
+    assert data.THRESHOLD_PROBES[0]["target"] == data.GEAR_CARE_ANSWERS[1]["key"] == "bag"
+    # Index 3 is the all-caps copy: the one probe the `exact` strategy can hit.
+    caps = data.THRESHOLD_PROBES[3]
+    bag = next(entry for entry in data.GEAR_CARE_ANSWERS if entry["key"] == "bag")
+    assert caps["target"] == "bag" and caps["kind"] == "same words, capitals"
+    assert caps["text"] == caps["text"].upper() and caps["text"].lower() == bag["prompt"].lower()
+
+
+def test_cache_aside_script():
     assert set(data.CACHE_ASIDE_SCRIPT) == {"prefix", "ask", "answer", "again"}
     assert data.CACHE_ASIDE_SCRIPT["prefix"].endswith(" ")
 
@@ -145,7 +153,7 @@ def test_session_turns():
     assert data.SESSION_TURNS[-1]["text"] == data.MEMORY_QUESTIONS[0]["text"]
     known = set().union(*(_stems(fact["text"]) for fact in data.DANA_FACTS))
     user_facts = [turn for turn in data.SESSION_TURNS[:-1] if turn["role"] == "USER"]
-    assert len(user_facts) == 2
+    assert user_facts == [data.SESSION_TURNS[0], data.SESSION_TURNS[2]], "am_chat offers turns 0 and 2 as Dana's two facts"
     for turn in user_facts:
         assert _stems(turn["text"]) - known, turn
 

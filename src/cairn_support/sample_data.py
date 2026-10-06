@@ -465,6 +465,11 @@ THRESHOLD_PROBES: list[dict] = [
         "target": "boots",
     },
     {
+        "text": "HOW DO I WASH MY DOWN SLEEPING BAG?",
+        "kind": "same words, capitals",
+        "target": "bag",
+    },
+    {
         "text": "How do I wash my synthetic sleeping bag?",
         "kind": "swapped item",
         "target": None,
@@ -479,12 +484,6 @@ THRESHOLD_PROBES: list[dict] = [
         "kind": "unrelated",
         "target": None,
     },
-]
-
-# Two variants of the stored down-bag question for the search-strategies example.
-STRATEGY_VARIANTS: list[dict] = [
-    {"label": "shouting", "text": "HOW DO I WASH MY DOWN SLEEPING BAG?"},
-    {"label": "punctuation", "text": "How do I wash my down sleeping bag"},
 ]
 
 # The cache-aside example: a question the cache misses, the answer to store, and a paraphrase.
