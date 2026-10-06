@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12, <3.14"
 
 [[package]]
@@ -256,6 +256,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "context-surfaces"
+version = "0.0.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "redis-context-retriever" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d0/90/8b614f6635e8cf4ce81ad779e8762bb8b6f71a2377aff4e1f1d303d095af/context_surfaces-0.0.6.tar.gz", hash = "sha256:e1050e5209785b9f8c1daf04a9a24b0a8837489a1751d2597a6b33e09a544363", size = 2318, upload-time = "2026-07-27T11:13:35.749Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/e3/bb0f02bee5fd9a6143b2ca8bee621310d683b38395f51f47aa9a0cf7a554/context_surfaces-0.0.6-py3-none-any.whl", hash = "sha256:9166f493671e18c6ee825e490ac5262d1042ec6794668cee6253bdfee3907f79", size = 2022, upload-time = "2026-07-27T11:13:34.627Z" },
 ]
 
 [[package]]
@@ -640,14 +652,14 @@ wheels = [
 
 [[package]]
 name = "jedi"
-version = "0.20.0"
+version = "0.19.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "parso" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/46/b7/a3635f6a2d7cf5b5dd98064fc1d5fbbafcb25477bcea204a3a92145d158b/jedi-0.20.0.tar.gz", hash = "sha256:c3f4ccbd276696f4b19c54618d4fb18f9fc24b0aef02acf704b23f487daa1011", size = 3119416, upload-time = "2026-05-01T23:38:47.814Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/3a/79a912fbd4d8dd6fbb02bf69afd3bb72cf0c729bb3063c6f4498603db17a/jedi-0.19.2.tar.gz", hash = "sha256:4770dc3de41bde3966b02eb84fbcf557fb33cce26ad23da12c742fb50ecb11f0", size = 1231287, upload-time = "2024-11-11T01:41:42.873Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/93/242e2eab5fe682ffcb8b0084bde703a41d51e17ee0f3a31ff0d9d813620a/jedi-0.20.0-py2.py3-none-any.whl", hash = "sha256:7bdd9c2634f56713299976f4cbd59cb3fa92165cc5e05ea811fb253480728b67", size = 4884812, upload-time = "2026-05-01T23:38:43.919Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/5a/9cac0c82afec3d09ccd97c8b6502d48f165f9124db81b4bcb90b4af974ee/jedi-0.19.2-py2.py3-none-any.whl", hash = "sha256:a8ef22bde8490f57fe5c7681a3c83cb58874daf72b4784de3cce5b6ef6edb5b9", size = 1572278, upload-time = "2024-11-11T01:41:40.175Z" },
 ]
 
 [[package]]
@@ -895,7 +907,7 @@ wheels = [
 
 [[package]]
 name = "marimo"
-version = "0.25.0"
+version = "0.24.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click", marker = "sys_platform != 'emscripten'" },
@@ -918,9 +930,9 @@ dependencies = [
     { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
     { name = "websockets", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d3/a7/4f0cc52e7c875997e7026e737f7a20f75786d2d65e572a1a0ef9cd5204ce/marimo-0.25.0.tar.gz", hash = "sha256:0005827578027cf9ea2cce039e099c029a9323a3467cb15100228918c1608ad1", size = 50236089, upload-time = "2026-09-23T21:48:33.867Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/a7/321efa5a41218b1d1efab5110484d264377428ee858969d3678e573e3379/marimo-0.24.2.tar.gz", hash = "sha256:b0e1bf55f605f1a522cc3428a38d44242469fd24aa24199a86715aefbf746812", size = 38784284, upload-time = "2026-09-11T16:58:30.789Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/0d/055b436b509ffd6e7f9307dacd95f58c7fbb6c75a1eafca3c6047e7f13a6/marimo-0.25.0-py3-none-any.whl", hash = "sha256:43bb4d82d713f44fc064e77668e59a9fbb6172a6cf7c3abe25c15ef2cb1cce31", size = 50902999, upload-time = "2026-09-23T21:48:29.047Z" },
+    { url = "https://files.pythonhosted.org/packages/49/c9/48e338c36e7153da76fd6cc87afb86d0c8b4aedd5a8f969c106e05b9b61d/marimo-0.24.2-py3-none-any.whl", hash = "sha256:a6c46e8f49e3b30a5d59ae3af06f6ecd0b0a3b69434be8a022692229dd538ad4", size = 39251372, upload-time = "2026-09-11T16:58:27.615Z" },
 ]
 
 [[package]]
@@ -1137,6 +1149,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/41/ee/38e785e88a4045f6ad1d1f2808dcdfafdca48c760260c0587bf171e29fc9/numpy-2.5.3-cp313-cp313-win32.whl", hash = "sha256:1c80eabb4035ecf4ca9cd49cde8a9fdd69a729e63e6474887d1523ade7aa277f", size = 6129003, upload-time = "2026-09-06T16:25:23.664Z" },
     { url = "https://files.pythonhosted.org/packages/f3/ec/100f2b1794ede74a9b3d7ec6b9736927f56713414c1dfe19ab6c383494bf/numpy-2.5.3-cp313-cp313-win_amd64.whl", hash = "sha256:71cad2b2a7451ab79d8f5e71b453485b6775963d5cf794179144a7463fe6e8ec", size = 12560965, upload-time = "2026-09-06T16:25:26.602Z" },
     { url = "https://files.pythonhosted.org/packages/80/b1/7dc825ca94c12acebbce4c37caa5e198695eb31424bc579679f32b1bb49d/numpy-2.5.3-cp313-cp313-win_arm64.whl", hash = "sha256:8e4dd766076855b5ff7ea52fa5f07ce26286726e0f8bff446b7739d02e6ea204", size = 10482343, upload-time = "2026-09-06T16:25:29.772Z" },
+]
+
+[[package]]
+name = "openai"
+version = "3.25.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/54/32/26dbdc23d8abfdb8c0a070ce0fda0761550baa8f7729944f1061573e4892/openai-3.25.0.tar.gz", hash = "sha256:3dabc85a408ee7196aa03dfbe68b5177530aa1543282c2ed692be2e531e31e94", size = 1809327, upload-time = "2026-10-06T18:04:05.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/43/ee/c7387195e39970a20fa914f13ad36d1b7216a23c5bfd1b8daf6d5f00af31/openai-3.25.0-py3-none-any.whl", hash = "sha256:31ae9e63134f0bdb4440feca994ceeb0feeeaec88197e0fc011fcc49ff491e70", size = 2140042, upload-time = "2026-10-06T18:04:03.822Z" },
 ]
 
 [[package]]
@@ -1560,6 +1589,20 @@ wheels = [
 ]
 
 [[package]]
+name = "redis-agent-memory"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpcore" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/f6/c25f0e7de4e05378f427b9930d59bcf613ec0d3b4903b5f61fc846b7e042/redis_agent_memory-0.4.1.tar.gz", hash = "sha256:b379be6f64b7ca403036b6ce61018ab09216a4a33c5b9f3338bdc8c0db722a20", size = 74498, upload-time = "2026-09-16T07:34:10.814Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0f/63/ac28db26af34226d0252fd8d3af2281b58494ee704887ddf1ef8851ce7f5/redis_agent_memory-0.4.1-py3-none-any.whl", hash = "sha256:898ed9f256ff50504e77ba664016c2306f183b01e690fb750e99143a39360c11", size = 145506, upload-time = "2026-09-16T07:34:09.571Z" },
+]
+
+[[package]]
 name = "redis-context-retriever"
 version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1587,13 +1630,16 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "context-surfaces" },
     { name = "huggingface-hub" },
     { name = "marimo" },
     { name = "model2vec" },
     { name = "niquests" },
     { name = "numpy" },
+    { name = "openai" },
     { name = "python-dotenv" },
     { name = "redis" },
+    { name = "redis-agent-memory" },
     { name = "redis-context-retriever" },
 ]
 
@@ -1605,13 +1651,16 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = "==1.11.0" },
+    { name = "context-surfaces", specifier = ">=0.0.6" },
     { name = "huggingface-hub", specifier = "==1.33.0" },
-    { name = "marimo", specifier = "==0.25.0" },
+    { name = "marimo", specifier = "==0.24.2" },
     { name = "model2vec", specifier = "==0.9.0" },
     { name = "niquests", specifier = "==3.21.2" },
     { name = "numpy", specifier = "==2.5.3" },
+    { name = "openai", specifier = ">=3.25.0" },
     { name = "python-dotenv", specifier = "==1.2.3" },
     { name = "redis", specifier = "==8.1.0" },
+    { name = "redis-agent-memory", specifier = ">=0.4.1" },
     { name = "redis-context-retriever", specifier = "==0.0.6" },
 ]
 

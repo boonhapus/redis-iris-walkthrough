@@ -9,7 +9,10 @@ readme = "README.md"
 # >=3.12: one numpy pin and no marker split (plan R3.2); redis-context-retriever itself needs 3.11.
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "marimo==0.25.0",
+  # 0.25.0 and 0.25.1 bundle Zod 4.5, which rejects every mo.ui.chat message before it reaches
+  # Python ("expected nonoptional ... at messages[0].metadata", marimo #11090). Fixed on main by
+  # marimo #11114 (2026-10-06); bump past 0.25.1 once a release includes it.
+  "marimo==0.24.2",
   "redis==8.1.0",
   "niquests==3.21.2",
   "redis-context-retriever==0.0.6",  # import name: context_surfaces; pulls httpx, fastmcp, pydantic, keyring
@@ -21,6 +24,9 @@ dependencies = [
   # inline "# comment" as part of the value.
   "python-dotenv==1.2.3",
   "anthropic==1.11.0",
+  "context-surfaces>=0.0.6",
+  "redis-agent-memory>=0.4.1",
+  "openai>=3.25.0",
 ]
 
 [dependency-groups]
