@@ -227,20 +227,67 @@ async def _(os):
 
 
 @app.cell
-def _(
+def am_steps(ai, ams_client, dt, it, models):
+    def ams_query(messages: list[ai.ChatMessage], n: int) -> str:
+        """The text to search with: the last `n` user messages, newest first."""
+        recent = it.islice((m for m in reversed(messages) if m.role == "user"), n)
+        return "\n".join(str(m.content) for m in recent)
+
+
+    async def ams_remember_turn(session_id: str, user_id: str, text: str) -> None:
+        """Principle 3: write the user's message to session memory."""
+        await ams_client.add_session_event_async(
+            session_id=session_id,
+            actor_id=user_id,
+            role=models.MessageRole.USER,
+            content=[{"text": text}],
+            created_at=dt.datetime.now(dt.timezone.utc),
+        )
+
+
+    async def ams_recall(
+        query: str, user_id: str, threshold: float
+    ) -> list[models.MemoryRecord]:
+        """Principles 1 and 2: search long-term memory by meaning, cut off by `threshold`, for one owner."""
+        r = await ams_client.search_long_term_memory_async(
+            request={
+                "text": query,
+                "similarityThreshold": threshold,
+                "filter": {"ownerId": {"eq": user_id}},
+                "limit": 10,
+            }
+        )
+        return r.items
+
+
+    def ams_build_system(user_id: str, recalled: list[models.MemoryRecord]) -> str:
+        """Principle 3: the app, not Agent Memory, decides what the model sees."""
+        system = "You are a helpful AI assistant."
+
+        if recalled:
+            facts = "\n".join(f"- {m.text}" for m in recalled)
+            system += f"\n\nWhat you remember about {user_id}:\n{facts}"
+
+        return system
+
+    return ams_build_system, ams_query, ams_recall, ams_remember_turn
+
+
+@app.cell
+def am_chat_fn(
     AsyncGenerator,
     Callable,
     ai,
-    ams_client,
-    dt,
-    it,
-    models,
+    ams_build_system,
+    ams_query,
+    ams_recall,
+    ams_remember_turn,
     secrets,
     stream_llm,
 ):
     ChatFn = Callable[[list[ai.ChatMessage], ai.ChatModelConfig], AsyncGenerator[str, None]]
- 
- 
+
+
     def ams_chat(
         user_id: str,
         threshold: Callable[[], float],
@@ -253,54 +300,28 @@ def _(
         async def chat(
             messages: list[ai.ChatMessage], config: ai.ChatModelConfig
         ) -> AsyncGenerator[str, None]:
-            """
-            Redis-backed chat.
- 
-            1. Store the current USER turn in STM.
-            2. Fetch the user's LTM based on the most recent turn.
-            3. Interface with language model.
-            """
-            latest_user_text = str(messages[-1].content)
- 
-            # 1. Store the current USER turn in STM.
-            _ = await ams_client.add_session_event_async(
-                session_id=session_id,
-                actor_id=user_id,
-                role=models.MessageRole.USER,
-                content=[{"text": latest_user_text}],
-                # namespace=...,
-                # metadata=...,
-                created_at=dt.datetime.now(dt.timezone.utc),
-            )
- 
-            # 2. Fetch the user's LTM based on the most recent turns.
-            recent_user_turns = it.islice((m for m in reversed(messages) if m.role == "user"), turns())
+            """One agent turn."""
+            latest = str(messages[-1].content)
 
-            ltm = await ams_client.search_long_term_memory_async(
-                request={
-                    "text": "\n".join(str(m.content) for m in recent_user_turns),
-                    "similarityThreshold": threshold(),
-                    "filter": {"ownerId": {"eq": user_id}},
-                    "limit": 10,
-                }
-            )
- 
-            # 3. Interface with language model.
-            system = "You are a helpful AI assistant."
+            # Principle 3: write the user's message to session memory.
+            await ams_remember_turn(session_id, user_id, latest)
 
-            if ltm.items:
-                facts = "\n".join(f"- {m.text}" for m in ltm.items)
-                system += f"\n\nWhat you remember about {user_id}:\n{facts}"
-        
+            # Principles 1 and 2: recall this user's memories by meaning.
+            query = ams_query(messages, turns())
+            recalled = await ams_recall(query, user_id, threshold())
+
+            # Principle 3: build the prompt the model sees.
+            system = ams_build_system(user_id, recalled)
+
             history = [
                 {"role": m.role, "content": str(m.content)}
                 for m in messages
                 if m.role in ("user", "assistant")
             ]
- 
+
             async for text in stream_llm(system, history, config):
                 yield text
- 
+
         return chat
 
     return (ams_chat,)
@@ -349,38 +370,41 @@ async def _(USER_ID, ams_client, mo, uuid):
 
 
 @app.cell
-def _(ams_client, asyncio, it):
-    async def amnesia(user_id: str) -> None:
-        """Lose all memories about `user_id`."""
-        memory_ids: list[str] = []
-        page_token: str | None = ""
+def am_amnesia(ams_client, asyncio, models):
+    async def ams_memories(owner: str) -> list[models.MemoryRecord]:
+        """Every long-term memory whose `ownerId` is `owner`, across pages."""
+        found: list[models.MemoryRecord] = []
+        page_token: str | None = None
 
-        # FETCH ALL MEMZ
-        while page_token is not None:
+        while True:
             r = await ams_client.search_long_term_memory_async(
                 request={
-                    "filter": {"ownerId": {"eq": user_id}},
+                    "filter": {"ownerId": {"eq": owner}},
                     "limit": 100,
                     **({"pageToken": page_token} if page_token else {}),
                 }
             )
-
-            memory_ids += [m.id for m in r.items]
+            found += r.items
             page_token = r.next_page_token
 
-        # DELETE ALL MEMZ
-        r = await asyncio.gather(
+            if not page_token:
+                return found
+
+
+    async def amnesia(user_id: str) -> list[str]:
+        """Lose all memories about `user_id`. Returns the ids deleted."""
+        memory_ids = [m.id for m in await ams_memories(user_id)]
+
+        await asyncio.gather(
             *(
                 ams_client.bulk_delete_long_term_memories_async(memory_ids=memory_ids[i : i + 100])
                 for i in range(0, len(memory_ids), 100)
             )
         )
 
-        return list(it.chain.from_iterable(r))
+        return memory_ids
 
-
-    # await amnesia("Tom")
-    return
+    return amnesia, ams_memories
 
 
 if __name__ == "__main__":
