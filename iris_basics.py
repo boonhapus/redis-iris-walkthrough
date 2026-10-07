@@ -209,7 +209,7 @@ def am_title(mo):
 
 
 @app.cell
-async def _(os):
+async def am_connect(mo, os):
     import datetime as dt
     import secrets
  
@@ -222,8 +222,302 @@ async def _(os):
         api_key=os.environ["MEMORY_API_KEY"],
     )
 
-    await ams_client.health_async()
+    _health = await ams_client.health_async()
+
+    mo.md(f"Agent Memory is {_health.status.value}.")
     return ams_client, dt, models, secrets
+
+
+@app.cell(hide_code=True)
+def am_try_it(mo):
+    mo.md(r"""
+    ### Try it
+
+    Select Seed memories, then ask each customer the same question. The panel under the chat shows what the agent recalled and the prompt it built. Switching customers starts a new conversation.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def am_controls(AMS_SEEDS, USER_ID, mo):
+    get_memories_version, set_memories_version = mo.state(0)
+
+    ams_owner = mo.ui.dropdown(options=list(AMS_SEEDS), value=USER_ID, label="Chat as")
+    ams_seed_button = mo.ui.run_button(label="Seed memories")
+    ams_refresh_button = mo.ui.run_button(label="Refresh")
+    ams_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
+
+    mo.hstack(
+        [ams_owner, ams_seed_button, ams_refresh_button, ams_cleanup_button],
+        justify="start",
+        align="end",
+    )
+    return (
+        ams_cleanup_button,
+        ams_owner,
+        ams_refresh_button,
+        ams_seed_button,
+        get_memories_version,
+        set_memories_version,
+    )
+
+
+@app.cell(hide_code=True)
+async def am_seed(ams_seed, ams_seed_button, mo, set_memories_version):
+    mo.stop(not ams_seed_button.value)
+
+    _ids = await ams_seed()
+    set_memories_version(lambda v: v + 1)
+
+    mo.callout(
+        mo.md(
+            f"Wrote {len(_ids)} new memories to long-term memory."
+            if _ids
+            else "Every seed memory is already in long-term memory."
+        ),
+        kind="success",
+    )
+    return
+
+
+@app.cell(hide_code=True)
+async def am_cleanup(
+    AMS_SEEDS,
+    amnesia,
+    ams_cleanup_button,
+    mo,
+    set_memories_version,
+):
+    mo.stop(not ams_cleanup_button.value)
+
+    _total = 0
+    for _owner in AMS_SEEDS:
+        _total += len(await amnesia(_owner))
+
+    set_memories_version(lambda v: v + 1)
+
+    mo.callout(
+        mo.md(f"Deleted {_total} memories for {' and '.join(AMS_SEEDS)}."),
+        kind="warn",
+    )
+    return
+
+
+@app.cell(hide_code=True)
+async def am_memories(
+    ams_memories,
+    ams_owner,
+    ams_refresh_button,
+    get_memories_version,
+    mo,
+):
+    _ = (get_memories_version(), ams_refresh_button.value)
+
+    _owner = ams_owner.value
+    _found = await ams_memories(_owner)
+
+    mo.vstack(
+        [
+            mo.md(f"**Long-term memory for {_owner}** ({len(_found)})"),
+            mo.ui.table(
+                [
+                    {
+                        "memory": m.text,
+                        "type": m.memory_type,
+                        "created (UTC)": m.created_at.strftime("%H:%M:%S"),
+                    }
+                    for m in _found
+                ],
+                selection=None,
+                pagination=False,
+                show_search=False,
+                show_download=False,
+            )
+            if _found
+            else mo.md("_No memories yet._"),
+            mo.md(
+                "Agent Memory also extracts memories from session events in the background, "
+                "when extraction is enabled on the store. Select Refresh to look for new ones."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def am_state(mo):
+    get_threshold, set_threshold = mo.state(0.3)
+    get_turns, set_turns = mo.state(1)
+    return get_threshold, get_turns, set_threshold, set_turns
+
+
+@app.cell(hide_code=True)
+def am_chat(
+    ams_chat,
+    ams_owner,
+    get_threshold,
+    get_turns,
+    mo,
+    set_threshold,
+    set_turns,
+):
+    ams_turn_log: list[dict] = []
+    ams_sweep_cache: dict = {}
+
+    similarity_threshold = mo.ui.slider(
+        start=0.0, stop=1.0, step=0.05, value=get_threshold(),
+        label="Memory similarity threshold", show_value=True,
+        on_change=set_threshold, debounce=True,
+    )
+
+    turns = mo.ui.slider(
+        start=1, stop=10, step=1, value=get_turns(),
+        label="Search with the last N user messages", show_value=True,
+        on_change=set_turns, debounce=True,
+    )
+
+    chatbot = mo.ui.chat(
+        ams_chat(
+            user_id=ams_owner.value,
+            threshold=get_threshold,
+            turns=get_turns,
+            log=ams_turn_log,
+        ),
+        prompts=[
+            "What pets do I have?",
+            "Where am I headed this summer?",
+            "Which foods should I avoid?",
+        ],
+    )
+
+    mo.vstack([chatbot, mo.hstack([similarity_threshold, turns], justify="start")])
+    return ams_sweep_cache, ams_turn_log, chatbot
+
+
+@app.cell(hide_code=True)
+async def am_trace(
+    ams_recall,
+    ams_sweep_cache: dict,
+    ams_turn_log: list[dict],
+    asyncio,
+    chatbot,
+    get_threshold,
+    mo,
+):
+    _user_messages = [m for m in chatbot.value if m.role == "user"]
+
+    mo.stop(
+        not (_user_messages and ams_turn_log)
+        or ams_turn_log[-1]["message"] != str(_user_messages[-1].content),
+        mo.md("_Send a message to see what the agent recalls._"),
+    )
+
+    _turn = ams_turn_log[-1]
+    _recalled = _turn["recalled"]
+    _thresholds = sorted(
+        {0.1, 0.2, 0.3, 0.4, 0.5, round(get_threshold(), 2), round(_turn["threshold"], 2)}
+    )
+
+    _key = (_turn["query"], _turn["user_id"], tuple(_thresholds))
+    if _key not in ams_sweep_cache:
+        ams_sweep_cache[_key] = await asyncio.gather(
+            *(ams_recall(_turn["query"], _turn["user_id"], _t) for _t in _thresholds)
+        )
+    _hits = ams_sweep_cache[_key]
+
+    _sweep = [
+        {
+            "threshold": _t,
+            "recalled": len(_h),
+            "memories": "; ".join(m.text for m in _h) or "none",
+            "note": ", ".join(
+                _name
+                for _name, _value in (
+                    ("this turn", _turn["threshold"]),
+                    ("slider", get_threshold()),
+                )
+                if round(_value, 2) == _t
+            ),
+        }
+        for _t, _h in zip(_thresholds, _hits)
+    ]
+
+    mo.vstack(
+        [
+            mo.md(
+                f"**This turn.** The app wrote the message to session memory as a user event in session `{_turn['session_id']}`, "
+                f"then searched long-term memory for `ownerId` `{_turn['user_id']}` at threshold {_turn['threshold']:.2f}."
+            ),
+            mo.md(
+                f"**Recalled ({len(_recalled)})**\n\n"
+                + ("\n".join(f"- {t}" for t in _recalled) or "_No memory cleared the threshold._")
+            ),
+            mo.accordion(
+                {
+                    "Search text": mo.md(f"```text\n{_turn['query']}\n```"),
+                    "System prompt sent to the model": mo.md(f"```text\n{_turn['system']}\n```"),
+                }
+            ),
+            mo.md("**The same search at other thresholds**"),
+            mo.ui.table(
+                _sweep,
+                selection=None,
+                pagination=False,
+                show_search=False,
+                show_download=False,
+            ),
+            mo.md("Raising the threshold drops weaker matches. Move the slider to add a row for it."),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def am_read_code(mo):
+    mo.md(r"""
+    ### Read the code
+
+    Each function names the principle it teaches. `ams_chat` strings them into one turn.
+    """)
+    return
+
+
+@app.cell
+def am_seed_fn(USER_ID, ams_client, ams_memories, uuid):
+    AMS_SEEDS = {
+        USER_ID: [
+            "I've got two dogs, Max and Cece",
+            "I wear size 11 trail shoes",
+            "I'm planning a hiking trip in the Dolomites in August",
+        ],
+        "Priya": [
+            "I have a cat named Miso",
+            "I'm allergic to peanuts and tree nuts",
+            "I'm planning a canoe trip in Maine in June",
+        ],
+    }
+
+
+    async def ams_seed() -> list[str]:
+        """Principle 2: write memories straight to long-term memory, each tagged with an `ownerId`."""
+        created: list[str] = []
+
+        for owner, texts in AMS_SEEDS.items():
+            stored = {m.text for m in await ams_memories(owner)}
+            new = [
+                {"id": str(uuid.uuid4()), "text": text, "ownerId": owner}
+                for text in texts
+                if text not in stored
+            ]
+
+            if new:
+                await ams_client.bulk_create_long_term_memories_async(memories=new)
+
+            created += [m["id"] for m in new]
+
+        return created
+
+    return AMS_SEEDS, ams_seed
 
 
 @app.cell
@@ -292,6 +586,7 @@ def am_chat_fn(
         user_id: str,
         threshold: Callable[[], float],
         turns: Callable[[], int],
+        log: list[dict],
         session_id: str | None = None,
     ) -> ChatFn:
         """Marimo Chat, with Agent Memory injected in."""
@@ -313,6 +608,18 @@ def am_chat_fn(
             # Principle 3: build the prompt the model sees.
             system = ams_build_system(user_id, recalled)
 
+            log.append(
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "message": latest,
+                    "query": query,
+                    "threshold": threshold(),
+                    "recalled": [m.text for m in recalled],
+                    "system": system,
+                }
+            )
+
             history = [
                 {"role": m.role, "content": str(m.content)}
                 for m in messages
@@ -325,48 +632,6 @@ def am_chat_fn(
         return chat
 
     return (ams_chat,)
-
-
-@app.cell
-def _(ams_chat, mo):
-    get_threshold, set_threshold = mo.state(0.5)
-
-    similarity_threshold = mo.ui.slider(
-        start=0.0, stop=1.0, step=0.05, value=get_threshold(),
-        label="Memory similarity threshold", show_value=True,
-        on_change=set_threshold,
-    )
-
-    get_turns, set_turns = mo.state(1)
-
-    turns = mo.ui.slider(
-        start=1, stop=10, step=1, value=get_turns(),
-        label="LTM user turns", show_value=True,
-        on_change=set_turns,
-    )
-
-    chatbot = mo.ui.chat(ams_chat(user_id="Tom", threshold=get_threshold, turns=get_turns))
-
-    mo.vstack([chatbot, similarity_threshold, turns])
-    return
-
-
-@app.cell
-async def _(USER_ID, ams_client, mo, uuid):
-    mo.stop(predicate=True)
-
-    _fact = "I've got two dogs, Max and Cece"
-
-    await ams_client.bulk_create_long_term_memories_async(
-      memories=[
-          {
-              "id": str(uuid.uuid4()),
-              "text": _fact,
-              "ownerId": USER_ID,
-          },
-      ],
-    )
-    return
 
 
 @app.cell
