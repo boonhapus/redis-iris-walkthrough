@@ -180,29 +180,28 @@ def am_title(mo):
     mo.md(r"""
     # Redis Agent Memory
 
-    An agent that forgets a customer's nut allergy between conversations can suggest the wrong trail snack next time.
+    An agent that forgets a customer's two dogs between conversations asks about them again every time.
     Redis Agent Memory keeps each conversation in session memory and durable facts in long-term memory, written by the app or extracted from session events.
-    Write five memories about Dana, a made-up Cairn customer, then chat as Dana and change what the agent recalls to see three principles:
+    Seed memories for two made-up customers, Tom and Priya, then chat as either and tune what the agent recalls to see three principles:
 
-    1. **Long-term memory recalls facts by meaning.** Questions that share no word with the fact they are after still find it, ranked best first with no score in the reply.
-    2. **The owner and namespace are the tenant boundary.** The API key opens the whole store, and Agent Memory returns only memories matching the `ownerId` and `namespace` the app sends.
-    3. **An agent turn reads both tiers.** The app fetches the session by id in event order, searches long-term memory with the latest message, and joins both into one prompt.
+    1. **Long-term memory recalls by meaning.** A question that shares no word with a stored fact can still find it. `similarityThreshold` sets the cosine similarity a memory must reach to come back, so raising it returns fewer memories.
+    2. **The `ownerId` filter scopes recall to one user.** Every memory carries an `ownerId`, and the search asks for the chat user's memories only. The app sends that filter with each search, so the app draws the line between users.
+    3. **The app builds the prompt.** Each turn the app writes the user's message to session memory and searches long-term memory with the last N user messages. It adds the hits to the system prompt, so the model sees recalled facts only because the app puts them there.
 
-    Agent Memory is in public preview on Redis Cloud. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `ANTHROPIC_API_KEY`, which the chat and the cell under it need.
-    Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/),
-    [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/), and
-    [REST quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/rest-api-quickstart/).
+    Agent Memory is in preview on Redis Cloud. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY`, which the chat needs and which must match the provider of `AI_MODEL`.
+    Docs: [overview](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
+    [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/), and
+    [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
 
     Each line reads source, target, and what passes between them:
 
     ```text
-    App            -> long-term memory  POST /long-term-memory, five memories with ids the app chooses
-    App            -> session memory    POST /session-memory/events, the customer's message
-    App            -> long-term memory  POST /long-term-memory/search, the message, filtered by owner and namespace
-    App            -> session memory    GET /session-memory/{sessionId}, events in order
-    App            -> Claude            the session events and the recalled memories, one call
-    App            -> session memory    POST /session-memory/events, the agent's reply
-    session memory -> long-term memory  background extraction, every 5 minutes by default
+    App            -> long-term memory  POST /long-term-memory, three memories per customer, each with an id and an ownerId the app chooses
+    App            -> session memory    POST /session-memory/events, the user's message
+    App            -> long-term memory  POST /long-term-memory/search, the last N user messages, filtered by ownerId, cut off by similarityThreshold
+    App            -> model             the system prompt with the recalled facts, and the chat history
+    session memory -> long-term memory  background extraction, when enabled on the store
+    App            -> long-term memory  POST /long-term-memory/search, then DELETE /long-term-memory, for every memory of one ownerId
     ```
     """)
     return
