@@ -12,4 +12,4 @@ The notebook `iris_basics.py` on disk, and the live kernel while a marimo sessio
 | `staging/` | superseded | The 2026-10-05 v2 build: scaffold, column fragments, `assemble.py`, build and review notes. Do not run `assemble.py` over the root notebook |
 | `reviews/plan-conformance-2026-09-30.md` | superseded | The MVP plan conformance review |
 
-Columns 1 to 3 (Redis Search, LangCache, Context Retriever) are title cells only in the current working copy. Column 4 is the exemplar the others will follow.
+Columns 1 to 3 (Redis Search, LangCache, Context Retriever) are a title cell and a comment-only stub cell each in the current working copy, rewritten on 2026-10-08 to match column 4. Column 4 is the exemplar the others follow.

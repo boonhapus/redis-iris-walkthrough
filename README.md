@@ -6,26 +6,24 @@
 
 When your agent needs context, you need a search index, a semantic cache, governed access to your data, and a memory that outlives the session. Redis gives you all four in one data layer, and this notebook shows the exact command or request behind each.
 
-LangCache and Agent Memory are in public preview, and Context Retriever is in preview.
-
 ## What you'll learn
 
 - Redis Search
   - An index follows every write under its prefix
-  - Redis fuses keyword and vector rankings in one command
+  - An unfiltered nearest-neighbor search always answers, and a similarity floor can return nothing
   - Filters run inside the vector search
 - Redis LangCache
   - Your app searches before the LLM and stores after it
   - The threshold trades wrong answers for misses
-  - A cached answer lives until its time to live (TTL) runs out
+  - A cached answer lives until its time to live (TTL) runs out or your app deletes it
 - Redis Context Retriever
-  - The data model generates the tools
-  - The agent can call only what the model defines
-  - Context Retriever is a layer on top of your Redis
+  - Each field's `index` kind decides which tools the surface lists
+  - `connection_config` ties the surface to your own Redis database
+  - An admin key creates the surface, and the agent holds only an agent key
 - Redis Agent Memory
-  - Long-term memory recalls facts by meaning
-  - The owner and namespace are the tenant boundary
-  - An agent turn reads both tiers
+  - Long-term memory recalls by meaning
+  - The `ownerId` filter scopes recall to one customer
+  - The app builds the prompt
 
 ## What you'll build
 
@@ -37,7 +35,7 @@ Nothing is written until you press a seed button, submit the Search form, or sen
 
 Each column has one job:
 
-- Redis Search: answer a question over 36 help articles by keyword, by meaning, and by both
+- Redis Search: answer a question over 36 help articles by meaning, within a similarity floor and a filter
 - Redis LangCache: return a stored answer for a question asked in other words
 - Redis Context Retriever: turn three Python classes into MCP tools an agent calls over your Redis
 - Redis Agent Memory: recall a customer fact with no word in common with the question
@@ -46,7 +44,7 @@ Each column has one job:
 
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.12 or 3.13 (uv installs it)
-- A Redis 8.4 or later database with Search and JSON, either local or Redis Cloud
+- A Redis 8 or later database with Search and JSON, either local or Redis Cloud
 - A LangCache service (API URL, cache ID, and API key)
 - A Context Retriever admin key
 - An Agent Memory service (endpoint, store ID, and API key)
@@ -110,6 +108,8 @@ Until you press a column's seed button, the cells that need its data show marimo
 
 ## Step 4. Search the help center
 
+> **Note:** The Search column is being rebuilt around the three principles in its title. The load, the filter sweep, and the form below ran live on 2026-10-05 in the earlier build. The similarity-floor chat has not run live yet.
+
 In the Redis Search column, press **Load the help center: 1 FT.CREATE, 36 HSET, 36 EXPIRE**.
 
 Redis answers `OK` to the `FT.CREATE`, and the cell shows that reply. The cell writes the 36 hashes in three pipelines of 12 and runs `FT.INFO` after each one. In a live run on 2026-10-05, `num_docs` read 12, 24, and 36, with 0 indexing failures:
@@ -123,30 +123,16 @@ FT.INFO idx:cairn:<run>:help
 
 Each hash expires after one hour, and the index has no TTL. A second press before Clean up rewrites keys the index holds, so its first row shows the full count.
 
-After the load, the chat appears. Set the filters above it, then type a question or pick a suggested prompt:
+After the load, the chat appears. Set the filters and the similarity floor above it, then type a question or pick a suggested prompt:
 
 - **Categories (none means all)**: a multiselect of the six categories, all selected at first
 - **Year floor**: a slider from 2022 to 2026, at 2022 at first
-- Suggested prompts: *trail shoes feel cramped*, *Trailhead*, *waterproofng*, *Where is my parcel?*, and the December gift question below
+- **Similarity floor**: a slider from 0 to 1, sent to Redis as a `$radius` of 1 minus the floor
+- Suggested prompts: *trail shoes feel cramped*, *waterproofng*, *Where is my parcel?*, and the December gift question below
 
-Each question runs `FT.HYBRID` with the filter inside both the keyword and the vector side:
+Each question runs one `FT.SEARCH` with the filter and a `VECTOR_RANGE` clause in the same query. Redis returns only the articles within the radius that pass the filter, and the model gets those articles and the question. When no article is within the radius, the system prompt says so, the same empty answer LangCache and Agent Memory give below their `similarityThreshold`.
 
-```
-FT.HYBRID idx:cairn:<run>:help SEARCH "<words> (@category:{...} @year:[<floor> 2026])" SCORER BM25STD VSIM @embedding $vector KNN 2 K 10 FILTER "(@category:{...} @year:[<floor> 2026])" COMBINE RRF 4 WINDOW 20 CONSTANT 60 LOAD 1 @__key LIMIT 0 10 PARAMS 2 vector <1024 bytes>
-```
-
-The cell also runs `BM25STD` and `KNN 10` under the same filter, and `KNN 5` with and without it. Claude gets the top three articles and the question, and the reply lists the titles it received.
-
-The last-turn panel under the chat ranks each article Claude received under `BM25STD`, KNN, and `FT.HYBRID`. In a live run on 2026-10-05, with Claude stubbed, the top article ranked as follows:
-
-| Question | `FT.HYBRID` first | `BM25STD` | KNN | `FT.HYBRID` |
-|---|---|---|---|---|
-| *trail shoes feel cramped* | Finding your boot size | - | 1 | 1 |
-| *Trailhead* | Resoling worn boots | 1 | 3 | 1 |
-| *waterproofng* | Restoring waterproofing on shells and boots | - | 1 | 1 |
-| *Where is my parcel?* | Shipping outside the US | - | 1 | 1 |
-
-`-` means outside the top ten. `FT.HYBRID` answered in 45 to 66 ms.
+The panel beside the chat shows the `FT.SEARCH` line, each article's `vector_score`, and a `KNN 3` without a floor, which returns three articles for any question. Raise the similarity floor until the range query returns nothing, and `KNN 3` still answers.
 
 The panel also compares the unfiltered top five, filtered in the app, with `KNN 5` with the filter inside. Move **Year floor** to 2025 and ask *Where is my parcel?* again. In the 2026-10-05 run the app kept 3, and `KNN 5` with the filter inside returned 5.
 
@@ -166,7 +152,7 @@ The form at the bottom writes one more article. Its fields are **Title**, **Body
 
 The cell writes `cairn:<run>:help:reader` with a one-hour `EXPIRE` and reads `num_docs` before and after. In the 2026-10-05 run it went from 36 to 37, and a second submit read 37 to 37.
 
-Ask *Can I return a gift I got in December?* before and after the submit. In that run the new article was absent from the top three before it, and ranked first by KNN and `FT.HYBRID` after it.
+Ask *Can I return a gift I got in December?* before and after the submit. In that run the new article was absent from the top three before it, and ranked first by KNN after it.
 
 ## Step 5. Cache an answer by meaning
 
@@ -392,7 +378,7 @@ flowchart LR
     N --> LC[Redis LangCache]
     N --> CR[Redis Context Retriever]
     N --> AM[Redis Agent Memory]
-    RS -->|"FT.CREATE, HSET, FT.SEARCH, FT.HYBRID"| R[(Your Redis)]
+    RS -->|"FT.CREATE, HSET, FT.SEARCH"| R[(Your Redis)]
     LC -->|"POST /entries, POST /entries/search"| LCS[LangCache service]
     CR -->|"POST /context-surfaces, tools/call"| CRS[Context Retriever service]
     CRS -->|"JSON.SET, FT.CREATE"| R
@@ -485,7 +471,7 @@ Clean up lists every surface on the account, page by page, and deletes each one 
 
 ### Do I need Redis Cloud?
 
-No. The Redis Search column runs on any Redis 8.4 or later with Search. The three hosted services, LangCache, Context Retriever, and Agent Memory, run on Redis Cloud.
+No. The Redis Search column runs on any Redis 8 or later with Search. The three hosted services, LangCache, Context Retriever, and Agent Memory, run on Redis Cloud.
 
 ### Does the notebook call an LLM?
 
@@ -537,8 +523,6 @@ Context Retriever was not run live in its new form, because no `CTX_ADMIN_KEY` w
 
 - The load answered `OK`, and `FT.INFO` read `num_docs` 12, 24, and 36, with 0 indexing failures.
 - A second load after a form submit answered `SEARCH_INDEX_EXISTS Index already exists`, and every row read 37.
-- `FT.HYBRID` with `FILTER` ran live for the first time and answered in 45 to 66 ms. The RESP2 reply parsed as written.
-- The `BM25STD`, KNN, and `FT.HYBRID` ranks of the top article were -, 1, and 1 for *trail shoes feel cramped*. They were 1, 3, and 1 for *Trailhead*, and -, 1, and 1 for *waterproofng*.
 - At year floor 2025, *Where is my parcel?* kept 3 articles filtered in the app and 5 with the filter inside `KNN 5`.
 - The form took `num_docs` from 36 to 37, and a second submit read 37 to 37. The new article then ranked first for the December question.
 - With `returns` and `shipping` selected, the filter inside `KNN 5` returned 5, 5, 5, 5, and 4 for the year floors 2022 to 2026.

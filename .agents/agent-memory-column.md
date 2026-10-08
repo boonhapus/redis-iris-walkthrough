@@ -10,7 +10,7 @@ The notebook teaches a prospective Redis Iris developer how to integrate each Ir
 
 | Cell | Code shown | What the reader sees or what it defines |
 |---|---|---|
-| `am_title` | hidden | Problem sentence, three numbered principles, "public preview" plus the Settings line, Docs line, and the source-target call map the other three titles also carry |
+| `am_title` | hidden | Problem sentence, three numbered principles, the Settings line, Docs line, and the source-target call map the other three titles also carry |
 | `am_store_button` | hidden | Heading "Seed and list two customers' long-term memories", four sentences (Seed, Refresh plus the extracted-type note, Clean up), the three `run_button`s |
 | `am_store` | hidden | Seed, Clean up, and Refresh actions, then two markdown tables (memory, type) per `ownerId`. Also reruns on every chat turn so the tables agree with the bars. Defines `ams_store` |
 | `am_owner` | hidden | The `Chat as` dropdown (defined here, displayed in the workbench) and the walkthrough prose with one payoff per step. Defines `ams_owner` |
@@ -40,7 +40,7 @@ Starter prompts, in walkthrough order: "Which foods should I avoid?", "What pets
 - `ams_request` stays a function because the workbench renders the live request body from it.
 - Markdown tables through `mo.md`, not `mo.ui.table` (0.24.2 hard-codes the column explorer, chart builder, and page-size selector).
 - Redis Cloud is assumed. True globals are UPPERCASE and live in column 0.
-- Agent Memory is "in public preview" (Redis Cloud create-service page and the Python quickstart, read 2026-10-07). Context Retriever keeps "in preview".
+- No preview or availability status in any title (Nick, 2026-10-08). Each column's Docs links carry the service's status, and the reader checks it there. `FT.HYBRID` is out of the notebook and the project for the same reason: none of the hosted services rests on it.
 - Voice: `C:/Users/NickCooper/projects/demo/.agents/VOICE.md`, enforced by `tests/test_voice.py` (25-word ceiling with inline code stripped, serial comma, no semicolons, no exclamation marks, never "developers").
 - Delegated work runs as paseo agents (Sonnet 5.5 for cheap implementers and reviewers), one report file each under `.agents/reviews/`, unless Nick invokes a Workflow himself.
 
