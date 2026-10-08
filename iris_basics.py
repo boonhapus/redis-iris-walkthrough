@@ -8,8 +8,8 @@ app = marimo.App(width="columns", app_title="Redis Iris basics")
 def _():
     from collections.abc import AsyncGenerator, Callable
     import asyncio
+    import datetime as dt
     import html
-    import itertools as it
     import json
     import os
     import uuid
@@ -19,7 +19,7 @@ def _():
     from marimo import ai
     import marimo as mo
 
-    return AsyncGenerator, ai, asyncio, html, it, json, mo, os, redis, uuid
+    return AsyncGenerator, ai, asyncio, dt, html, json, mo, os, redis, uuid
 
 
 @app.cell
@@ -31,14 +31,8 @@ def redis_client(os, redis):
         health_check_interval=30,
     )
 
-    # AI_CLIENT = load_llm_client(model="gpt-4o-mini")
-    # AI_CLIENT = load_llm_client(model="claude_haiku-4-5")
-
     AI_MODEL = "gpt-4o-mini"
-    # AI_MODEL = "calude_hauiku-4-5"
-
-    USER_ID = "Tom"
-    return AI_MODEL, USER_ID
+    return (AI_MODEL,)
 
 
 @app.cell
@@ -174,6 +168,7 @@ def cr_title(mo):
     notebook        -> surface          tools/list once, then one tools/call per console submit, with an agent key
     ```
     """)
+
     return
 
 
@@ -184,27 +179,27 @@ def am_title(mo):
 
     An agent that forgets a customer's two dogs between conversations asks about them again every time.
     Redis Agent Memory keeps each conversation in session memory and durable facts in long-term memory, written by the app or extracted from session events.
-    Select Seed to write memories for two made-up customers, Tom and Priya, then chat as either to see three principles:
+    Select Seed to write memories for two Cairn Outfitters customers, Tom and Priya, then chat as either to see three principles:
 
-    1. **Long-term memory recalls by meaning.** "Which foods should I avoid?" shares no keyword with "I'm allergic to peanuts and tree nuts", yet the search returns it for Priya. The bars beside the chat show the highest `similarityThreshold` that returns each memory, so raising the slider moves the line past the weakest memories first.
-    2. **The `ownerId` filter scopes recall to one customer.** The app sends `filter: {ownerId: ...}` with every search, so Tom's agent does not see Priya's allergy. The bars beside the chat show the same search for both customers.
-    3. **The app builds the prompt.** Each turn writes the message to session memory and searches long-term memory with the last N user messages. The memories it recalls go into the system prompt, so the model sees a memory only because the app put it there. Beside the chat you see the search text, the bars for it, and the prompt the app builds.
+    1. **Long-term memory recalls by meaning.** "Which foods should I avoid?" shares no keyword with "I'm allergic to peanuts and tree nuts", yet the search returns it for Priya. The search is a vector search, and `similarityThreshold` is its cosine similarity floor, the same name the LangCache column tunes.
+    2. **The `ownerId` filter scopes recall to one customer.** The app sends `filter: {ownerId: ...}` with every search, so Tom's agent does not see Priya's allergy.
+    3. **The app builds the prompt.** Each turn writes the message to session memory, searches long-term memory, and puts what it recalls in the system prompt.
 
-    Agent Memory is in public preview on Redis Cloud. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY`, which the chat needs and which must match the provider of `AI_MODEL`.
-    Docs: [overview](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
+    Agent Memory is in public preview on Redis Cloud. Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY` for the chat.
+    Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
     [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/), and
     [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
-    """)
-    return
 
+    Each line reads source, target, and what passes between them:
 
-@app.cell(hide_code=True)
-def am_store_md(mo):
-    mo.md(r"""
-    ## What long-term memory holds
-
-    Seed writes three memories per customer with `POST /long-term-memory`, each tagged with an `ownerId` the app chooses.
-    Clean up deletes every memory whose `ownerId` is Tom or Priya. Chat sessions are not deleted. The store expires them after an hour by default.
+    ```text
+    App        -> long-term   POST /long-term-memory, the Seed memories, each with an ownerId
+    App        -> session     POST /session-memory/events, the user's message, every turn
+    App        -> long-term   POST /long-term-memory/search: text, similarityThreshold, ownerId
+    long-term  -> App         the memories at or above the threshold, best first, no score
+    App        -> LLM         the system prompt with the recalled memories, and the history
+    session    -> long-term   extraction in the background, a few minutes after a turn
+    ```
     """)
     return
 
@@ -215,12 +210,25 @@ def am_store_button(mo):
     ams_refresh_button = mo.ui.run_button(label="Refresh")
     ams_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
 
-    mo.hstack([ams_seed_button, ams_refresh_button, ams_cleanup_button], justify="start")
+    mo.vstack(
+        [
+            mo.md(r"""
+    ## Seed and list two customers' long-term memories
+
+    Seed writes three memories per customer with `POST /long-term-memory`, each tagged with the `ownerId` the app chooses.
+    Refresh lists them again, including anything the store has extracted from a session a few minutes after a turn.
+    Seeds carry type `semantic`. An extracted memory carries the type the extractor chooses, such as `episodic`.
+    Clean up deletes every session and every long-term memory tagged Tom or Priya.
+    """),
+            mo.hstack([ams_seed_button, ams_refresh_button, ams_cleanup_button], justify="start"),
+        ]
+    )
     return ams_cleanup_button, ams_refresh_button, ams_seed_button
 
 
 @app.cell(hide_code=True)
 async def am_store(
+    ams_chatbot,
     ams_cleanup_button,
     ams_forget,
     ams_memories,
@@ -236,11 +244,14 @@ async def am_store(
         _ids = await ams_seed()
         _note = f"Wrote {len(_ids)} new memories to long-term memory." if _ids else "Every seed memory is already in long-term memory."
     if ams_cleanup_button.value:
-        _deleted = 0
+        _sessions, _memories = 0, 0
         for _owner in ams_seeds:
-            _deleted += len(await ams_forget(_owner))
-        _note = f"Deleted {_deleted} memories for {' and '.join(ams_seeds)}."
-    _ = ams_refresh_button.value  # Refresh re-lists, for memories extracted in the background
+            _deleted_sessions, _deleted_memories = await ams_forget(_owner)
+            _sessions += len(_deleted_sessions)
+            _memories += len(_deleted_memories)
+        _note = f"Deleted {_memories} memories and {_sessions} sessions for {' and '.join(ams_seeds)}."
+    _ = ams_refresh_button.value  # Refresh lists again, for memories extracted in the background
+    _ = ams_chatbot.value  # and so does each chat turn, so the tables agree with the bars
 
     ams_store = {}
     for _owner in ams_seeds:
@@ -253,42 +264,42 @@ async def am_store(
                 [ams_memory_table(_owner, _found) for _owner, _found in ams_store.items()],
                 widths="equal",
                 align="start",
-            ),
-            mo.md(
-                "Agent Memory also extracts memories from session events in the background, "
-                "on the store's extraction cadence (5 minutes by default). "
-                "Tell the agent a new fact, wait a few minutes, then select Refresh to look for what it extracted."
-            ),
+            )
         ]
     )
     return (ams_store,)
 
 
 @app.cell(hide_code=True)
-def am_owner(USER_ID, ams_seeds, mo):
-    ams_owner = mo.ui.dropdown(options=list(ams_seeds), value=USER_ID, label="Chat as")
+def am_owner(ams_seeds, mo):
+    ams_owner = mo.ui.dropdown(options=list(ams_seeds), value=next(iter(ams_seeds)), label="Chat as")  # displayed in the workbench, upstream of the chat so a switch starts a new session
 
     mo.md(r"""
-    ## Chat and the data behind each turn
+    ## Chat with the Cairn agent as Tom or Priya and watch the recall
 
-    Send the first three starter messages as Tom, then switch to Priya and send them again. Switching customers starts a new conversation.
-    The fourth message tells the agent a new fact, and Refresh can show the memory extracted from it a few minutes later.
-    Until you send a message, the panel beside the chat previews the first starter message.
+    Type `/` in the chat box to pick a starter message. Send the first one as Tom. The agent has nothing on food, and the Priya bars show the allergy the `filter` kept out.
+    Send the next two as Tom, and his dogs and his Dolomites trip appear in the system prompt.
+
+    Switch to Priya, which starts a new conversation, and send the same three. The foods question now recalls the allergy, with no keyword shared.
+    Move `similarityThreshold` and watch memories enter and leave the system prompt.
+
+    Send the packing question next. Alone it is a weak match, so set N to 2 and the trip question rides along in the search text.
+    The last message tells the agent something new. A few minutes later, Refresh can list a memory the store extracted from it.
     """)
     return (ams_owner,)
 
 
 @app.cell(hide_code=True)
-async def am_workbench(
+def am_workbench(
     ams_bars,
     ams_build_system,
     ams_chatbot,
-    ams_client,
     ams_owner,
     ams_request,
     ams_session_id,
     ams_threshold,
     ams_turn_bands,
+    ams_turn_events,
     ams_turn_live,
     ams_turn_query,
     ams_turns,
@@ -300,58 +311,46 @@ async def am_workbench(
     _t = round(get_threshold(), 2)
     _n = get_turns()
     _owner = ams_owner.value
-    _turn_done = bool(ams_chatbot.value) and ams_chatbot.value[-1].role == "assistant"
+    _shown = min(_n, sum(m.role == "user" for m in ams_chatbot.value))
     _recalled = [text for text, band in ams_turn_bands[_owner].items() if round(band, 2) >= _t]
 
     _data = [
+        ams_turns,
         mo.md(
-            ("**Search text**, the last user message:" if _n == 1 else f"**Search text**, the last {_n} user messages:")
+            ("**Search text**, the last user message:" if _shown == 1 else f"**Search text**, the last {_shown} user messages, oldest first:")
             if ams_turn_live
-            else "**Search text**, a preview of the first starter message until you send one:"
+            else "**Search text**, the first starter message until you send one:"
         ),
         mo.md(f"```text\n{ams_turn_query}\n```"),
-        mo.md(f"**Recall for ownerId {_owner} at {_t:.2f}.** Memories above the line go into the prompt."),
+        mo.md(
+            "Each bar is the highest `similarityThreshold` that returns the memory, found by running this search at 21 thresholds. "
+            "The API returns no score. Dark bars are at or above the slider's line, and those memories go into the system prompt."
+        ),
+        ams_threshold,
+        mo.md(f"**ownerId {_owner}**, what the `filter` returns"),
         ams_bars(ams_turn_bands[_owner], _t),
     ]
     for _other in (o for o in ams_turn_bands if o != _owner):
-        _data += [mo.md(f"**The same search as ownerId {_other}**"), ams_bars(ams_turn_bands[_other], _t)]
+        _data += [mo.md(f"**ownerId {_other}**, the same search for comparison. The agent never sends it."), ams_bars(ams_turn_bands[_other], _t)]
     _data += [
-        mo.md("**System prompt the app built for this recall**"),
-        mo.md(f"```text\n{ams_build_system(_owner, _recalled)}\n```"),
-        mo.md(f"**Request as sent for ownerId {_owner}**"),
+        mo.md("---"),
+        mo.md("Moving a slider redraws this pane without a new turn."),
+        mo.md("**Search request**, from `ams_request`"),
         mo.md(f"```json\n{json.dumps(ams_request(ams_turn_query, _owner, _t), indent=2)}\n```"),
+        mo.md("**System prompt**, from `ams_build_system`"),
+        mo.md(f"```text\n{ams_build_system(_owner, _recalled)}\n```"),
+        mo.md(
+            f"**Session `{ams_session_id}`**, the user messages the app wrote ({len(ams_turn_events)})"
+            if ams_turn_events
+            else f"**Session `{ams_session_id}`**, no messages written yet"
+        ),
     ]
-    if _turn_done:
-        _session = await ams_client.get_session_memory_async(session_id=ams_session_id)
-        _data += [
-            mo.md(f"**Session `{ams_session_id}` in Agent Memory** ({len(_session.events)} events)"),
-            mo.ui.table(
-                [
-                    {"role": e.role.value, "text": e.content[0].text, "created (UTC)": e.created_at.strftime("%H:%M:%S")}
-                    for e in _session.events
-                ],
-                selection=None,
-                pagination=False,
-                show_search=False,
-                show_download=False,
-            ),
-        ]
-    _data.append(
-        mo.accordion(
-            {
-                "How the bars are measured": mo.md(
-                    "The search API returns no similarity score. The notebook ran the same search at 21 thresholds, "
-                    "0.00 to 1.00 in steps of 0.05. Each bar ends at the highest threshold that returned the memory, "
-                    "so its similarity lies between that value and the next step up. "
-                    "Memories at or above the line are returned at the slider's setting."
-                ),
-            }
-        )
-    )
+    if ams_turn_events:
+        _data.append(mo.md("\n".join(f"- {text}" for text in ams_turn_events)))
 
     mo.hstack(
         [
-            mo.vstack([ams_owner, ams_threshold, ams_turns, ams_chatbot]),
+            mo.vstack([ams_owner, ams_chatbot]),
             mo.vstack(_data),
         ],
         widths=[5, 6],
@@ -364,21 +363,18 @@ async def am_workbench(
 @app.cell(hide_code=True)
 def am_build_md(mo):
     mo.md(r"""
-    ## The Agent Memory calls behind the demo
+    ## The Agent Memory code: client, store, prompt, turn
 
-    Five cells of SDK calls. The client connects. The store cell seeds, lists, and deletes memories.
-    The search cell runs one search and the sweep behind the bars. The prompt cell writes the session event and builds the system prompt.
-    The turn calls the search and prompt cells in order. In edit mode their code is open, and the notebook machinery is collapsed at the end of the column.
+    One cell per step, with the code visible in `marimo edit`. In `marimo run`, pick **Show code** from the app menu.
+    Every call on `ams_client` goes to Agent Memory, and the rest is the app. Seed and Clean up call the store functions, and each chat turn calls `ams_turn`.
     """)
     return
 
 
 @app.cell
-async def am_connect(mo, os):
-    import datetime as dt
-    import secrets
- 
-    from redis_agent_memory import AgentMemory, models
+def am_connect(os):
+    # Client. Three settings from .env, and one object for every Agent Memory call below.
+    from redis_agent_memory import AgentMemory, errors, models
 
 
     ams_client = AgentMemory(
@@ -386,17 +382,14 @@ async def am_connect(mo, os):
         store_id=os.environ["MEMORY_STORE_ID"],
         api_key=os.environ["MEMORY_API_KEY"],
     )
-
-    _health = await ams_client.health_async()
-
-    mo.md(f"Agent Memory is {_health.status.value}.")
-    return ams_client, dt, models, secrets
+    return ams_client, errors, models
 
 
 @app.cell
-def am_store_fns(USER_ID, ams_client, asyncio, models, uuid):
+def am_store_fns(ams_client, asyncio, models):
+    # Store. Seed, list, and delete the long-term memories of two customers.
     ams_seeds = {
-        USER_ID: [
+        "Tom": [
             "I've got two dogs, Max and Cece",
             "I wear size 11 trail shoes",
             "I'm planning a hiking trip in the Dolomites in August",
@@ -410,65 +403,55 @@ def am_store_fns(USER_ID, ams_client, asyncio, models, uuid):
 
 
     async def ams_memories(owner: str) -> list[models.MemoryRecord]:
-        """Every long-term memory whose `ownerId` is `owner`, across pages."""
-        found: list[models.MemoryRecord] = []
-        page_token: str | None = None
-
-        while True:
-            r = await ams_client.search_long_term_memory_async(
-                request={
-                    "filter": {"ownerId": {"eq": owner}},
-                    "limit": 100,
-                    **({"pageToken": page_token} if page_token else {}),
-                }
-            )
-            found += r.items
-            page_token = r.next_page_token
-
-            if not page_token:
-                return found
+        """Every long-term memory whose `ownerId` is `owner`, up to 100. With no `text`, the search endpoint lists by filter alone."""
+        r = await ams_client.search_long_term_memory_async(
+            request={"filter": {"ownerId": {"eq": owner}}, "limit": 100}
+        )
+        return r.items
 
 
     async def ams_seed() -> list[str]:
-        """Principle 2: write memories straight to long-term memory, each tagged with an `ownerId`."""
+        """Write memories straight to long-term memory, each tagged with the `ownerId` the app chooses (the write side of principle 2).
+        The ids are the app's too, so a retry or a second Seed rewrites the same records and creates nothing new."""
         created: list[str] = []
 
         for owner, texts in ams_seeds.items():
-            stored = {m.text for m in await ams_memories(owner)}
-            new = [
-                {"id": str(uuid.uuid4()), "text": text, "ownerId": owner}
-                for text in texts
-                if text not in stored
+            before = {m.id for m in await ams_memories(owner)}
+            memories = [
+                {"id": f"{owner.lower()}-seed-{i}", "text": text, "ownerId": owner}  # no memoryType, so the store files it as "semantic"
+                for i, text in enumerate(texts, 1)
             ]
-
-            if new:
-                await ams_client.bulk_create_long_term_memories_async(memories=new)
-
-            created += [m["id"] for m in new]
+            await ams_client.bulk_create_long_term_memories_async(memories=memories)
+            created += [m["id"] for m in memories if m["id"] not in before]
 
         return created
 
 
-    async def ams_forget(owner: str) -> list[str]:
-        """Delete every long-term memory about `owner`. Returns the ids deleted."""
+    async def ams_forget(owner: str) -> tuple[list[str], list[str]]:
+        """Delete every session and every long-term memory about `owner`. Returns the session ids and the memory ids deleted."""
+        sessions = await ams_client.list_sessions_async(filter_owner_id=owner)
+        await asyncio.gather(*(ams_client.delete_session_memory_async(session_id=s) for s in sessions.items))
+
         memory_ids = [m.id for m in await ams_memories(owner)]
+        if memory_ids:
+            await ams_client.bulk_delete_long_term_memories_async(memory_ids=memory_ids)
 
-        await asyncio.gather(
-            *(
-                ams_client.bulk_delete_long_term_memories_async(memory_ids=memory_ids[i : i + 100])
-                for i in range(0, len(memory_ids), 100)
-            )
-        )
-
-        return memory_ids
+        return sessions.items, memory_ids
 
     return ams_forget, ams_memories, ams_seed, ams_seeds
 
 
 @app.cell
-def am_recall_fns(ams_client, asyncio, models):
+def am_prompt_fns(ai):
+    # Prompt. The search text, the search request, and the system prompt the app builds.
+    def ams_query(messages: list[ai.ChatMessage], n: int) -> str:
+        """The text to search with: the last `n` user messages, in order."""
+        user_messages = [str(m.content) for m in messages if m.role == "user"]
+        return "\n".join(user_messages[-n:])
+
+
     def ams_request(query: str, owner: str, threshold: float) -> dict:
-        """The search request. Principle 1 is `text` and `similarityThreshold`; Principle 2 is `filter`."""
+        """The search request. `text` and `similarityThreshold` match by meaning (principle 1), `filter` scopes recall to one `ownerId` (principle 2), and `limit` caps the results at ten."""
         return {
             "text": query,
             "similarityThreshold": threshold,
@@ -477,63 +460,16 @@ def am_recall_fns(ams_client, asyncio, models):
         }
 
 
-    async def ams_recall(query: str, owner: str, threshold: float) -> list[models.MemoryRecord]:
-        """Search long-term memory by meaning, for one owner, cut off by `threshold`."""
-        r = await ams_client.search_long_term_memory_async(request=ams_request(query, owner, threshold))
-        return r.items
-
-
-    async def ams_sweep(query: str, store: dict[str, list[models.MemoryRecord]]) -> dict[str, dict[str, float]]:
-        """For each owner in `store`, the highest threshold that returns each memory. The API returns no score."""
-        grid = [round(0.05 * i, 2) for i in range(21)]  # 0.00 to 1.00
-        pairs = [(owner, t) for owner in store for t in grid]
-        gate = asyncio.Semaphore(12)  # 42 searches per sweep; keep a dozen in flight
-
-        async def recall(owner: str, t: float) -> list[models.MemoryRecord]:
-            async with gate:
-                return await ams_recall(query, owner, t)
-
-        hits = await asyncio.gather(*(recall(owner, t) for owner, t in pairs))
-
-        bands = {owner: {m.text: 0.0 for m in records} for owner, records in store.items()}
-        for (owner, t), found in zip(pairs, hits):
-            for m in found:
-                bands[owner][m.text] = max(bands[owner].get(m.text, 0.0), t)
-
-        return bands
-
-    return ams_recall, ams_request, ams_sweep
-
-
-@app.cell
-def am_prompt_fns(ai, ams_client, dt, it, models):
-    def ams_query(messages: list[ai.ChatMessage], n: int) -> str:
-        """The text to search with: the last `n` user messages, newest first."""
-        recent = it.islice((m for m in reversed(messages) if m.role == "user"), n)
-        return "\n".join(str(m.content) for m in recent)
-
-
-    async def ams_remember(session_id: str, owner: str, text: str) -> None:
-        """Principle 3: write the user's message to session memory."""
-        await ams_client.add_session_event_async(
-            session_id=session_id,
-            actor_id=owner,
-            role=models.MessageRole.USER,
-            content=[{"text": text}],
-            created_at=dt.datetime.now(dt.timezone.utc),
-        )
-
-
     def ams_build_system(owner: str, facts: list[str]) -> str:
-        """Principle 3: the app, not Agent Memory, decides what the model sees."""
-        system = "You are a helpful AI assistant."
+        """The system prompt. The app, not Agent Memory, decides what the model sees (principle 3)."""
+        system = "You are the Cairn Outfitters support agent. Answer the customer in two or three sentences."
 
         if facts:
             system += f"\n\nWhat you remember about {owner}:\n" + "\n".join(f"- {fact}" for fact in facts)
 
         return system
 
-    return ams_build_system, ams_query, ams_remember
+    return ams_build_system, ams_query, ams_request
 
 
 @app.cell
@@ -541,36 +477,49 @@ def am_turn_fn(
     AsyncGenerator,
     ai,
     ams_build_system,
+    ams_client,
     ams_owner,
     ams_query,
-    ams_recall,
-    ams_remember,
+    ams_request,
     ams_settings,
-    secrets,
+    dt,
+    models,
     stream_llm,
+    uuid,
 ):
-    ams_session_id = f"{ams_owner.value.lower()}-{secrets.token_hex(6)}"  # a new session each time the customer changes
+    # Turn. One chat turn: the session write, the long-term search, and the prompt.
+    ams_session_id = f"{ams_owner.value.lower()}-{uuid.uuid4().hex[:12]}"  # a new session each time the customer changes
 
 
     async def ams_turn(messages: list[ai.ChatMessage], config: ai.ChatModelConfig) -> AsyncGenerator[str, None]:
-        """One agent turn. Principle 3: the app, not the service, decides what the model sees."""
+        """One agent turn: write the message to session memory, search long-term memory, and put what it recalls in the system prompt."""
+        # Notebook inputs: the customer from the dropdown, and the slider values through ams_settings() (plumbing, not an Agent Memory call).
         owner = ams_owner.value
+        threshold, turns = ams_settings()
 
         # Session memory: the user's message, as an event in this session.
-        await ams_remember(ams_session_id, owner, str(messages[-1].content))
+        # The first event's actorId becomes the session's ownerId, and the memories the store extracts from the session carry it.
+        # Extraction runs a few minutes later. The prompt below never reads these events.
+        await ams_client.add_session_event_async(
+            session_id=ams_session_id,
+            actor_id=owner,
+            role=models.MessageRole.USER,
+            content=[{"text": str(messages[-1].content)}],
+            created_at=dt.datetime.now(dt.timezone.utc),
+        )
 
         # Long-term memory: this owner's memories, by meaning, searched with the last N user messages.
-        # ams_settings reads the two sliders (notebook machinery, at the end of the column).
-        threshold, turns = ams_settings()
-        query = ams_query(messages, turns)
-        recalled = await ams_recall(query, owner, threshold)
+        found = await ams_client.search_long_term_memory_async(request=ams_request(ams_query(messages, turns), owner, threshold))
 
-        # The prompt: the app puts the recalled facts in front of the model.
-        system = ams_build_system(owner, [m.text for m in recalled])
+        # The prompt: the app puts the recalled memories in front of the model.
+        system = ams_build_system(owner, [m.text for m in found.items])
         history = [{"role": m.role, "content": str(m.content)} for m in messages if m.role in ("user", "assistant")]
 
-        async for text in stream_llm(system, history, config):
-            yield text
+        try:
+            async for text in stream_llm(system, history, config):
+                yield text
+        except Exception as e:  # a model error must not hide the two Agent Memory calls that already ran
+            yield f"The model call failed ({type(e).__name__}). The session write and the search still ran."
 
     return ams_session_id, ams_turn
 
@@ -578,17 +527,19 @@ def am_turn_fn(
 @app.cell(hide_code=True)
 def am_machinery_md(mo):
     mo.md(r"""
-    ## Notebook machinery
+    ## Notebook plumbing: slider state, chat object, threshold sweep, renderers
 
-    These cells hold the sliders and the chat object, the state behind them, the sweep that feeds the bars, and the rendering helpers.
-    In edit mode, open a cell to read its code.
+    Four hidden cells follow: slider state, chat object, the threshold sweep behind the bars, and the renderers for bars and tables.
+    Read `am_settings`, `am_chat`, `am_turn_sweep`, and `am_render` in `iris_basics.py`, or expand them in `marimo edit`.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def am_settings(mo):
-    # The turn reads the latest slider values through ams_settings() below. A slider's .value cannot be read in the cell that defines it, and a cell that references these getters reruns on every move.
+    # Slider state. The sliders live in am_chat, so a turn cannot read their .value from inside the chat cell.
+    # A cell that references these getters reruns on every move, so the turn reads them through ams_settings() instead.
+    # am_chat reads the getters for the sliders' start values, and marimo exempts the cell that owns a control.
     get_threshold, set_threshold = mo.state(0.3)
     get_turns, set_turns = mo.state(1)
 
@@ -602,6 +553,7 @@ def am_settings(mo):
 
 @app.cell(hide_code=True)
 def am_chat(ams_turn, get_threshold, get_turns, mo, set_threshold, set_turns):
+    # debounce=True: the setter fires when the slider is released, not on every step.
     ams_threshold = mo.ui.slider(
         start=0.0, stop=1.0, step=0.05, value=get_threshold(), show_value=True, debounce=True,
         label="similarityThreshold", on_change=set_threshold,
@@ -610,7 +562,13 @@ def am_chat(ams_turn, get_threshold, get_turns, mo, set_threshold, set_turns):
         start=1, stop=10, step=1, value=get_turns(), show_value=True, debounce=True,
         label="Search with the last N user messages", on_change=set_turns,
     )
-    ams_prompts = ["Which foods should I avoid?", "What pets do I have?", "Where am I headed this summer?", "I'm training for a marathon in October."]
+    ams_prompts = [
+        "Which foods should I avoid?",
+        "What pets do I have?",
+        "Where am I headed this summer?",
+        "Any packing tips?",
+        "I'm training for a marathon in October.",
+    ]
 
     # Displayed beside the data in am_workbench. ams_turn is the Iris turn above.
     ams_chatbot = mo.ui.chat(ams_turn, prompts=ams_prompts, max_height=520)
@@ -620,27 +578,63 @@ def am_chat(ams_turn, get_threshold, get_turns, mo, set_threshold, set_turns):
 @app.cell(hide_code=True)
 async def am_turn_sweep(
     ams_chatbot,
+    ams_client,
     ams_prompts,
     ams_query,
+    ams_request,
+    ams_session_id,
     ams_store,
-    ams_sweep,
+    asyncio,
+    errors,
     get_turns,
+    models,
 ):
-    # The search text behind the last turn (the first starter prompt before any chat), and how high a threshold
-    # each memory clears for it, for every customer. Depends on the chat, N, and the store, not on the threshold.
+    async def ams_sweep(query: str, store: dict[str, list[models.MemoryRecord]]) -> dict[str, dict[str, float]]:
+        """For each owner in `store`, the highest threshold that returns each memory. The API returns no score."""
+        grid = [round(0.05 * i, 2) for i in range(21)]  # 0.00 to 1.00
+        pairs = [(owner, t) for owner in store for t in grid]
+        gate = asyncio.Semaphore(12)  # 42 searches per sweep; keep a dozen in flight
+
+        async def recall(owner: str, t: float) -> list[models.MemoryRecord]:
+            async with gate:
+                r = await ams_client.search_long_term_memory_async(request={**ams_request(query, owner, t), "limit": 100})
+                return r.items
+
+        hits = await asyncio.gather(*(recall(owner, t) for owner, t in pairs))
+
+        bands = {owner: {m.text: 0.0 for m in records} for owner, records in store.items()}
+        for (owner, t), found in zip(pairs, hits):
+            for m in found:
+                bands[owner][m.text] = max(bands[owner].get(m.text, 0.0), t)
+
+        return bands
+
+
+    async def ams_session_texts(session_id: str) -> list[str]:
+        """The user messages the app wrote to this session, or none when the session is gone (Clean up deletes it)."""
+        try:
+            session = await ams_client.get_session_memory_async(session_id=session_id)
+        except errors.NotFoundErrorResponseContent:
+            return []
+        return [e.content[0].text for e in session.events]
+
+
+    # The search text behind the last turn (the first starter prompt before any chat), how high a threshold each
+    # memory clears for it, for every customer, and the session so far. Depends on the chat, N, and the store, not on the threshold.
     ams_turn_live = any(m.role == "user" for m in ams_chatbot.value)
     ams_turn_query = ams_query(ams_chatbot.value, get_turns()) if ams_turn_live else ams_prompts[0]
     ams_turn_bands = await ams_sweep(ams_turn_query, ams_store)
-    return ams_turn_bands, ams_turn_live, ams_turn_query
+    ams_turn_events = await ams_session_texts(ams_session_id) if ams_turn_live else []
+    return ams_turn_bands, ams_turn_events, ams_turn_live, ams_turn_query
 
 
 @app.cell(hide_code=True)
 def am_render(html, mo, models):
     def ams_bars(bands: dict[str, float], threshold: float) -> mo.Html:
-        """One row per memory: a bar to the highest threshold that returns it, and the slider as a line."""
+        """One row per memory, in store order."""
         threshold = round(threshold, 2)
         rows = []
-        for text, band in sorted(bands.items(), key=lambda kv: -kv[1]):
+        for text, band in bands.items():
             state = "ams-bar" if round(band, 2) >= threshold else "ams-bar ams-bar-below"
             rows.append(
                 '<div class="ams-row">'
@@ -652,11 +646,12 @@ def am_render(html, mo, models):
                 f'<div class="ams-value">{band:.2f}</div>'
                 "</div>"
             )
-        body = "".join(rows) or '<div class="ams-empty">No memories for this owner yet. Select Seed to write them.</div>'
+        ticks = '<div class="ams-row"><div></div><div class="ams-ticks"><span>0</span><span>0.5</span><span>1</span></div><div></div></div>'
+        body = "".join(rows) + ticks if rows else '<div class="ams-empty">No memories yet. Select Seed to write them.</div>'
         css = """
     <style>
     .ams-bars { font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; color: #52514e; }
-    .ams-row { display: grid; grid-template-columns: minmax(0, 3fr) 2fr 3.2em; gap: 0 8px; align-items: center; margin: 6px 0; }
+    .ams-row { display: grid; grid-template-columns: minmax(0, 2fr) 3fr 3.2em; gap: 0 8px; align-items: center; margin: 6px 0; }
     .ams-label { overflow-wrap: anywhere; }
     .ams-track { position: relative; min-width: 0; height: 12px; background: #e1e0d9; border-radius: 0 4px 4px 0; }
     .ams-bar { position: absolute; left: 0; top: 0; height: 100%; background: #2a78d6; border-radius: 0 4px 4px 0; }
@@ -664,32 +659,19 @@ def am_render(html, mo, models):
     .ams-line { position: absolute; top: -4px; height: 20px; width: 2px; background: #0b0b0b; }
     .ams-value { color: #0b0b0b; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
     .ams-ticks { display: flex; justify-content: space-between; color: #898781; font-size: 11px; border-top: 1px solid #c3c2b7; padding-top: 2px; }
-    .ams-caption { color: #898781; font-size: 11px; margin-top: 4px; }
     .ams-empty { color: #898781; }
     </style>
     """
-        return mo.Html(
-            '<div class="ams-bars">'
-            + body
-            + '<div class="ams-row"><div></div><div class="ams-ticks"><span>0</span><span>0.5</span><span>1</span></div><div></div></div>'
-            + f'<div class="ams-caption">Highest similarityThreshold at which the memory is returned. Line: slider at {threshold:.2f}.</div>'
-            + "</div>"
-            + css
-        )
+        return mo.Html('<div class="ams-bars">' + body + "</div>" + css)
 
 
     def ams_memory_table(owner: str, found: list[models.MemoryRecord]) -> mo.Html:
-        """One owner's long-term memories as a table, headed with the `ownerId`."""
-        rows = [
-            {"memory": m.text, "type": m.memory_type, "created (UTC)": m.created_at.strftime("%H:%M:%S")}
-            for m in found
-        ]
-        table = (
-            mo.ui.table(rows, selection=None, pagination=False, show_search=False, show_download=False)
-            if rows
-            else mo.md("_No memories yet._")
-        )
-        return mo.vstack([mo.md(f"**ownerId: {owner}** ({len(found)})"), table])
+        """One owner's long-term memories as a markdown table, headed with the `ownerId`."""
+        head = f"**ownerId {owner}** ({len(found)})"
+        if not found:
+            return mo.md(head + "\n\n_No memories yet._")
+        rows = [f"| {m.text.replace('|', '&#124;')} | {m.memory_type} |" for m in found]
+        return mo.md("\n".join([head, "", "| memory | type |", "|---|---|", *rows]))
 
     return ams_bars, ams_memory_table
 

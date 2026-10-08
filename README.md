@@ -33,7 +33,7 @@ One marimo notebook, `iris_basics.py`, with five columns, and one `.env` that co
 
 A component column has a seed button, a chat or a tool console, a last-turn panel, and a Clean up button. The Search, LangCache, and Agent Memory chats call the model named by `AI_MODEL` in column 0, `gpt-4o-mini` at first. Context Retriever gets a tool console with no LLM.
 
-Nothing is written until you press a seed button, submit the Search form, or send a chat message. A LangCache miss stores the model's answer, and each Agent Memory message writes two session events: the message and the agent's reply. Each Clean up button deletes what its column wrote.
+Nothing is written until you press a seed button, submit the Search form, or send a chat message. A LangCache miss stores the model's answer, and each Agent Memory message writes one session event, the message itself. Each Clean up button deletes what its column wrote.
 
 Each column has one job:
 
@@ -99,8 +99,10 @@ uv run marimo edit iris_basics.py
 Or present it as an app:
 
 ```sh
-uv run marimo run iris_basics.py
+uv run marimo run --include-code iris_basics.py
 ```
+
+The code stays folded until you pick **Show code** from the app menu.
 
 marimo loads `.env` when the kernel starts. Column 0 loads the embedding model and builds one client per service. It sends nothing to Redis, the hosted services, or the LLM.
 
@@ -266,63 +268,21 @@ The last cell reads your own database. `JSON.GET cairn:<run>:customer:C001` retu
 
 ## Step 7. Recall a memory by meaning
 
-In the Redis Agent Memory column, press **Write 5 memories about Dana: 1 POST /long-term-memory**.
+In the Redis Agent Memory column, press **Seed**.
 
-Agent Memory answers `201`, and the cell reports how many of the 5 ids sent are in `created`. The ids are `cairn-<run>-m1` to `cairn-<run>-m5`. The cell shows the five memories and the request as sent, with the credential masked:
+The cell writes three memories for each of two Cairn Outfitters customers, Tom and Priya, with one `POST /long-term-memory` per customer. Each memory carries an `ownerId` the notebook chooses and an id the notebook chooses, so a second press rewrites the same six records and reports nothing new. Two tables list what the store holds for each `ownerId`, with the type the store filed each memory under.
 
-```json
-{"memories": [{"id": "cairn-<run>-m1", "text": "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.", "ownerId": "cairn-<run>", "namespace": "iris-basics-notebook", "memoryType": "semantic", "topics": ["food", "allergy"]}]}
-```
+Under the tables, the workbench puts the chat beside the data behind each turn. Pick a customer in **Chat as**, then type `/` in the chat box to pick a starter message. The right pane shows the search text, one bar per memory for both customers, the request the app sends, the system prompt it builds, and the messages it wrote to the session.
 
-In a check on 2026-10-05, a second identical write answered `201` with the same five ids, and the owner still held 5 memories. Because the ids are yours, Clean up can name them without a ledger.
+Each bar ends at the highest `similarityThreshold` that still returns the memory. The notebook finds it by running the same search at 21 thresholds, because the search API returns no score. Move the `similarityThreshold` slider, and the dark bars, at or above the line, are the memories that go into the system prompt. The second customer's bars show the same search run against that customer's memories, for comparison, and the agent never sends it.
 
-The chat under the seed is the Cairn agent, and you are Dana. Set its two controls, then type a message or pick a suggested prompt:
-
-- **Recall scope**: **Dana: this notebook's owner and namespace**, **Another customer: a different ownerId**, or **Another app: a different namespace**
-- `similarityThreshold`: a slider from 0.0 to 1.0, at 0.0 at first
-- Suggested prompts:
-  - *What should the kitchen avoid serving me?*
-  - *My toes feel squashed on long descents.*
-  - *Somewhere freezing to visit next year?*
-  - *I am training for a 50 kilometre trail race in April.*
-  - *My left knee complains on steep downhills, so I always carry trekking poles.*
-
-Each message makes four Agent Memory requests and one Claude call:
+Each message sends two Agent Memory requests and one model call:
 
 1. `POST /session-memory/events` with your message
-2. `POST /long-term-memory/search` with your message, the scope's filter, your threshold, and `limit` 3
-3. `GET /session-memory/{sessionId}` for the events in order
-4. One Claude call with the recalled memories as the system prompt and the session events as messages
-5. `POST /session-memory/events` with Claude's reply
+2. `POST /long-term-memory/search` with the last N user messages, the customer's `ownerId` filter, and your threshold
+3. One model call with the recalled memories in the system prompt and the chat history as messages
 
-The first message, or the first after you clear the chat, starts a new session. The last-turn panel shows the session's events, the recalled memories with rank and content words in common, and the filter as sent. It ends with the exact text Claude received.
-
-In a live run on 2026-10-05, with Claude stubbed, the first turn under **Dana** at 0.0 sent Claude this:
-
-```
-You are the Cairn Outfitters support agent. Answer the customer in two or three sentences.
-Long-term memory recalled for this customer:
-- Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not contain them.
-- Dana wants parcels sent express, with no plastic packaging.
-- Dana prefers gear made from recycled materials and will pay extra for it.
-
-user: What should the kitchen avoid serving me?
-```
-
-The allergy memory ranked first with 0 content words in common. In the same run *I am training for a 50 kilometre trail race in April.* recalled the Patagonia trek first. The session read back `USER`, `ASSISTANT`, `USER`.
-
-Under **Another customer** and **Another app**, the search recalled 0 memories, so Claude's system prompt carried none of Dana's. The API key was the same throughout.
-
-The table under the panel asks the three suggested questions at your scope and threshold, with `limit` 100. In the 2026-10-05 run it read:
-
-| Scope and threshold | kitchen | toes | freezing |
-|---|---|---|---|
-| Dana, 0.0 | #1 of 5 | #1 of 5 | #1 of 5 |
-| Dana, 0.3 | #1 of 1 | not in the 0 returned | #1 of 1 |
-| Dana, 0.5 | not in the 0 returned | not in the 0 returned | not in the 0 returned |
-| Another customer or Another app, 0.0 | not in the 0 returned | not in the 0 returned | not in the 0 returned |
-
-The reply ranks memories best first and carries no score. In the 2026-10-05 run, each item held `createdAt`, `id`, `memoryType`, `namespace`, `ownerId`, `text`, `topics`, and `updatedAt`.
+Switching customers starts a new session. The reply is not written to session memory. A few minutes after a turn, the store extracts long-term memories from the session, and **Refresh** lists them with their type.
 
 ## Step 8. Clean up
 
@@ -331,9 +291,9 @@ Press the Clean up button at the bottom of each column you used:
 - Redis Search: **Clean up: FT.DROPINDEX and UNLINK by name** drops the index without `DD`, then unlinks the 36 keys and the form's article. On 2026-10-05 it read *Dropped 1 index. Unlinked 37 of 37 keys.*
 - Redis LangCache: **Clean up: DELETE the 5 answers and the chat's answers by id** sends one `DELETE /entries/{entryId}` per id. A `204` is a deletion, and a `404` means the TTL or an earlier Clean up removed the entry. On 2026-10-05 it read *Deleted 8, already gone 0.*
 - Redis Context Retriever: **Clean up: DELETE the surface and UNLINK 20 keys** deletes every surface named `cairn-<run>` and revokes their agent keys. It then counts what the delete left in your Redis and unlinks the 20 keys.
-- Redis Agent Memory: **Clean up: DELETE this owner's sessions and memories** deletes this owner's sessions, chat sessions included, then the memories whose `ownerId` matches. On 2026-10-05 it deleted 2 of 2 sessions and 5 memories, 0 of them extracted from sessions.
+- Redis Agent Memory: **Clean up** deletes every session and every long-term memory tagged Tom or Priya, extracted memories included. The note above the tables reports both counts.
 
-After chatting with the Cairn agent, press Agent Memory's button again ten minutes later. Extraction runs every 5 minutes by default, configurable from 60 to 600 seconds, and adds memories with ids the service chooses. This owner-scoped Clean up is what deletes them.
+After chatting, press **Refresh** a few minutes later. Extraction runs every 5 minutes by default, configurable from 60 to 600 seconds, and adds memories with ids the service chooses. Clean up deletes those too.
 
 ## How it works
 
