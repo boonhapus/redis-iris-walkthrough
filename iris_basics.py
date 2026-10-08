@@ -11,7 +11,6 @@ def _():
     import datetime as dt
     import html
     import json
-    import os
     import uuid
 
     import redis
@@ -19,7 +18,69 @@ def _():
     from marimo import ai
     import marimo as mo
 
-    return AsyncGenerator, ai, asyncio, dt, html, json, mo, os, redis, uuid
+    return AsyncGenerator, ai, asyncio, dt, html, json, mo, redis, uuid
+
+
+@app.cell(hide_code=True)
+def env_check(mo):
+    # Shows the settings the notebook needs and where to find each one. While any is
+    # missing, it stops every cell below. os is imported here, not in the imports cell,
+    # so each cell that reads the environment waits for this check.
+    import os
+
+    # 1. The settings, and where to find each one.
+    _docs = "https://redis.io/docs/latest/operate"
+    _settings = {
+        "REDIS_URL": (
+            f"[Database]({_docs}/rc/databases/connect/) > Configuration: Public endpoint and Default user password, "
+            "as `redis://default:<password>@<host>:<port>`. Use `rediss://` on TLS."
+        ),
+        "LANGCACHE_HOST": f"[LangCache]({_docs}/iris/langcache/view-edit-cache/) > your service > Configuration > Connectivity > URL, with `https://`.",
+        "LANGCACHE_CACHE_ID": "Same page, Cache ID.",
+        "LANGCACHE_API_KEY": "Shown once, when you create the service. Generate key on the same page replaces it.",
+        "CTX_ADMIN_KEY": "[Context Retriever > Admin keys](https://cloud.redis.io/#/context-retriever/admin-keys) > New admin key. Shown once.",
+        "MEMORY_API_BASE_URL": f"[Agent Memory]({_docs}/iris/agent-memory/view-service/) > your service > Configuration > Endpoint, with `https://`.",
+        "MEMORY_STORE_ID": "Same section, Store ID.",
+        "MEMORY_API_KEY": "Same service > API keys > New API key. Shown once.",
+        "LLM_API_KEY": "An OpenAI key for `gpt` models, or an Anthropic key for `claude`. `AI_MODEL` sets which.",
+    }
+    _missing = [name for name in _settings if not os.environ.get(name)]
+
+    # 2. One table row per setting: a green check or a red cross, the name, and where to find it.
+    _check = '<span style="color: var(--green-9)">&#10003;</span>'
+    _cross = '<span style="color: var(--red-9)">&#10007;</span>'
+    _rows = ["| Set | Variable | Where to find it |", "|---|---|:--|"]
+    for _name, _where in _settings.items():
+        _rows.append(f"| {_cross if _name in _missing else _check} | `{_name}` | {_where} |")
+
+    # 3. The restart button. marimo has no restart call for a cell, so the button ends the
+    # kernel process. marimo then shows a "Kernel stopped" banner with a Restart action, and
+    # the new kernel reads .env again.
+    def _restart_kernel(_):
+        os._exit(0)
+
+    env_restart_button = mo.ui.button(label="Restart kernel", kind="danger", on_click=_restart_kernel)
+
+    # 4. The panel. mo.stop shows it and stops the cells below while any setting is missing.
+    _panel = mo.callout(
+        mo.vstack(
+            [
+                mo.md(r"""
+    ## Settings
+
+    The notebook reads these settings from `.env`, next to `pyproject.toml`, when the kernel starts.
+    Copy `.env.example` to `.env`, fill in every value, then restart the kernel to load them.
+    Most values come from the [Redis Cloud console](https://cloud.redis.io/).
+    """),
+                mo.md("\n".join(_rows)),
+                env_restart_button,
+            ]
+        ),
+        kind="danger" if _missing else "info",
+    )
+    mo.stop(bool(_missing), _panel)
+    _panel
+    return (os,)
 
 
 @app.cell

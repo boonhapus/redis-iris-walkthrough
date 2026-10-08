@@ -52,7 +52,9 @@ Each column has one job:
 
 > **Note:** The notebook does not start a local Redis instance. The only thing that runs on your machine is a 30 MB embedding model.
 
-Each service's client cell reads only that service's variables. A missing variable raises `KeyError` in that cell, and every cell in its column shows marimo's *An ancestor raised an exception* notice. The other columns still run. Without an LLM key the client still builds, and each chat turn reports the failed model call in the chat.
+Column 0 checks that all nine variables in Step 2 are set. It marks each missing one with a red cross. Every cell that reads the environment then shows marimo's *Ancestor stopped* notice until you set them all.
+
+The Settings panel in column 0 says where to find each value. Its **Restart kernel** button ends the kernel, and **Restart** in the banner that follows starts a new one that reads `.env` again.
 
 ## Step 1. Open the folder
 
@@ -71,7 +73,7 @@ Copy the sample file:
 cp .env.example .env
 ```
 
-Open `.env`, uncomment the variables for the columns you want to run, and fill them in. Every value comes from [Redis Cloud](https://cloud.redis.io) or from your own Redis.
+Open `.env`, uncomment every variable, and fill each one in. Every value comes from [Redis Cloud](https://cloud.redis.io) or from your own Redis.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -102,7 +104,7 @@ uv run marimo run --include-code iris_basics.py
 
 The code stays folded until you pick **Show code** from the app menu.
 
-marimo loads `.env` when the kernel starts. Column 0 loads the embedding model and builds one client per service. It sends nothing to Redis, the hosted services, or the LLM.
+marimo loads `.env` when the kernel starts, and column 0 checks that every variable is set. Column 0 loads the embedding model and builds one client per service. It sends nothing to Redis, the hosted services, or the LLM.
 
 Until you press a column's seed button, the cells that need its data show marimo's *Ancestor stopped* notice.
 
@@ -417,9 +419,11 @@ Run it once against your own services before you present.
 
 ## Troubleshooting
 
-### A client cell raises KeyError
+### Column 0 lists settings that are not set
 
-Verify that `.env` sits next to `pyproject.toml` and that the service's variables are uncommented, then restart the kernel. Until then, every cell in that column shows *An ancestor raised an exception*.
+The Settings panel marks every variable that is not set with a red cross. Verify that `.env` sits next to `pyproject.toml` and that each name is uncommented and filled in. Then press **Restart kernel** in the panel and **Restart** in the banner. Until then, every cell that reads the environment shows *Ancestor stopped*.
+
+A variable already set in your shell, or by `uv run --env-file`, wins over `.env`. Change it there before you restart.
 
 ### A chat turn raises an authentication error
 
