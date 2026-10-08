@@ -46,12 +46,12 @@ def llm_client(AI_MODEL, AsyncGenerator, ai, os):
     if AI_MODEL.startswith("gpt"):
         from openai import AsyncOpenAI
 
-        llm = AsyncOpenAI(api_key=os.environ["LLM_API_KEY"])
- 
+        llm = AsyncOpenAI(api_key=os.environ.get("LLM_API_KEY", "missing"))  # a missing key fails at the first chat turn, not here
+
         async def stream_llm(
             system_prompt: str, messages: list[dict[str, str]], config: ai.ChatModelConfig
         ) -> AsyncGenerator[str, None]:
-            """Stream the repsonse from OpenAI."""
+            """Stream the response from OpenAI."""
             stream = await llm.chat.completions.create(
                 model=AI_MODEL,
                 messages=[{"role": "system", "content": system_prompt}, *messages],
@@ -67,12 +67,12 @@ def llm_client(AI_MODEL, AsyncGenerator, ai, os):
     if AI_MODEL.startswith("claude"):
         from anthropic import AsyncAnthropic
 
-        llm = AsyncAnthropic(api_key=os.environ["LLM_API_KEY"])
+        llm = AsyncAnthropic(api_key=os.environ.get("LLM_API_KEY"))  # None lets the SDK look for its own credentials
 
         async def stream_llm(
             system_prompt: str, messages: list[dict[str, str]], config: ai.ChatModelConfig
         ) -> AsyncGenerator[str, None]:
-            """Stream the repsonse from Anthropic."""
+            """Stream the response from Anthropic."""
             async with llm.messages.stream(
                 model=AI_MODEL,
                 system=system_prompt,
@@ -97,7 +97,7 @@ def rs_title(mo):
     2. **Redis fuses keyword and vector rankings in one command.** Keyword and vector search fail on different questions, and `FT.HYBRID` merges the two with Reciprocal Rank Fusion (RRF).
     3. **Filters run inside the vector search.** Redis picks the k nearest articles from those that pass a tag or numeric filter, so it returns fewer than k only when fewer pass.
 
-    Redis Search is available in Redis Open Source, Redis Software, and Redis Cloud, and `FT.HYBRID` needs Redis 8.4 or later. Settings: `REDIS_URL`, plus `ANTHROPIC_API_KEY`, which the chat and the cell under it need.
+    Redis Search is available in Redis Open Source, Redis Software, and Redis Cloud, and `FT.HYBRID` needs Redis 8.4 or later. Settings: `REDIS_URL`, plus `LLM_API_KEY`, which the chat and the cell under it need.
     Docs: [Redis Search](https://redis.io/docs/latest/develop/ai/search-and-query/), [vectors and filters](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/), and [`FT.HYBRID`](https://redis.io/docs/latest/commands/ft.hybrid/).
 
     Each line reads source, target, and what passes between them:
@@ -127,7 +127,7 @@ def lc_title(mo):
     2. **The threshold trades wrong answers for misses.** LangCache serves any entry whose similarity clears `similarityThreshold`, so a question that only sounds similar can get a wrong answer.
     3. **A cached answer lives until its time to live (TTL) runs out.** Until `ttlMillis` passes or your app deletes it, LangCache serves the answer unchanged, so the TTL caps how stale it gets.
 
-    LangCache is in public preview on Redis Cloud. Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, plus `ANTHROPIC_API_KEY`, which the chat needs on a miss. Docs:
+    LangCache is in public preview on Redis Cloud. Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, plus `LLM_API_KEY`, which the chat needs on a miss. Docs:
     [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
     [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/),
     [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/), and

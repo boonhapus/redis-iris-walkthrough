@@ -31,9 +31,9 @@ LangCache and Agent Memory are in public preview, and Context Retriever is in pr
 
 One marimo notebook, `iris_basics.py`, with five columns, and one `.env` that configures them. Column 0 holds the setup and one client per service, Claude included. Each of the other four columns holds one component.
 
-A component column has a seed button, a chat or a tool console, a last-turn panel, and a Clean up button. The Search, LangCache, and Agent Memory chats call Claude (`claude-opus-5-5`). Context Retriever gets a tool console with no LLM.
+A component column has a seed button, a chat or a tool console, a last-turn panel, and a Clean up button. The Search, LangCache, and Agent Memory chats call the model named by `AI_MODEL` in column 0, `gpt-4o-mini` at first. Context Retriever gets a tool console with no LLM.
 
-Nothing is written until you press a seed button, submit the Search form, or send a chat message. A LangCache miss stores Claude's answer, and each Agent Memory message writes two session events: the message and the agent's reply. Each Clean up button deletes what its column wrote.
+Nothing is written until you press a seed button, submit the Search form, or send a chat message. A LangCache miss stores the model's answer, and each Agent Memory message writes two session events: the message and the agent's reply. Each Clean up button deletes what its column wrote.
 
 Each column has one job:
 
@@ -50,11 +50,11 @@ Each column has one job:
 - A LangCache service (API URL, cache ID, and API key)
 - A Context Retriever admin key
 - An Agent Memory service (endpoint, store ID, and API key)
-- A Claude API key, or an `ant auth login` profile, for the three chats
+- An LLM API key for the three chats: an OpenAI key when `AI_MODEL` starts with `gpt`, an Anthropic key when it starts with `claude`
 
 > **Note:** The notebook does not start a local Redis instance. The only thing that runs on your machine is a 30 MB embedding model.
 
-Each service's client cell reads only that service's variables. A missing variable raises `KeyError` in that cell, and every cell in its column shows marimo's *An ancestor raised an exception* notice. The other columns still run. Without a Claude credential the Claude client still builds, and each chat message that reaches Claude raises an error in the chat.
+Each service's client cell reads only that service's variables. A missing variable raises `KeyError` in that cell, and every cell in its column shows marimo's *An ancestor raised an exception* notice. The other columns still run. Without an LLM key the client still builds, and each chat turn reports the failed model call in the chat.
 
 ## Step 1. Open the folder
 
@@ -86,11 +86,9 @@ Open `.env`, uncomment the variables for the columns you want to run, and fill t
 | `MEMORY_API_BASE_URL` | none | Agent Memory. The Endpoint on the service's General settings page, with `https://` |
 | `MEMORY_STORE_ID` | none | Agent Memory. The Store ID on the same page |
 | `MEMORY_API_KEY` | none | Agent Memory. A key from the service's API keys page, shown once |
-| `ANTHROPIC_API_KEY` | none | The Search, LangCache, and Agent Memory chats. An API key from the API keys page of the [Claude Console](https://platform.claude.com) |
+| `LLM_API_KEY` | none | The Search, LangCache, and Agent Memory chats. An OpenAI key when `AI_MODEL` starts with `gpt`, or an Anthropic key when it starts with `claude` |
 
 Context Retriever uses the same `REDIS_URL` as Redis Search and hands that password to the hosted service, so point it at a scratch database.
-
-The Anthropic SDK also accepts a profile from `ant auth login`, so you can leave `ANTHROPIC_API_KEY` unset. A set key wins over the profile.
 
 ## Step 3. Start the notebook
 
@@ -104,7 +102,7 @@ Or present it as an app:
 uv run marimo run iris_basics.py
 ```
 
-marimo loads `.env` when the kernel starts. Column 0 loads the embedding model and builds one client per service. It sends nothing to Redis, the hosted services, or Claude.
+marimo loads `.env` when the kernel starts. Column 0 loads the embedding model and builds one client per service. It sends nothing to Redis, the hosted services, or the LLM.
 
 Until you press a column's seed button, the cells that need its data show marimo's *Ancestor stopped* notice.
 
@@ -351,7 +349,7 @@ Then each client gets its own cell:
 |---|---|---|
 | `redis_client` | `REDIS_CLIENT`, a redis-py client with `protocol=2`, `decode_responses=True`, and a 30-second health check | `REDIS_URL` |
 | `embedding_model` | `EMBEDDING_MODEL`, potion-base-8M, which embeds on your machine | nothing |
-| `llm_client` | `LLM_MODEL` (`claude-opus-5-5`) and `ask_llm` | `ANTHROPIC_API_KEY`, or an `ant auth login` profile |
+| `llm_client` | `stream_llm`, which streams from OpenAI or Anthropic according to `AI_MODEL` | `LLM_API_KEY` |
 | `langcache_client` | `LANGCACHE` | `LANGCACHE_HOST`, `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY` |
 | `context_retriever_client` | `CONTEXT_RETRIEVER`, with a 60-second read timeout | `CTX_ADMIN_KEY` and `CTX_API_URL` |
 | `agent_memory_client` | `AGENT_MEMORY`, `MEMORY_OWNER_ID` (`cairn-<run>`), and `MEMORY_NAMESPACE` (`iris-basics-notebook`) | `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY` |
@@ -479,7 +477,7 @@ Verify that `.env` sits next to `pyproject.toml` and that the service's variable
 
 ### A chat turn raises an authentication error
 
-Verify that `ANTHROPIC_API_KEY` is set and valid in `.env`, or that `ant auth login` has stored a profile, then restart the kernel. A set key wins over the profile, and an invalid one raises `anthropic.AuthenticationError`.
+Verify that `LLM_API_KEY` is set and valid in `.env` and matches the provider of `AI_MODEL`, then restart the kernel. With an invalid key, each chat turn ends with "The model call failed" and the error's name.
 
 The Redis and service requests before the Claude call have already run. LangCache stores nothing for that turn. Agent Memory keeps your message as a session event, and Claude receives it on later turns.
 
@@ -626,4 +624,4 @@ Context Retriever was not run live in its new form, because no `CTX_ADMIN_KEY` w
 
 - The surface listed 21 tools for three entities. `get_customer_by_id` with `{"id": "C001"}` returned the record plus a `_retrieval` stamp, and `filter_customer` with no condition answered `isError` with *at least one condition is required*.
 
-The first live run of this notebook's Context Retriever column needs `CTX_ADMIN_KEY` in `.env`. The first real chat turns need `ANTHROPIC_API_KEY` or an `ant auth login` profile.
+The first live run of this notebook's Context Retriever column needs `CTX_ADMIN_KEY` in `.env`. The first real chat turns need `LLM_API_KEY`.
