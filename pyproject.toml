@@ -24,7 +24,6 @@ dependencies = [
   # inline "# comment" as part of the value.
   "python-dotenv==1.2.3",
   "anthropic==1.11.0",
-  "context-surfaces>=0.0.6",
   "redis-agent-memory>=0.4.1",
   "openai>=3.25.0",
   "google-genai==2.30.1",

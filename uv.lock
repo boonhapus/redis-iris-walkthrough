@@ -259,18 +259,6 @@ wheels = [
 ]
 
 [[package]]
-name = "context-surfaces"
-version = "0.0.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "redis-context-retriever" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/90/8b614f6635e8cf4ce81ad779e8762bb8b6f71a2377aff4e1f1d303d095af/context_surfaces-0.0.6.tar.gz", hash = "sha256:e1050e5209785b9f8c1daf04a9a24b0a8837489a1751d2597a6b33e09a544363", size = 2318, upload-time = "2026-07-27T11:13:35.749Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/e3/bb0f02bee5fd9a6143b2ca8bee621310d683b38395f51f47aa9a0cf7a554/context_surfaces-0.0.6-py3-none-any.whl", hash = "sha256:9166f493671e18c6ee825e490ac5262d1042ec6794668cee6253bdfee3907f79", size = 2022, upload-time = "2026-07-27T11:13:34.627Z" },
-]
-
-[[package]]
 name = "cryptography"
 version = "50.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1699,7 +1687,6 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
-    { name = "context-surfaces" },
     { name = "google-genai" },
     { name = "huggingface-hub" },
     { name = "marimo" },
@@ -1721,7 +1708,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = "==1.11.0" },
-    { name = "context-surfaces", specifier = ">=0.0.6" },
     { name = "google-genai", specifier = "==2.30.1" },
     { name = "huggingface-hub", specifier = "==1.33.0" },
     { name = "marimo", specifier = "==0.24.2" },
