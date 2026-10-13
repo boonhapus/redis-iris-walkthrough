@@ -1,5 +1,6 @@
 """Unit tests for src/cairn_support: the boundary rule, the sample-data constraints the notebook
 examples rely on, the two formatting helpers, and the embedder when its model is already cached.
+The last section covers run_tag, sessions, and llm, with no network.
 """
 
 import ast
@@ -13,7 +14,6 @@ from cairn_support import formatting
 from cairn_support import sample_data as data
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src" / "cairn_support"
-FORBIDDEN_IMPORTS = {"redis", "niquests", "marimo"}
 SHOP_ID = re.compile(r"^[A-Za-z]+[0-9]+$")
 
 
@@ -25,22 +25,28 @@ def _mentions(article: dict, word: str) -> bool:
     return word.lower() in (article["title"] + " " + article["body"]).lower()
 
 
+def _import_roots(module: Path) -> set[str]:
+    roots = set()
+    for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"), filename=str(module))):
+        if isinstance(node, ast.Import):
+            roots |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            roots.add((node.module or "").split(".")[0])
+    return roots
+
+
 # ---- boundary ----
 
 
-def test_package_has_no_iris_imports():
+def test_package_never_imports_marimo():
     modules = sorted(PACKAGE_DIR.glob("*.py"))
-    assert len(modules) >= 4
+    assert len(modules) >= 8
     for module in modules:
-        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                roots = {alias.name.split(".")[0] for alias in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                roots = {(node.module or "").split(".")[0]}
-            else:
-                continue
-            assert not roots & FORBIDDEN_IMPORTS, f"{module.name} imports {roots & FORBIDDEN_IMPORTS}"
+        assert "marimo" not in _import_roots(module), f"{module.name} imports marimo"
+
+
+def test_sample_data_imports_nothing():
+    assert _import_roots(PACKAGE_DIR / "sample_data.py") == set()
 
 
 # ---- Redis Search ----
@@ -202,3 +208,83 @@ def test_embedder_loads_from_cache(monkeypatch):
     assert vectors.shape == (2, 256)
     assert vectors.dtype == np.float32
     assert np.allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=1e-5)
+
+
+# ---- run_tag, sessions, llm ----
+
+
+def test_run_tag_is_eight_hex_characters_in_the_prefix():
+    from cairn_support.run_tag import KEY_PREFIX, RUN_TAG
+
+    assert re.fullmatch(r"[0-9a-f]{8}", RUN_TAG)
+    assert KEY_PREFIX == f"cairn:{RUN_TAG}:"
+
+
+def test_json_session_pins_the_json_headers():
+    from cairn_support.sessions import json_session
+
+    session = json_session("https://example.invalid/v1", {"Authorization": "Bearer x"})
+    assert session.headers["Content-Type"] == "application/json"
+    assert session.headers["Authorization"] == "Bearer x"
+    assert "Accept" not in session.headers or session.headers["Accept"] == "*/*"
+
+
+def _wsgi(environ, start_response):
+    # JSON on /json, JSON sent as text/plain on /plain, an empty 204 on /empty, and the gateway's 403 HTML page anywhere else.
+    path = environ["PATH_INFO"]
+    if path == "/json":
+        start_response("200 OK", [("Content-Type", "application/json")])
+        return [b'{"data": []}']
+    if path == "/plain":
+        start_response("201 Created", [("Content-Type", "text/plain")])
+        return [b'{"id": "a"}']
+    if path == "/empty":
+        start_response("204 No Content", [])
+        return [b""]
+    start_response("403 Forbidden", [("Content-Type", "text/html")])
+    return [b"<html>Forbidden</html>"]
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "payload"),
+    [("/json", 200, {"data": []}), ("/plain", 201, {"id": "a"}), ("/empty", 204, None), ("/other", 403, {"type": "Forbidden"})],
+)
+def test_json_request_returns_status_payload_and_ms(path, status, payload):
+    import niquests
+
+    from cairn_support.sessions import json_request
+
+    with niquests.Session(app=_wsgi) as session:  # mounted at wsgi://default, the base URL, so nothing leaves the process
+        reply = json_request(session, "POST", path, {"q": 1})
+    assert (reply.status, reply.payload) == (status, payload)
+    assert isinstance(reply.ms, int)
+
+
+def test_stream_llm_sends_user_and_assistant_messages_only():
+    from types import SimpleNamespace
+
+    from cairn_support.llm import _history
+
+    messages = [
+        SimpleNamespace(role="system", content="hidden"),
+        SimpleNamespace(role="user", content="hi"),
+        {"role": "assistant", "content": "hello"},
+    ]
+    assert _history(messages) == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+
+
+def test_recording_collects_the_requests_inside_the_block_only():
+    import niquests
+
+    from cairn_support.sessions import json_request, recording
+
+    with niquests.Session(app=_wsgi) as session:
+        json_request(session, "GET", "/json")
+        with recording() as wire:
+            json_request(session, "POST", "/json", {"q": 1})
+            json_request(session, "DELETE", "/empty")
+        json_request(session, "GET", "/other")
+    assert [(e.method, e.path, e.body, e.status, e.payload) for e in wire] == [
+        ("POST", "/json", {"q": 1}, 200, {"data": []}),
+        ("DELETE", "/empty", None, 204, None),
+    ]
