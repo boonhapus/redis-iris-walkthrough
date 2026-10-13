@@ -11,13 +11,16 @@ For more Iris demos, see [redis/redis-iris-demos](https://github.com/redis/redis
 
 ## Get started
 
-You need [uv](https://docs.astral.sh/uv/), which installs Python 3.12 or 3.13 for you, and these accounts and keys:
+You need:
 
-- A Redis 8 or later database with Search and JSON, local or on [Redis Cloud](https://cloud.redis.io)
-- A LangCache service
-- A Context Retriever admin key
-- An Agent Memory service
+- A free [Redis Cloud](https://cloud.redis.io) account (or Redis 8+ since Iris builds on `FT.SEARCH` and JSON the data type)
 - An OpenAI or Anthropic API key, for the LangCache and Agent Memory chats
+
+You'll also set up three services, each with its own key in `.env`:
+
+- [Redis LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/): for semantic caching
+- [Redis Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/): for centralized, fresh context from Redis
+- [Redis Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/): an LLM-agnostic short-term and long-term memory layer
 
 1. Open the folder:
 
@@ -31,14 +34,17 @@ You need [uv](https://docs.astral.sh/uv/), which installs Python 3.12 or 3.13 fo
    cp .env.example .env
    ```
 
-3. Start the notebook. `uv` installs the dependencies on the first run.
+3. Start the notebook with [uv](https://docs.astral.sh/uv/), which installs Python and the dependencies on the first run.
 
    ```sh
    uv run marimo edit iris_basics.py
    ```
 
-Column 0 checks your settings and marks each missing one with a red cross. Until all nine are set, the other columns wait behind it. After you edit `.env`, press **Restart kernel** in column 0, then **Restart** in the banner that follows.
+   No uv? Use pip with Python 3.12 or 3.13 (3.14 is not supported yet). Create a virtual environment, install the project into it, and start marimo from there:
 
-Nothing is written until you press a button such as **Load**, **Seed**, or **Create**, or send a chat message. Each column has a **Clean up** button that deletes what the column wrote.
-
-`AI_MODEL` in column 0 picks the chat model, `gpt-4o-mini` at first. Put an OpenAI key in `LLM_API_KEY` for a `gpt` model and an Anthropic key for a `claude` model.
+   ```sh
+   python -m venv .venv
+   source .venv/bin/activate   # on Windows: .venv\Scripts\activate
+   pip install -e .
+   marimo edit iris_basics.py
+   ```
