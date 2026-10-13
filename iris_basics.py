@@ -138,6 +138,9 @@ def rs_title(mo):
     2. **An unfiltered nearest-neighbor search always answers, and a similarity floor can return nothing.** `KNN 3` returns the three closest articles to any question, while `VECTOR_RANGE` returns only those within `$radius`, a `COSINE` distance of 1 minus the floor. Redis LangCache and Redis Agent Memory send the same empty reply when nothing clears their `similarityThreshold`.
     3. **Filters run inside the vector search.** A top five filtered in the app shrinks as the years narrow, while `KNN 5` with the filter before `=>` returns five as long as five pass. Agent Memory sends `filter: {ownerId: ...}` with every search, and a LangCache search can carry `attributes`, both filters inside a vector search.
 
+    Embeddings: this is the one column where your app does the embedding. `potion-base-8M` is a small static model, about 30 MB, that runs on this machine with no account. It stands in for whichever model you would choose in your own app.
+    Redis stores and compares whatever vectors you write and never learns which model made them. It checks only that each vector has the index's `DIM`, so keeping every question and article on one model is up to the app.
+
     Settings: `REDIS_URL` for a Redis 8 database with Search, shared with the Context Retriever column.
     Docs: [Redis Search](https://redis.io/docs/latest/develop/ai/search-and-query/),
     [vectors and filters](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/),
@@ -694,6 +697,9 @@ def lc_title(mo):
     1. **Your app searches before the LLM and stores after it.** `POST /entries/search` answers 200 with `data: []` on a miss, so the app calls the LLM and sends `POST /entries`, which answers 201 with an `entryId`. Both carry one Bearer token, and the pane beside the chat shows each turn's search, its reply, and the store after a miss.
     2. **The threshold trades wrong answers for misses.** A request's `similarityThreshold`, the same name the Agent Memory column tunes, is the floor on each entry's `similarity` and overrides the cache's default, 0.85 at creation. Move the slider and seven questions re-sort into hit, wrong answer, and miss, while `exact` in `searchStrategies` hits the same words regardless of case, at `similarity` 1.
     3. **A cached answer lives until its time to live (TTL) runs out or your app deletes it.** A new cache's default TTL is no expiration, so the app sends `ttlMillis` with every `POST /entries` to cap how stale an answer gets. Pick 10 seconds and a new question misses, hits at once when repeated, then misses again, so Clean up's `DELETE /entries/{entryId}` reads 404 after its TTL.
+
+    Embeddings: LangCache embeds inside the service, so this column sends text and never a vector. You pick the embedding provider and model in the console when you create the service: Redis's own provider, OpenAI with your key, or your own endpoint that speaks the OpenAI embeddings API.
+    `LLM_API_KEY` is the chat's key and plays no part in that choice.
 
     Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, shown once at creation, plus `LLM_API_KEY`, which the chat needs on a miss.
     The first two, the base URL and the `{cacheId}` in every path, are on the service's Connectivity page, and the third is the Bearer token.
@@ -1279,6 +1285,8 @@ def cr_title(mo):
     1. **Each field's `index` kind decides which tools the surface lists.** Three `ContextModel` classes mark each indexed field `text`, `tag`, or `numeric` in `ContextField(index=...)`, three of the field types the Search column declares in `FT.CREATE`. `export_data_model(entities=[...])` turns the classes into the `data_model`, and `tools/list` then shows `search_customer_by_text` and no `search_order_by_text`, because Order has no `text` field.
     2. **`connection_config` ties the surface to your own Redis database.** `POST /context-surfaces` carries that `data_model` and a `data_source.connection_config` built from the same `REDIS_URL` the Search column uses, with `addr`, `username`, `password`, `db`, and `tls_enabled`. On import the service writes JSON documents at each class's `__redis_key_template__` and builds one Redis Search index per entity, which `JSON.GET` and `FT._LIST` show.
     3. **An admin key creates the surface, and the agent holds only an agent key.** `CTX_ADMIN_KEY` goes in `X-API-Key` on every admin request, and Create uses it to make one agent key with an `expires_at` and read that key's `mcp_url`. The console sends `tools/call` to that `mcp_url` with the agent key alone, and `get_customer_by_id` for `C001` returns the record with a `_retrieval` stamp naming the surface.
+
+    Embeddings: none here. The three classes declare `text`, `tag`, and `numeric` fields and no `vector` field, so no tool in this column matches by meaning.
 
     Context Retriever does not support Redis Flex or Active-Active databases.
     Settings: `CTX_ADMIN_KEY` from the Redis Cloud Admin keys page, shown once, plus `REDIS_URL` for a database with Search and JSON that the hosted service can reach.
@@ -2065,6 +2073,10 @@ def am_title(mo):
     1. **Long-term memory recalls by meaning.** "Which foods should I avoid?" shares no keyword with "I'm allergic to peanuts and tree nuts", yet the search returns it for Priya. The search is a vector search, and `similarityThreshold` is its cosine similarity floor, the same name the LangCache column tunes.
     2. **The `ownerId` filter scopes recall to one customer.** The app sends `filter: {ownerId: ...}` with every search, so Tom's agent does not see Priya's allergy.
     3. **The app builds the prompt.** Each turn writes the message to session memory, searches long-term memory, and puts what it recalls in the system prompt.
+
+    Embeddings: Agent Memory embeds inside the service. It stores each long-term memory with a vector embedding and searches those vectors, so the app sends text and never a vector.
+    The service's own AI model settings, which cover embedding, extraction, and summarization, are chosen in the console when you create it: Redis-managed keys by default, or your own provider key and models.
+    The embedding model is fixed after creation, and `LLM_API_KEY` is only the chat's key.
 
     Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY` for the chat.
     Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
