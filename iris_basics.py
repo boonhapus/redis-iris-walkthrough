@@ -59,7 +59,7 @@ def env_check(mo):
         "MEMORY_API_BASE_URL": f"[Agent Memory]({_docs}/iris/agent-memory/view-service/) > your service > Configuration > Endpoint, with `https://`.",
         "MEMORY_STORE_ID": "Same section, Store ID.",
         "MEMORY_API_KEY": "Same service > API keys > New API key. Shown once.",
-        "LLM_API_KEY": "An OpenAI key for `gpt` models, or an Anthropic key for `claude`. `AI_MODEL` sets which.",
+        "LLM_API_KEY": "An OpenAI key for `gpt` models, an Anthropic key for `claude`, or a Google AI Studio key for `gemini`. `AI_MODEL` sets which.",
     }
     _missing = [name for name in _settings if not os.environ.get(name)]
 
@@ -120,7 +120,7 @@ def ai_model():
 
 
     # The LLM model needed for all chat interfaces.
-    # Supported models by OpenAI, Anthropic
+    # Supported models by OpenAI, Anthropic, Google (gemini)
     AI_MODEL = "gpt-4o-mini"
     return AI_MODEL, stream_llm
 

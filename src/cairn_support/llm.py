@@ -2,7 +2,8 @@
 
 This is not Redis or Iris. Each turn builds its own system prompt, and stream_llm only sends
 that prompt and the conversation to the model and streams the reply back.
-A model name that starts with "claude" goes to Anthropic, and any other name to OpenAI.
+A model name that starts with "claude" goes to Anthropic, one that starts with "gemini" to Google,
+and any other name to OpenAI.
 LLM_API_KEY is read at the first call, not at import, so a missing key fails at the first chat
 turn with the SDK's own error.
 """
@@ -15,13 +16,19 @@ from cairn_support.types import ChatMessage
 _clients: dict[tuple[str, str | None], object] = {}  # one client per provider and key, so turns reuse a connection
 
 
-def _client(provider: str):
+def _client(model: str):
+    """The SDK client for `model`'s provider: Anthropic, Google, or OpenAI."""
     key = os.environ.get("LLM_API_KEY") or None
+    provider = "anthropic" if model.startswith("claude") else "gemini" if model.startswith("gemini") else "openai"
     if (provider, key) not in _clients:
         if provider == "anthropic":
             from anthropic import AsyncAnthropic
 
             _clients[provider, key] = AsyncAnthropic(api_key=key)  # None lets the SDK look for its own credentials
+        elif provider == "gemini":
+            from google import genai
+
+            _clients[provider, key] = genai.Client(api_key=key)  # None lets the SDK look for GOOGLE_API_KEY or GEMINI_API_KEY
         else:
             from openai import AsyncOpenAI
 
@@ -49,13 +56,25 @@ async def stream_llm(
     """
     history = _history(messages)
     if model.startswith("claude"):
-        async with _client("anthropic").messages.stream(
+        async with _client(model).messages.stream(
             model=model, system=system_prompt, messages=history, max_tokens=max_tokens
         ) as stream:
             async for text in stream.text_stream:
                 yield text
+    elif model.startswith("gemini"):
+        stream = await _client(model).aio.models.generate_content_stream(
+            model=model,
+            contents=[
+                {"role": "model" if message["role"] == "assistant" else "user", "parts": [{"text": message["content"]}]}
+                for message in history
+            ],
+            config={"system_instruction": system_prompt, "max_output_tokens": max_tokens},
+        )
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
     else:
-        stream = await _client("openai").chat.completions.create(
+        stream = await _client(model).chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system_prompt}, *history],
             max_tokens=max_tokens,

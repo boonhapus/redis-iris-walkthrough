@@ -273,6 +273,56 @@ def test_stream_llm_sends_user_and_assistant_messages_only():
     assert _history(messages) == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
 
 
+def test_client_routes_a_model_name_to_its_providers_sdk(monkeypatch):
+    from anthropic import AsyncAnthropic
+    from google import genai
+    from openai import AsyncOpenAI
+
+    from cairn_support import llm
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(llm, "_clients", {})
+    claude, gemini, gpt = llm._client("claude-sonnet-5-5"), llm._client("gemini-2.5-flash"), llm._client("gpt-4o-mini")
+    assert isinstance(claude, AsyncAnthropic)
+    assert isinstance(gemini, genai.Client)
+    assert isinstance(gpt, AsyncOpenAI)
+    assert llm._client("gemini-2.5-pro") is gemini and llm._client("o4-mini") is gpt  # one client per provider and key
+
+
+def test_stream_llm_gemini_branch_sends_a_valid_request_and_yields_the_text(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from google.genai import types
+
+    from cairn_support import llm
+
+    sent = {}
+
+    async def generate_content_stream(**kwargs):
+        sent.update(kwargs)
+
+        async def chunks():
+            for text in ("Hel", None, "", "lo"):  # a chunk with only thought or finish parts has no text
+                yield SimpleNamespace(text=text)
+
+        return chunks()
+
+    fake = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate_content_stream)))
+    monkeypatch.setattr(llm, "_client", lambda model: fake)
+
+    async def collect():
+        history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hey"}, {"role": "user", "content": "more"}]
+        return [text async for text in llm.stream_llm("be brief", history, "gemini-2.5-flash", max_tokens=99)]
+
+    assert asyncio.run(collect()) == ["Hel", "lo"]
+    assert sent["model"] == "gemini-2.5-flash"
+    contents = [types.Content.model_validate(content) for content in sent["contents"]]  # the real SDK's types accept the dicts
+    assert [(content.role, content.parts[0].text) for content in contents] == [("user", "hi"), ("model", "hey"), ("user", "more")]
+    config = types.GenerateContentConfig.model_validate(sent["config"])
+    assert (config.system_instruction, config.max_output_tokens) == ("be brief", 99)
+
+
 def test_recording_collects_the_requests_inside_the_block_only():
     import niquests
 
