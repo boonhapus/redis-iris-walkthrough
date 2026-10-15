@@ -1,17 +1,15 @@
 """Cairn Outfitters sample content, as Python literals.
 
-Cairn Outfitters is a made-up outdoor gear shop. Everything the notebook loads, caches, indexes,
-or remembers comes from this module, so nothing here is Redis or Iris protocol: no command, no
-request body, no key template. Those stay in the notebook cells where a reader can see them.
+Cairn Outfitters is a made-up outdoor gear shop. The notebook loads, caches, and indexes from
+this module, so nothing here is Redis or Iris protocol: no command, no request body, no key
+template. Those stay in the notebook cells where a reader can see them.
 
-The tests in tests/test_cairn_support.py hold this data to the constraints the examples rely on:
+The examples rely on a few constraints in this data:
 
 - no help article says "cramped" or "shoes", exactly one says "Trailhead", and none says
-  "waterproofng", so each search preset shows a different engine winning;
+  "waterproofng", so the three search examples each show a different kind of match;
 - every shop id matches ^[A-Za-z]+[0-9]+$, so a TAG query never meets a hyphen;
-- every THRESHOLD_PROBES target is a GEAR_CARE_ANSWERS key or None;
-- each memory question shares no word stem with the fact it is after;
-- SESSION_TURNS[-1]["text"] == MEMORY_QUESTIONS[0]["text"].
+- every THRESHOLD_PROBES target is a GEAR_CARE_ANSWERS key or None.
 """
 
 # ---- Redis Search: the help centre ----
@@ -513,56 +511,3 @@ SHOP_RECORDS: dict[str, list[dict]] = {
         {"order_id": "O1008", "customer_id": "C006", "sku": "P104", "region": "apac", "status": "shipped", "total": 89.0},
     ],
 }
-
-# ---- Agent Memory: Dana ----
-
-# Five facts about Dana, a made-up Cairn customer. The notebook adds the id, owner, and
-# namespace. Each question below shares no word stem with the fact it is after.
-DANA_FACTS: list[dict] = [
-    {
-        "text": (
-            "Dana is allergic to peanuts and tree nuts, so trail snacks and camp meals must not "
-            "contain them."
-        ),
-        "topics": ["food", "allergy"],
-    },
-    {
-        "text": "Dana has wide feet, so she needs boots half a size bigger than her usual size.",
-        "topics": ["sizing", "footwear"],
-    },
-    {
-        "text": "Dana is planning a winter trek across Patagonia in February and gets cold easily.",
-        "topics": ["travel", "trip"],
-    },
-    {
-        "text": "Dana prefers gear made from recycled materials and will pay extra for it.",
-        "topics": ["preferences", "sustainability"],
-    },
-    {
-        "text": "Dana wants parcels sent express, with no plastic packaging.",
-        "topics": ["shipping", "packaging"],
-    },
-]
-
-# The recall example's questions. target is the 1-based index into DANA_FACTS.
-MEMORY_QUESTIONS: list[dict] = [
-    {"text": "What should the kitchen avoid serving me?", "target": 1},
-    {"text": "My toes feel squashed on long descents.", "target": 2},
-    {"text": "Somewhere freezing to visit next year?", "target": 3},
-]
-
-# One short conversation for the session example. The two USER facts are new, so anything the
-# service extracts from them is a new record under the same owner. The last turn is the first
-# memory question, asked inside a session.
-SESSION_TURNS: list[dict] = [
-    {"role": "USER", "text": "I am training for a 50 kilometre trail race in April."},
-    {
-        "role": "ASSISTANT",
-        "text": "Noted: a 50 km race in April. Do steep descents give you any trouble?",
-    },
-    {
-        "role": "USER",
-        "text": "My left knee complains on steep downhills, so I always carry trekking poles.",
-    },
-    {"role": "USER", "text": "What should the kitchen avoid serving me?"},
-]

@@ -1,4 +1,4 @@
-"""The model call behind the Search, LangCache, and Agent Memory chat turns.
+"""The model call behind the LangCache and Agent Memory chat turns.
 
 This is not Redis or Iris. Each turn builds its own system prompt, and stream_llm only sends
 that prompt and the conversation to the model and streams the reply back.

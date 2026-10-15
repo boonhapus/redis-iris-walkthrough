@@ -37,16 +37,6 @@ class Exchange(NamedTuple):
     ms: int
 
 
-class Article(TypedDict):
-    """One help-center article, as sample_data.HELP_ARTICLES holds it and the Search column writes it."""
-
-    id: str
-    title: str
-    body: str
-    category: str
-    year: int
-
-
 class Surface(TypedDict):
     """The context surface the Context Retriever column created, as it keeps it after Create."""
 

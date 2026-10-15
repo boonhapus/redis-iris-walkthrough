@@ -1,16 +1,12 @@
-"""Normalize raw FT.INFO / FT.SEARCH replies from redis-py (RESP3 maps or legacy RESP2 lists)."""
+"""Turn raw FT.SEARCH replies from redis-py into rows, a markdown table, and text.
+
+redis-py returns a RESP3 map or a legacy RESP2 list.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
-
-
-def ft_info_dict(reply: list | dict) -> dict:
-    """FT.INFO as a flat string-keyed dict."""
-    if isinstance(reply, dict):
-        return reply
-    return dict(zip(reply[::2], reply[1::2]))
 
 
 def _search_rows_resp2(reply: list) -> tuple[int, list[dict[str, Any]]]:

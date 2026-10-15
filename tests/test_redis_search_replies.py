@@ -1,21 +1,10 @@
 from cairn_support.redis_search_replies import (
     format_ft_search_reply,
-    ft_info_dict,
     ft_search_inputs_markdown,
     ft_search_markdown_table,
     ft_search_result_summary,
     ft_search_rows,
 )
-
-
-def test_ft_info_resp3_dict():
-    reply = {"num_docs": 36, "hash_indexing_failures": 0}
-    assert ft_info_dict(reply) == reply
-
-
-def test_ft_info_resp2_list():
-    reply = ["num_docs", 36, "hash_indexing_failures", 0]
-    assert ft_info_dict(reply) == {"num_docs": 36, "hash_indexing_failures": 0}
 
 
 def test_ft_search_resp3():

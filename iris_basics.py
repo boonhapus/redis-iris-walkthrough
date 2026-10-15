@@ -184,8 +184,6 @@ def rs_title(CAIRN_SCOPE, mo):
 @app.cell
 def rs_config(CAIRN_SCOPE):
     from cairn_support.sample_data import HELP_ARTICLES
-    from cairn_support.types import Article
-
 
     RS_SCOPE = f"cairn:{CAIRN_SCOPE}:"
     RS_KEY_PREFIX = f"{RS_SCOPE}help"
@@ -356,7 +354,7 @@ def rs_config_run(
     if rs_button_delete.value:
         try:
             _ = REDIS_CLIENT.execute_command("FT.DROPINDEX", RS_IDX_NAME)
-        except redis.exceptions.RedisError as e:
+        except redis.exceptions.RedisError:
             _ = ""
         finally:
             _output = mo.md(f"**`{RS_IDX_NAME}`** was {'' if _ == 'OK' else 'not '}dropped.")
@@ -503,9 +501,6 @@ def rs_config_load(
 
                 _full_text = f"{article['title']}. {article['body']}"
                 _vector = embed_texts(EMBEDDING_MODEL, [_full_text])[0].astype("float32").tobytes()
-
-                # Minor cleanups
-                _val["year"] = int(article["year"])
                 _val["embedding"] = _vector
 
                 _pipe.hset(_key, mapping=_val)
@@ -532,33 +527,19 @@ def rs_3a_meaning_prose(
     shlex,
     textwrap,
 ):
+    rs_idx_state = ""
     try:
         _stmt = f"""FT.INFO {RS_IDX_NAME}"""
         _ = textwrap.dedent(_stmt)
         _ = shlex.split(_)
-        _ = REDIS_CLIENT.execute_command(*_)
+        rs_idx_state = REDIS_CLIENT.execute_command(*_)
     except redis.exceptions.RedisError as e:
         log(e, level="warning" if "already" in str(e) else "error")
-        rs_idx_state = ""
-    finally:
-        rs_idx_state = _
 
     SEARCH_PRESETS: list[dict] = [
-        {
-            "label": "by Meaning",
-            "query": "trail shoes feel cramped",
-            "target": "size-boots",
-        },
-        {
-            "label": "by Exact",
-            "query": "Trailhead",
-            "target": "warranty-resole",
-        },
-        {
-            "label": "by Typo",
-            "query": "waterproofng",
-            "target": "care-waterproof",
-        },
+        {"label": "by Meaning", "query": "trail shoes feel cramped"},
+        {"label": "by Exact", "query": "Trailhead"},
+        {"label": "by Typo", "query": "waterproofng"},
     ]
 
     rs_meaning_pick = mo.ui.dropdown(
