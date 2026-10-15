@@ -381,25 +381,6 @@ HELP_ARTICLES: list[dict] = [
     },
 ]
 
-# The search examples: a question, the article it is really after, and a label for the reader.
-SEARCH_PRESETS: list[dict] = [
-    {
-        "label": "Same meaning, different words",
-        "query": "trail shoes feel cramped",
-        "target": "size-boots",
-    },
-    {
-        "label": "An exact name",
-        "query": "Trailhead",
-        "target": "warranty-resole",
-    },
-    {
-        "label": "A typo",
-        "query": "waterproofng",
-        "target": "care-waterproof",
-    },
-]
-
 # ---- LangCache: gear-care answers ----
 
 # The five answers the cache stores. Nothing here is close to another app's questions.

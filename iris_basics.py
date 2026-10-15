@@ -10,6 +10,7 @@ def _():
     import asyncio
     import datetime as dt
     import json
+    import textwrap
     import time
     import uuid
 
@@ -17,22 +18,22 @@ def _():
     import marimo as mo
 
     # Notebook-local data support, typing information, or internal machinery.
-    from cairn_support.run_tag import KEY_PREFIX, RUN_TAG
+    from cairn_support.formatting import log
     from cairn_support.sessions import json_request, json_session
     from cairn_support.types import ChatMessage, ChatTurn, Reply
 
     return (
         ChatMessage,
         ChatTurn,
-        KEY_PREFIX,
-        RUN_TAG,
         Reply,
         asyncio,
         dt,
         json,
         json_request,
         json_session,
+        log,
         mo,
+        textwrap,
         time,
         uuid,
     )
@@ -102,16 +103,25 @@ def env_check(mo):
 
 @app.cell
 def redis_client(os):
+    import shlex
+
     import redis
 
 
     REDIS_CLIENT = redis.Redis.from_url(
         os.environ["REDIS_URL"],
-        protocol=2,               # flat FT.* replies: every reply shape here was verified live under RESP2
-        decode_responses=True,    # strings back; the vector field is never read through a core command
+
+        # Make sure we have a keepalive for inactive notebooks.
         health_check_interval=30,
+
+        # Communicate via STR instead of BYTES (purely for notebook UX).
+        decode_responses=True,
     )
-    return REDIS_CLIENT, redis
+
+
+    # Short id for this notebook's scratch area on a shared Redis (Search keys, Context Retriever surface name).
+    CAIRN_SCOPE = "20261021"
+    return CAIRN_SCOPE, REDIS_CLIENT, redis, shlex
 
 
 @app.cell
@@ -125,564 +135,1053 @@ def ai_model():
     return AI_MODEL, stream_llm
 
 
+@app.cell
+def _():
+    from cairn_support.embedder import embed_texts, load_embedding_model
+
+
+    # potion-base-8M from the Hugging Face cache, about 30 MB the first time
+    EMBEDDING_MODEL = load_embedding_model()
+    return EMBEDDING_MODEL, embed_texts
+
+
 @app.cell(column=1, hide_code=True)
-def rs_title(mo):
-    mo.md(r"""
+def rs_title(CAIRN_SCOPE, mo):
+    mo.md(f"""
     # Redis Search
 
-    Customers ask in their own words, and a keyword index finds only the words your articles use.
-    Redis Search keeps text, tag, numeric, and vector fields in one index over your hashes, and the other three services build on it.
-    Load 36 Cairn Outfitters articles, then run the four searches below to see three principles:
+    As Cairn Outfitters, you store your **Help Center** articles in Redis as hashes, mapped like..
 
-    1. **An index follows every write under its prefix.** `FT.CREATE` names a key prefix once, and Redis indexes each `HSET` under it as part of the write, so `num_docs` reads 36, then 37. Redis Context Retriever's index per entity follows its JSON documents the same way.
-    2. **An unfiltered nearest-neighbor search always answers, and a similarity floor can return nothing.** `KNN 3` returns the three closest articles to any question, while `VECTOR_RANGE` returns only those within `$radius`, a `COSINE` distance of 1 minus the floor. Redis LangCache and Redis Agent Memory send the same empty reply when nothing clears their `similarityThreshold`.
-    3. **Filters run inside the vector search.** A top five filtered in the app shrinks as the years narrow, while `KNN 5` with the filter before `=>` returns five as long as five pass. Agent Memory sends `filter: {ownerId: ...}` with every search, and a LangCache search can carry `attributes`, both filters inside a vector search.
+      `cairn:<scope>:help:<article-id>: {{ title, body, category, year }}`
 
-    Embeddings: this is the one column where your app does the embedding. `potion-base-8M` is a small static model, about 30 MB, that runs on this machine with no account. It stands in for whichever model you would choose in your own app.
-    Redis stores and compares whatever vectors you write and never learns which model made them. It checks only that each vector has the index's `DIM`, so keeping every question and article on one model is up to the app.
-
-    Settings: `REDIS_URL` for a Redis 8 database with Search, shared with the Context Retriever column.
-    Docs: [Redis Search](https://redis.io/docs/latest/develop/ai/search-and-query/),
-    [vectors and filters](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/),
-    [`FT.CREATE`](https://redis.io/docs/latest/commands/ft.create/), and
-    [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/).
-
-    Each line reads source, target, and what passes between them:
-
-    ```text
-    App   -> FT index  FT.CREATE on prefix cairn:<run>:help: with TEXT, TAG, NUMERIC, and VECTOR fields
-    App   -> model     potion-base-8M embeds each article and each question on this machine
-    App   -> hash      HSET title, body, category, year, and embedding, then EXPIRE 3600
-    hash  -> FT index  indexed as part of the HSET, so FT.INFO num_docs reads 36, then 37
-    App   -> FT index  FT.SEARCH: KNN 3 by meaning, VECTOR_RANGE $radius, and KNN 5 with the year filter inside
+    ```json
+    {{
+      "cairn:{CAIRN_SCOPE}:help:ship-times": {{
+        "title": "How long does delivery take?",
+        "body": "Standard orders leave our Denver warehouse..",
+        "category": "shipping",
+        "year": "2025",
+        "embedding": "OSgjvXX2dD7aP5M9maqqv.."
+      }}
+    }}
     ```
+
+    [**Redis Search**](https://redis.io/docs/latest/develop/ai/search-and-query/) is an index over those keys. You declare it once with `FT.CREATE`, pointing at a key prefix. After that, every `HSET` under that prefix is searchable automatically—no separate "index this document" step.
+
+    Redis Search allow you to use Redis as a Document database, Vector database, Secondary index, or Search engine.
+
+    ---
+
+    ## We'll learn how to..
+
+    1. Create the index.
+    2. Add documents to the index.
+    3. Use `FT.SEARCH` to find the relevant information.
     """)
     return
 
 
+@app.cell
+def rs_config(CAIRN_SCOPE):
+    from cairn_support.sample_data import HELP_ARTICLES
+    from cairn_support.types import Article
+
+
+    RS_SCOPE = f"cairn:{CAIRN_SCOPE}:"
+    RS_KEY_PREFIX = f"{RS_SCOPE}help"
+    RS_IDX_NAME   = f"idx:{RS_SCOPE}help"
+    return HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX
+
+
 @app.cell(hide_code=True)
-def rs_load_button(mo, rss_create_index):
-    _ = rss_create_index  # the buttons appear once the index functions exist, so a press never runs ahead of the settings check
-    rss_load_button = mo.ui.run_button(label="Load")
-    rss_refresh_button = mo.ui.run_button(label="Refresh")
-    rss_add_button = mo.ui.run_button(label="Add one more article")  # shown in the last search, beside the result it changes
-    rss_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
+def rs_config_create(
+    EMBEDDING_MODEL,
+    RS_IDX_NAME,
+    RS_KEY_PREFIX,
+    mo,
+    textwrap,
+):
+    rs_button_create = mo.ui.run_button(label="Run the FT.CREATE command")
+    rs_button_delete = mo.ui.run_button(label="Drop the index", kind="danger")
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Each field's type decides what you can ask later: `TEXT` finds words, `TAG` matches exact labels, `NUMERIC` handles ranges, and `VECTOR` finds meaning. Fields left out of the schema are still stored, but you can't search on them.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea: the schema decides what you can search",
+    )
+
+    _md_create = mo.md(
+        textwrap.dedent(
+            f"""
+            ```bash
+            FT.CREATE {RS_IDX_NAME}
+              ON HASH
+              PREFIX 1 {RS_KEY_PREFIX}:
+            SCHEMA
+              title      TEXT     WEIGHT 2.0
+              body       TEXT
+              category   TAG
+              year       NUMERIC  SORTABLE
+              embedding  VECTOR   HNSW 6
+                TYPE FLOAT32
+                DIM {EMBEDDING_MODEL.dim}
+                DISTANCE_METRIC COSINE
+            ```
+            """
+        ).strip()
+    )
+
+    _buttons_note = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                **Run the FT.CREATE command** creates the index, and the same press loads the articles in step 2. Pressing it again is harmless. **Drop the index** deletes only the index; the articles stay in Redis until they expire.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="What the buttons do",
+    )
+
+    _md_options = mo.md(
+        textwrap.dedent(
+            """
+            - `ON HASH` indexes hashes. `ON JSON` would index JSON documents instead.
+            - `PREFIX 1` means one prefix follows; an index can watch several.
+            - `WEIGHT 2.0` makes a word found in the title count double when full-text results are scored. It has no effect on vector search.
+            - `SORTABLE` keeps `year` ready for fast sorting with `SORTBY year`.
+            - `HNSW` builds a graph that finds near neighbors quickly, without comparing the question with every article. `FLAT` compares with every one: exact, but slow on large data. In `HNSW 6`, the `6` counts the items that follow: `TYPE`, `DIM` and `DISTANCE_METRIC`, each with its value.
+            - `TYPE FLOAT32` stores each number in the vector as 4 bytes.
+            - `DIM` must match the number of values the model outputs. The notebook fills it in from the model.
+            - `COSINE` compares the direction of two vectors and ignores their length. Step 3 reports it as a distance: 1 − cosine similarity.
+
+            To change a field's type later, drop the index and create it again: the hashes stay in Redis and are indexed again. [`FT.ALTER`](https://redis.io/docs/latest/commands/ft.alter/) can only add fields.
+            """
+        ).strip()
+    )
+
+    _md_syntax = mo.md(
+        textwrap.dedent(
+            """
+            [`FT.CREATE`](https://redis.io/docs/latest/commands/ft.create/) for a [hash index](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/#hash-documents):
+
+            ```bash
+            FT.CREATE <name>
+              ON HASH
+              PREFIX <count> <prefix> [<prefix> ...]
+            SCHEMA
+              <field> <type> [<options>]
+              ...
+            ```
+
+            - [Schema definition](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/schema-definition/)
+            - [Field and type options](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/field-and-type-options/)
+            - [Vectors](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/)
+            """
+        ).strip()
+    )
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Load the help center
-
-    Load runs `FT.CREATE` once over the key prefix `cairn:<run>:help:`, then writes 36 articles with `HSET` and `EXPIRE 3600`, and `FT.INFO` reads `num_docs` 36 with no sync job.
-    Refresh reads `FT.INFO` again, and a second Load finds the index in place and rewrites the same 36 keys.
-    Clean up drops the index, which has no TTL, without `DD`, then unlinks the keys it wrote by name before their `EXPIRE` runs out.
-    """),
-            mo.hstack([rss_load_button, rss_refresh_button, rss_cleanup_button], justify="start"),
-        ]
+            mo.md("### 1. Create the index"),
+            _key_idea,
+            _md_create,
+            mo.hstack([rs_button_create, rs_button_delete], justify="start"),
+            _buttons_note,
+            mo.accordion(
+                {
+                    "More on each option": _md_options,
+                    "General syntax and docs": _md_syntax,
+                }
+            ),
+        ],
+        gap=0.75,
     )
-    return (
-        rss_add_button,
-        rss_cleanup_button,
-        rss_load_button,
-        rss_refresh_button,
-    )
+    return rs_button_create, rs_button_delete
 
 
 @app.cell(hide_code=True)
-def rs_load(
-    HELP_ARTICLES,
+def rs_config_run(
+    EMBEDDING_MODEL,
+    REDIS_CLIENT,
+    RS_IDX_NAME,
+    RS_KEY_PREFIX,
+    log,
     mo,
-    rss_add_button,
-    rss_cleanup_button,
-    rss_create_index,
-    rss_create_line,
-    rss_drop,
-    rss_extra_article: "Article",
-    rss_hset_lines,
-    rss_index_info,
-    rss_index_name,
-    rss_index_table,
-    rss_key_prefix,
-    rss_load_button,
-    rss_refresh_button,
-    rss_write_articles,
+    redis,
+    rs_button_create,
+    rs_button_delete,
+    shlex,
+    textwrap,
 ):
-    _note = ""
-    if rss_load_button.value:
-        _created = rss_create_index()
-        _written = rss_write_articles(HELP_ARTICLES)
-        _note = f"Created the index and wrote {_written} articles." if _created else f"The index already existed. Wrote the same {_written} articles again."
-    if rss_add_button.value:
-        _before = rss_index_info()
-        if _before is None:
-            _note = "No index yet. Select Load first, then add the article."
-        else:
-            rss_write_articles([rss_extra_article])
-            _after = rss_index_info()
-            _note = (
-                f"Wrote `{rss_key_prefix + rss_extra_article['id']}` with `EXPIRE 3600`. "
-                f"`num_docs` read {int(_before['num_docs'])} before and {int(_after['num_docs'])} after."
-            )
-    if rss_cleanup_button.value:
-        _dropped, _unlinked = rss_drop()
-        _note = f"Dropped the index and unlinked {_unlinked} keys." if _dropped else f"The index was already gone. Unlinked {_unlinked} keys."
-    _ = rss_refresh_button.value  # Refresh reads FT.INFO again
+    _output = mo.md("Press a button in the cell above to get started.")
 
-    rss_index_state = rss_index_info()  # the FT.INFO dict, or None when there is no index. rs_write_md and the four search cells read it, so every press reruns them.
+    #
+    # CREATE FLOW
+    #
+    if rs_button_create.value:
+        try:
+            _stmt = f"""
+            FT.CREATE {RS_IDX_NAME}
+              ON HASH
+              PREFIX 1 {RS_KEY_PREFIX}:
+            SCHEMA
+              title      TEXT     WEIGHT 2.0
+              body       TEXT
+              category   TAG
+              year       NUMERIC  SORTABLE
+              embedding  VECTOR   HNSW 6
+                                TYPE FLOAT32
+                                DIM {EMBEDDING_MODEL.dim}
+                                DISTANCE_METRIC COSINE
+            """
+            _ = textwrap.dedent(_stmt)
+            _ = shlex.split(_)
+            _ = REDIS_CLIENT.execute_command(*_)
+        except redis.exceptions.RedisError as e:
+            log(e, level="warning" if "already" in str(e) else "error")
+            _ = ""
+        finally:
+            _output = mo.md(f"**`{RS_IDX_NAME}`** was {'' if _ == 'OK' else 'already '}created.")
+
+    #
+    # DELETE FLOW
+    #
+    if rs_button_delete.value:
+        try:
+            _ = REDIS_CLIENT.execute_command("FT.DROPINDEX", RS_IDX_NAME)
+        except redis.exceptions.RedisError as e:
+            _ = ""
+        finally:
+            _output = mo.md(f"**`{RS_IDX_NAME}`** was {'' if _ == 'OK' else 'not '}dropped.")
+
+    _output
+    return
+
+
+@app.cell(hide_code=True)
+def rs_config_load_prose(
+    EMBEDDING_MODEL,
+    HELP_ARTICLES,
+    RS_KEY_PREFIX,
+    mo,
+    textwrap,
+):
+    _article = HELP_ARTICLES[0]
+    _key = f"{RS_KEY_PREFIX}:{_article['id']}"
+    _body = textwrap.shorten(_article["body"], width=48, placeholder=" ...")
+
+    _md_intro = mo.md(
+        textwrap.dedent(
+            f"""
+            ### 2. Load the documents
+
+            Each help article becomes one Redis [**hash**](https://redis.io/docs/latest/develop/data-types/hashes/): a key that holds named fields, like a small dictionary. Redis Search calls each hash it indexes a **document**. The notebook writes all {len(HELP_ARTICLES)} articles with `HSET`, one hash per article.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Each key starts with the prefix from step 1, so Redis indexes the hash the moment `HSET` writes it. There's no separate "index this" call. When a key is deleted or expires, it drops out of the index too.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea: writing is indexing",
+    )
+
+    _md_command = mo.md(
+        textwrap.dedent(
+            f"""
+            > Store the first article as a hash, and delete it after an hour.
+
+            ```bash
+            HSET {_key}
+              title "{_article['title']}"
+              body "{_body}"
+              category {_article['category']}
+              year {_article['year']}
+              embedding <{EMBEDDING_MODEL.dim * 4} bytes>
+
+            EXPIRE {_key} 3600
+            ```
+
+            Reading it piece by piece:
+
+            - `HSET <key>` creates the hash, or updates it if it already exists. The key is the prefix plus the article's id.
+            - `title`, `body`, `category` and `year` are the fields the schema declared in step 1. Redis stores every hash value as a string; the index reads `year` as a number because the schema says `NUMERIC`.
+            - `embedding` is the vector. The model turns the title and body into {EMBEDDING_MODEL.dim} numbers on this machine, and the notebook stores them as {EMBEDDING_MODEL.dim * 4} raw bytes, 4 per number, to match `TYPE FLOAT32` and `DIM {EMBEDDING_MODEL.dim}`.
+            - `EXPIRE <key> 3600` deletes the key after an hour (3,600 seconds), so the demo cleans up after itself.
+            """
+        ).strip()
+    )
+
+    _watch_out = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                f"""
+                If a value doesn't fit its field's type, Redis doesn't raise an error. It stores the hash but leaves it out of the index, so no search returns it. That happens with an embedding that isn't exactly {EMBEDDING_MODEL.dim * 4} bytes, for example after switching to a model with a different size, or with a `year` that isn't a number. `FT.INFO` counts these under `hash_indexing_failures`.
+                """
+            ).strip()
+        ),
+        kind="warn",
+        title="Watch out: a bad value hides the whole article",
+    )
+
+    _md_syntax = mo.md(
+        textwrap.dedent(
+            """
+            [`HSET`](https://redis.io/docs/latest/commands/hset/) and [`EXPIRE`](https://redis.io/docs/latest/commands/expire/):
+
+            ```bash
+            HSET <key> <field> <value> [<field> <value> ...]
+
+            EXPIRE <key> <seconds>
+            ```
+
+            More on [indexing hash documents](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/#hash-documents).
+            """
+        ).strip()
+    )
+
+    _runs_with_step_1 = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                f"""
+                There's no button here. **Run the FT.CREATE command** in step 1 also writes the articles, and the line below reports how many. The notebook sends all {len(HELP_ARTICLES) * 2} commands, an `HSET` and an `EXPIRE` per article, in one [pipeline](https://redis.io/docs/latest/develop/using-commands/pipelining/): a single round trip. Pressing the button again rewrites them and restarts the hour.
+                """
+            ).strip()
+        ),
+        kind="neutral",
+        title="Runs with the step 1 button",
+    )
 
     mo.vstack(
-        ([mo.md(_note)] if _note else [])
-        + [
-            rss_index_table(rss_index_state),
-            mo.md("**What Load sends**, with the first article:"),
-            mo.md(f"```text\n{rss_create_line()}\n{rss_hset_lines(HELP_ARTICLES[0])}\nFT.INFO {rss_index_name}\n```"),
-        ]
+        [
+            _md_intro,
+            _key_idea,
+            _md_command,
+            _watch_out,
+            mo.accordion({"General syntax and docs": _md_syntax}),
+            _runs_with_step_1,
+        ],
+        gap=0.75,
     )
-    return (rss_index_state,)
+    return
 
 
 @app.cell(hide_code=True)
-def rs_meaning_md(mo):
-    from cairn_support.sample_data import SEARCH_PRESETS  # three questions: the same meaning in other words, an exact name, and a typo
+def rs_config_load(
+    EMBEDDING_MODEL,
+    HELP_ARTICLES,
+    REDIS_CLIENT,
+    RS_KEY_PREFIX,
+    embed_texts,
+    mo,
+    rs_button_create,
+):
+    _output = mo.md("Create the index, then load help articles.")
 
-    rss_meaning_pick = mo.ui.dropdown(
+
+    #
+    # LOAD FLOW
+    #
+    if rs_button_create.value:
+        with REDIS_CLIENT.pipeline(transaction=False) as _pipe:
+            for article in HELP_ARTICLES:
+                _key = f"{RS_KEY_PREFIX}:{article['id']}"
+                _val = article.copy()
+
+                _full_text = f"{article['title']}. {article['body']}"
+                _vector = embed_texts(EMBEDDING_MODEL, [_full_text])[0].astype("float32").tobytes()
+
+                # Minor cleanups
+                _val["year"] = int(article["year"])
+                _val["embedding"] = _vector
+
+                _pipe.hset(_key, mapping=_val)
+                _pipe.expire(_key, time=3600)
+
+            _pipe.execute()
+
+        _output = mo.md(
+            f"Wrote **{len(HELP_ARTICLES)}** articles under `{RS_KEY_PREFIX}:` with `TTL=3600`."
+        )
+
+    _output
+    return
+
+
+@app.cell(hide_code=True)
+def rs_3a_meaning_prose(
+    EMBEDDING_MODEL,
+    REDIS_CLIENT,
+    RS_IDX_NAME,
+    log,
+    mo,
+    redis,
+    shlex,
+    textwrap,
+):
+    try:
+        _stmt = f"""FT.INFO {RS_IDX_NAME}"""
+        _ = textwrap.dedent(_stmt)
+        _ = shlex.split(_)
+        _ = REDIS_CLIENT.execute_command(*_)
+    except redis.exceptions.RedisError as e:
+        log(e, level="warning" if "already" in str(e) else "error")
+        rs_idx_state = ""
+    finally:
+        rs_idx_state = _
+
+    SEARCH_PRESETS: list[dict] = [
+        {
+            "label": "by Meaning",
+            "query": "trail shoes feel cramped",
+            "target": "size-boots",
+        },
+        {
+            "label": "by Exact",
+            "query": "Trailhead",
+            "target": "warranty-resole",
+        },
+        {
+            "label": "by Typo",
+            "query": "waterproofng",
+            "target": "care-waterproof",
+        },
+    ]
+
+    rs_meaning_pick = mo.ui.dropdown(
         options={f"{preset['label']}: {preset['query']}": preset["query"] for preset in SEARCH_PRESETS},
         value=f"{SEARCH_PRESETS[0]['label']}: {SEARCH_PRESETS[0]['query']}",
-        label="Question",
+        label="User Query",
+    )
+
+    _md_intro = mo.md(
+        textwrap.dedent(
+            f"""
+            ### 3a. Search by meaning with `KNN`
+
+            In step 2, each article was stored with an **embedding**: a list of {EMBEDDING_MODEL.dim} numbers that captures what its title and body *mean*. To search by meaning, the notebook embeds the shopper's question with the same model, then asks Redis which stored embeddings are **closest** to the question's. Close embeddings mean similar meaning, even when the two texts share no words.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Redis measures "close" with the metric the index declared in step 1, `DISTANCE_METRIC COSINE`, and returns it as **`vector_score`**, a cosine distance. **0** means the same meaning, around **1** means unrelated, and **lower is closer**.
+
+                **KNN** stands for *k nearest neighbors*. `KNN 3` returns the **3** closest articles, and it always returns three, even when none of them is a good match.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea: nearest neighbors",
+    )
+
+    _md_command = mo.md(
+        textwrap.dedent(
+            f"""
+            > Among all articles, find the 3 closest semantic matches to the user's question.
+
+            ```bash
+            FT.SEARCH {RS_IDX_NAME} "(*)=>[KNN 3 @embedding $vector AS vector_score]"
+                 RETURN  4  title category year vector_score
+                 SORTBY     vector_score
+                 DIALECT 2
+                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+            ```
+
+            Reading it piece by piece:
+
+            - `(*)` is the **filter**: which articles take part. `*` means all of them.
+            - `=>` passes those articles to the vector search on its right.
+            - `[KNN 3 @embedding $vector AS vector_score]` finds the **3** articles whose `embedding` field is nearest to `$vector`, and names each distance `vector_score`.
+            - `RETURN 4 ...` sends back these **4** fields for each hit, and leaves the embedding itself behind.
+            - `SORTBY vector_score` puts the closest article first.
+            - `DIALECT 2` turns on the query syntax that understands `=>[KNN ...]` and `$` parameters. Vector queries need it.
+            - `PARAMS 2 vector <bytes>` fills in `$vector`. The **2** counts the items that follow: the name `vector` and its value, the question's embedding as raw `FLOAT32` bytes. Bytes can't be typed into a command, so the notebook appends them as one extra argument. That's why the command shown with the results ends at `vector`.
+            """
+        ).strip()
+    )
+
+    _md_syntax = mo.md(
+        textwrap.dedent(
+            """
+            [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/) with a `KNN` query:
+
+            ```bash
+            FT.SEARCH <index> "<filter>=>[KNN <k> @<vector field> $<param> AS <score name>]"
+              RETURN <count> <field> [<field> ...]
+              SORTBY <field>
+              DIALECT 2
+              PARAMS <nargs> <name> <value> [<name> <value> ...]
+            ```
+
+            More in the [vector search guide](https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/).
+            """
+        ).strip()
+    )
+
+    _try_it = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Pick each query below and watch where its target article lands in the results.
+
+                - **by Meaning**, *trail shoes feel cramped*: **Finding your boot size** comes first, though no article contains "cramped" or "shoes".
+                - **by Typo**, *waterproofng*: **Restoring waterproofing on shells and boots** still comes first. The model splits words into pieces, and `water` and `proof` survive the typo.
+                - **by Exact**, *Trailhead*: **Resoling worn boots**, the only article that names this boot, comes third. An article's embedding sums up all of its text, so one product name barely moves it. Exact names are a job for full-text search on the `TEXT` fields: `FT.SEARCH <index> "Trailhead"` returns that article alone.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
     )
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Search by meaning, not words
-
-    `KNN 3` returns the three articles whose embeddings sit closest to the question's, sorted by `vector_score`, a `COSINE` distance where lower is closer.
-    The first question shares no word with Finding your boot size, which still comes first, near 0.54.
-    Pick `Trailhead`, and all three rows sit far off, near 0.86. Resoling worn boots, the one article that names the boot line, is only third, so an exact name is a job for the `TEXT` fields.
-    Pick the typo, and Restoring waterproofing comes first, near 0.52, although no article contains the misspelled word.
-    Every search below sends the same clauses: `RETURN` four fields, so the embedding never comes back, `SORTBY vector_score`, and `PARAMS` with the question's vector.
-    The reply is the match count, then each key and its fields, and the accordion under each table shows it as Redis sent it.
-    """),
-            rss_meaning_pick,
-        ]
+            _md_intro,
+            _key_idea,
+            _md_command,
+            mo.accordion({"General syntax and docs": _md_syntax}),
+            _try_it,
+            rs_meaning_pick,
+        ],
+        gap=0.75,
     )
-    return (rss_meaning_pick,)
+    return rs_idx_state, rs_meaning_pick
 
 
 @app.cell
-def rs_meaning(
+def rs_3a_meaning(
+    EMBEDDING_MODEL,
     REDIS_CLIENT,
+    RS_IDX_NAME,
+    convert_to_embedding,
+    log,
     mo,
-    rss_index_name,
-    rss_index_state,
-    rss_meaning_pick,
+    rs_idx_state,
+    rs_meaning_pick,
     rss_table,
-    rss_vector,
     shlex,
 ):
-    # KNN 3 with no filter (*): the three articles nearest the question in meaning.
-    # The command is written the way redis-cli takes it, and shlex.split keeps the quoted query one argument.
-    # RETURN brings back four fields and never the 1024-byte embedding. SORTBY vector_score is ascending, so the closest article comes first.
-    # DIALECT 2 is the query dialect that reads PARAMS. The question's 1024 bytes go last, as the value after PARAMS 2 vector.
-    mo.stop(rss_index_state is None, mo.md("_No index yet. Select Load at the top of this column._"))
-    _command = f"""
-    FT.SEARCH {rss_index_name} "*=>[KNN 3 @embedding $vector AS vector_score]"
-        RETURN 4 title category year vector_score
-        SORTBY vector_score
-        DIALECT 2
-        PARAMS 2 vector
+    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
+
+    log(f"Converting '{rs_meaning_pick.value}' to embedding", level="info")
+    _embedding = convert_to_embedding(model=EMBEDDING_MODEL, content=rs_meaning_pick.value)
+    log(f"Converted! ({len(_embedding)} bytes)", level="info")
+
+    _query = "(*)=>[KNN 3 @embedding $vector AS vector_score]"
+    _stmt = f"""
+    FT.SEARCH {RS_IDX_NAME} "{_query}"
+         RETURN  4  title category year vector_score
+         SORTBY     vector_score
+         DIALECT 2
+         PARAMS  2  vector
     """
-    _reply = REDIS_CLIENT.execute_command(*shlex.split(_command), rss_vector(rss_meaning_pick.value))
-    rss_table(_reply)
+    _ = shlex.split(_stmt)
+    _reply = REDIS_CLIENT.execute_command(*_, _embedding)
+
+    rss_table(_reply, query=_stmt, source_text=rs_meaning_pick.value)
     return
 
 
 @app.cell(hide_code=True)
-def rs_floor_md(mo):
-    rss_floor_slider = mo.ui.slider(start=0.0, stop=1.0, step=0.05, value=0.4, show_value=True, debounce=True, label="Similarity floor")
+def rs_3b_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
+    rs_floor_slider = mo.ui.slider(
+        start=0.0,
+        stop=1.0,
+        step=0.05,
+        value=0.4,
+        show_value=True,
+        debounce=True,
+        label="Similarity floor (cosine similarity)",
+    )
+
+    _md_intro = mo.md(
+        textwrap.dedent(
+            """
+            ### 3b. Set a similarity floor with `VECTOR_RANGE`
+
+            `KNN` always returns *k* articles, so it can never tell you that nothing matches. [`VECTOR_RANGE`](https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/) asks a different question: instead of "the 3 closest articles", it asks for "every article within this distance". The answer can be **no articles at all**.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                An empty reply tells the app it has nothing relevant, so it can say so, ask a follow-up question, or hand off to a person, instead of presenting a weak match as the answer. LangCache and Agent Memory, in later columns, work the same way: when nothing clears their `similarityThreshold`, the reply is empty.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea: an empty reply is an answer",
+    )
+
+    _md_command = mo.md(
+        textwrap.dedent(
+            f"""
+            > Among all articles, find up to 5 semantic matches within 0.60 cosine distance of the user's question.
+
+            ```bash
+            FT.SEARCH {RS_IDX_NAME} "@embedding:[VECTOR_RANGE $radius $vector]=>{{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}}"
+                 RETURN  4  title category year vector_score
+                 SORTBY     vector_score
+                 LIMIT   0  5
+                 DIALECT 2
+                 PARAMS  4  radius  0.60  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+            ```
+
+            What's new since 3a:
+
+            - `@embedding:[VECTOR_RANGE $radius $vector]` keeps every article whose `embedding` is within `$radius` of `$vector`. It's a filter on its own, so it needs no `(*)=>` in front.
+            - `=>{{...}}` sets options for that range. `$YIELD_DISTANCE_AS` names the distance, as `AS` did in 3a. `$EPSILON` is a search-accuracy setting, explained below.
+            - `LIMIT 0 5` skips no hits and returns at most **5**.
+            - `PARAMS 4` counts four items now, because there are two parameters: `radius` with its value, and `vector` with the question's bytes.
+            """
+        ).strip()
+    )
+
+    _floor_vs_radius = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                The slider is a **similarity floor**, where higher is stricter. Redis wants a **distance radius**, where lower is stricter. For cosine, distance is 1 − similarity, so the notebook sends `radius = 1 − floor`: a floor of **0.40** becomes a radius of **0.60**.
+                """
+            ).strip()
+        ),
+        kind="neutral",
+        title="Similarity floor vs. distance radius",
+    )
+
+    _md_epsilon = mo.md(
+        textwrap.dedent(
+            """
+            The `HNSW` index from step 1 finds neighbors by hopping through a graph instead of comparing the question with every article. That's fast, but a range search can stop early and miss a match near the edge. `$EPSILON` keeps it exploring candidates up to `radius × (1 + EPSILON)` away; the default is `0.01`. It doesn't loosen the rule: only articles within `$radius` come back.
+
+            It matters even with 36 articles. With the default, a floor of 0.40 returns nothing for *trail shoes feel cramped*, although **Finding your boot size** sits at a distance of about 0.54. With `0.5`, Redis finds it.
+            """
+        ).strip()
+    )
+
+    _md_syntax = mo.md(
+        textwrap.dedent(
+            """
+            [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/) with a `VECTOR_RANGE` query:
+
+            ```bash
+            FT.SEARCH <index> "@<vector field>:[VECTOR_RANGE $<radius> $<vector>]=>{$YIELD_DISTANCE_AS: <score name>}"
+              RETURN <count> <field> [<field> ...]
+              SORTBY <field>
+              LIMIT <offset> <count>
+              DIALECT 2
+              PARAMS <nargs> <name> <value> [<name> <value> ...]
+            ```
+
+            Other metrics, `L2` and `IP`, use the same `$radius` on a different distance scale. See [vector field options](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/).
+            """
+        ).strip()
+    )
+
+    _try_it = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                The question still comes from the dropdown in 3a.
+
+                - With *trail shoes feel cramped*, the default floor of 0.40 lets one article through: **Finding your boot size**, at a distance of about 0.54. Raise the floor to 0.50 and the reply is empty.
+                - Switch the dropdown to *Trailhead*. The reply is empty at the default floor, while `KNN 3` in 3a still returned three articles.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Set a similarity floor, and an empty reply is an answer
-
-    `VECTOR_RANGE` returns only the articles within `$radius` of the question, a `COSINE` distance of 1 minus the floor, so its reply can be empty.
-    At 0.40, Finding your boot size is inside the radius, near 0.54. Raise the floor to 0.50 and nothing is, while `KNN 3` returns three for any question.
-    LangCache and Agent Memory send the same empty reply when nothing clears their `similarityThreshold`.
-    Below 0.20, more than five articles qualify, and `LIMIT 0 5` shows only the closest five.
-    """),
-            rss_floor_slider,
-        ]
+            _md_intro,
+            _key_idea,
+            _md_command,
+            _floor_vs_radius,
+            mo.accordion(
+                {
+                    "What EPSILON does": _md_epsilon,
+                    "General syntax and docs": _md_syntax,
+                }
+            ),
+            _try_it,
+            rs_floor_slider,
+        ],
+        gap=0.75,
     )
-    return (rss_floor_slider,)
+    return (rs_floor_slider,)
 
 
 @app.cell
-def rs_floor(
+def rs_3b_meaning(
+    EMBEDDING_MODEL,
     REDIS_CLIENT,
+    RS_IDX_NAME,
+    convert_to_embedding,
+    log,
     mo,
-    rss_floor_slider,
-    rss_index_name,
-    rss_index_state,
+    rs_floor_slider,
+    rs_idx_state,
+    rs_meaning_pick,
     rss_table,
-    rss_vector,
     shlex,
 ):
-    # VECTOR_RANGE: the articles within $radius of the question, closest first. A floor of 0.40 is a radius of 0.60.
-    # A range clause is itself the filter, so it needs no *=> in front, and $YIELD_DISTANCE_AS names the distance, as AS does in KNN.
-    # HNSW range search is approximate, and $EPSILON 0.5 keeps it from stopping before it reaches an article inside the radius.
-    # LIMIT 0 5 returns at most five rows, while the match count at the head of the reply is not capped.
-    # The query sits on its own line, so its braces stay single inside the f-string.
-    mo.stop(rss_index_state is None, mo.md("_No index yet. Select Load at the top of this column._"))
+    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
+
+    log(f"Converting '{rs_meaning_pick.value}' to embedding", level="info")
+    _embedding = convert_to_embedding(model=EMBEDDING_MODEL, content=rs_meaning_pick.value)
+    log(f"Converted! ({len(_embedding)} bytes)", level="info")
+
+    _radii = round(1 - rs_floor_slider.value, 2)
     _query = "@embedding:[VECTOR_RANGE $radius $vector]=>{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}"
-    _command = f"""
-    FT.SEARCH {rss_index_name} "{_query}"
-        RETURN 4 title category year vector_score
-        SORTBY vector_score
-        LIMIT 0 5
-        DIALECT 2
-        PARAMS 4 radius {round(1 - rss_floor_slider.value, 2)} vector
+    _stmt = f"""
+    FT.SEARCH {RS_IDX_NAME} "{_query}"
+         RETURN  4  title category year vector_score
+         SORTBY     vector_score
+         LIMIT   0  5
+         DIALECT 2
+         PARAMS  4  radius  {_radii}  vector
     """
-    _reply = REDIS_CLIENT.execute_command(*shlex.split(_command), rss_vector("trail shoes feel cramped"))
-    rss_table(_reply)
+    _ = shlex.split(_stmt)
+    _reply = REDIS_CLIENT.execute_command(*_, _embedding)
+
+    rss_table(
+        _reply,
+        query=_stmt,
+        source_text=rs_meaning_pick.value,
+        params={
+            "Similarity floor": rs_floor_slider.value,
+            "$radius": _radii,
+        },
+    )
     return
 
 
 @app.cell(hide_code=True)
-def rs_filter_md(mo):
-    rss_year_slider = mo.ui.slider(start=2022, stop=2026, step=1, value=2022, show_value=True, debounce=True, label="Year floor")
+def rs_3c_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
+    rss_year_slider = mo.ui.slider(
+        start=2022,
+        stop=2026,
+        step=1,
+        value=2022,
+        show_value=True,
+        debounce=True,
+        label="Year floor",
+    )
+
+    _md_intro = mo.md(
+        textwrap.dedent(
+            """
+            ### 3c. Filter inside the vector search, not after it
+
+            Real searches mix meaning with plain rules: only recent articles, only one category, only one customer's data. Step 1 declared `year` as a `NUMERIC` field, so Redis can apply a year rule itself. This step runs the same search two ways and compares **where** the rule is applied.
+            """
+        ).strip()
+    )
+
+    _scenario = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                - **Question:** *Where is my parcel?*, embedded into `$vector`.
+                - **Goal:** the **5** articles closest in meaning, with `KNN 5`.
+                - **Rule:** only articles from the **year floor** on. Set it with the slider below.
+                """
+            ).strip()
+        ),
+        kind="neutral",
+        title="The same on both sides",
+    )
+
+    _md_command = mo.md(
+        textwrap.dedent(
+            f"""
+            **Post-filter**, the left results:
+
+            > Among all articles, find the 5 closest semantic matches to the user's question.
+
+            ```bash
+            FT.SEARCH {RS_IDX_NAME} "*=>[KNN 5 @embedding $vector AS vector_score]"
+                 RETURN  4  title category year vector_score
+                 SORTBY     vector_score
+                 DIALECT 2
+                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+            ```
+
+            The notebook then drops any article older than the year floor.
+
+            **Pre-filter**, the right results:
+
+            > Among articles from 2022 and later, find the 5 closest semantic matches to the user's question.
+
+            ```bash
+            FT.SEARCH {RS_IDX_NAME} "(@year:[2022 +inf])=>[KNN 5 @embedding $vector AS vector_score]"
+                 RETURN  4  title category year vector_score
+                 SORTBY     vector_score
+                 DIALECT 2
+                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+            ```
+
+            - `@year:[2022 +inf]` is a [numeric range](https://redis.io/docs/latest/develop/ai/search-and-query/query/range/) on the `year` field: 2022 and later, with no upper limit. The searches below put the slider's floor in place of 2022.
+            - `*` without parentheses means the same as `(*)` in 3a. The rest works as in 3a, with `KNN 5` in place of `KNN 3`.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Whatever sits left of `=>` decides which articles may compete, and the KNN on the right ranks only those. Filter **after** the KNN and you can end up with fewer than 5 results: older articles took slots that newer ones never got a chance at. Filter **before** it and Redis returns 5 whenever at least 5 articles pass the rule.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea: filter first, then rank",
+    )
+
+    _md_more_filters = mo.md(
+        textwrap.dedent(
+            """
+            - `@year:[2024 2025]` is a closed range: 2024 through 2025.
+            - `@category:{shipping}` matches a `TAG`. `@category:{shipping | returns}` matches either one.
+            - `@title:boots` is a full-text match on a `TEXT` field.
+            - `(@category:{shipping} @year:[2025 +inf])` needs both, because a space means AND.
+
+            A rule can only use fields the index declares in step 1. See [combined queries](https://redis.io/docs/latest/develop/ai/search-and-query/query/combined/).
+            """
+        ).strip()
+    )
+
+    _md_agent = mo.md(
+        textwrap.dedent(
+            """
+            Agent Memory sends a `filter` on `ownerId` with every search, and it's applied inside the vector search, like the right-hand query. Filtering afterward would let other customers' memories fill the *k* slots and leave this customer with fewer results, or none.
+            """
+        ).strip()
+    )
+
+    _try_it = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Move the year floor and compare the two sides.
+
+                - At **2022** and **2023**, both sides show the same five articles.
+                - At **2025**, the post-filter keeps 3 of its 5. The pre-filter still returns five, adding **Free shipping threshold** and **Backordered and out of stock items**.
+                - At **2026**, the post-filter keeps one. The pre-filter still fills all five slots, including weak matches like **Choosing a pack size by torso length**, because KNN returns *k* whenever enough articles pass.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Filter inside the vector search, not after it
-
-    The parcel question runs with a year floor two ways. On the left, Redis returns the five nearest articles, and the app drops the older ones.
-    On the right, the filter sits before `=>`, so Redis finds the five nearest among the articles that pass.
-    Move the year floor to 2025. The left keeps three of five, and the right still returns five.
-    Agent Memory's `filter` on `ownerId` runs inside its search the same way.
-    """),
+            _md_intro,
+            _scenario,
+            _md_command,
+            _key_idea,
+            mo.accordion(
+                {
+                    "Other rules you can put before =>": _md_more_filters,
+                    "Why it matters for Agent Memory": _md_agent,
+                }
+            ),
+            _try_it,
             rss_year_slider,
-        ]
+        ],
+        gap=0.75,
     )
     return (rss_year_slider,)
 
 
 @app.cell
-def rs_filter(
+def rs_3c_meaning(
+    EMBEDDING_MODEL,
     REDIS_CLIENT,
+    RS_IDX_NAME,
+    convert_to_embedding,
     mo,
-    rss_index_name,
-    rss_index_state,
+    rs_idx_state,
     rss_table,
-    rss_vector,
     rss_year_slider,
     shlex,
 ):
-    # Left, the filter in the app: Redis returns the five nearest articles, and Python drops the older ones.
-    # Right, the filter in the query: (@year:[<floor> +inf]) before => runs inside the vector search, so KNN 5 looks only at the articles that pass.
-    mo.stop(rss_index_state is None, mo.md("_No index yet. Select Load at the top of this column._"))
-    _year, _vector = rss_year_slider.value, rss_vector("Where is my parcel?")
+    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
+
+    _year = rss_year_slider.value
+    _vector = convert_to_embedding(model=EMBEDDING_MODEL, content="Where is my parcel?")
+
     _unfiltered = f"""
-    FT.SEARCH {rss_index_name} "*=>[KNN 5 @embedding $vector AS vector_score]"
-        RETURN 4 title category year vector_score
-        SORTBY vector_score
-        DIALECT 2
-        PARAMS 2 vector
+    FT.SEARCH {RS_IDX_NAME}
+         "*=>[KNN 5 @embedding $vector AS vector_score]"
+         RETURN  4  title category year vector_score
+         SORTBY     vector_score
+         DIALECT 2
+         PARAMS  2  vector
     """
     _filtered = f"""
-    FT.SEARCH {rss_index_name} "(@year:[{_year} +inf])=>[KNN 5 @embedding $vector AS vector_score]"
-        RETURN 4 title category year vector_score
-        SORTBY vector_score
-        DIALECT 2
-        PARAMS 2 vector
+    FT.SEARCH {RS_IDX_NAME} 
+         "(@year:[{_year} +inf])=>[KNN 5 @embedding $vector AS vector_score]"
+         RETURN  4  title category year vector_score
+         SORTBY     vector_score
+         DIALECT 2
+         PARAMS  2  vector
     """
     _top5 = REDIS_CLIENT.execute_command(*shlex.split(_unfiltered), _vector)
     _knn5 = REDIS_CLIENT.execute_command(*shlex.split(_filtered), _vector)
-    mo.hstack([rss_table(_top5, keep=lambda row: int(row["year"]) >= _year), rss_table(_knn5)], widths="equal", gap=1.5)
+
+    mo.hstack(
+        [
+            mo.vstack(
+                [
+                    mo.md("**Post-filter** — KNN on all articles, then the app drops older years"),
+                    rss_table(
+                        _top5,
+                        query=_unfiltered,
+                        source_text="Where is my parcel?",
+                        params={"Year floor (app filter)": _year},
+                        keep=lambda row: int(row["year"]) >= _year,
+                    ),
+                ],
+                gap=0.5,
+            ),
+            mo.vstack(
+                [
+                    mo.md("**Pre-filter** — `@year` range before `=>`, then KNN 5"),
+                    rss_table(
+                        _knn5,
+                        query=_filtered,
+                        source_text="Where is my parcel?",
+                        params={"@year floor": _year},
+                    ),
+                ],
+                gap=0.5,
+            ),
+        ],
+        widths="equal",
+        gap=1.5,
+    )
     return
 
 
 @app.cell(hide_code=True)
-def rs_write_md(
-    mo,
-    rss_add_button,
-    rss_extra_article: "Article",
-    rss_hset_lines,
-    rss_index_state,
-):
-    _docs = "no index yet" if rss_index_state is None else f"`num_docs` {int(rss_index_state['num_docs'])}"
+def rs_build_md(mo, textwrap):
+    _hidden = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Two helper functions run behind the steps above: `convert_to_embedding` turns each question into the bytes Redis searches, and `rss_table` draws each result. Their cells are at the bottom of this column with the code collapsed. Expand them in `marimo edit`, or pick **Show code** from the app menu in `marimo run`.
+                """
+            ).strip()
+        ),
+        kind="neutral",
+        title="Hidden: the helper code",
+    )
+
+    _md_commands = mo.md(
+        textwrap.dedent(
+            """
+            Each step's code is in the cell right under its explanation. `FT.CREATE` and every `FT.SEARCH` there are written as text, the way `redis-cli` takes them. `shlex.split` turns that text into the arguments `REDIS_CLIENT.execute_command` sends. A search also needs the question's embedding as raw bytes: `convert_to_embedding`, in the `rs_connect` cell, makes them by running the model on this machine.
+            """
+        ).strip()
+    )
+
+    _md_results = mo.md(
+        textwrap.dedent(
+            """
+            `rss_table`, in the `rs_render` cell, turns each `FT.SEARCH` reply into what you see under each search: the inputs, the command, a hit count, a table and the raw reply. It reads the reply with helpers from `cairn_support.redis_search_replies`.
+            """
+        ).strip()
+    )
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Search a new article as soon as it is written
-
-    Add one more article writes a 37th hash under the prefix with the same `HSET` and `EXPIRE`, and Redis indexes it as part of that write.
-    Before it, the gift question's nearest article is Sending a gift with a message, near 0.61. After it, the new article comes first, near 0.26.
-    """),
-            mo.hstack([rss_add_button, mo.md(f"`FT.INFO` reads {_docs}.")], justify="start", align="center", gap=1),
-            mo.md(f"**What Add sends**\n\n```text\n{rss_hset_lines(rss_extra_article)}\n```"),
-        ]
+            _hidden,
+            mo.accordion(
+                {
+                    "How commands reach Redis": _md_commands,
+                    "How results are drawn": _md_results,
+                }
+            ),
+        ],
+        gap=0.75,
     )
     return
 
 
-@app.cell
-def rs_write(
-    REDIS_CLIENT,
-    mo,
-    rss_index_name,
-    rss_index_state,
-    rss_table,
-    rss_vector,
-    shlex,
-):
-    # KNN 3 for the gift question. Select Add one more article above, and this reruns with the new hash first.
-    mo.stop(rss_index_state is None, mo.md("_No index yet. Select Load at the top of this column._"))
-    _command = f"""
-    FT.SEARCH {rss_index_name} "*=>[KNN 3 @embedding $vector AS vector_score]"
-        RETURN 4 title category year vector_score
-        SORTBY vector_score
-        DIALECT 2
-        PARAMS 2 vector
-    """
-    _reply = REDIS_CLIENT.execute_command(*shlex.split(_command), rss_vector("Can I return a gift I got in December?"))
-    rss_table(_reply)
-    return
+@app.cell(hide_code=True)
+def rs_connect(embed_texts):
+    def convert_to_embedding(model, content: str) -> bytes:
+        """Convert text to an embedding vector."""
+        return embed_texts(model, [content])[0].astype("float32").tobytes()
+
+    return (convert_to_embedding,)
 
 
 @app.cell(hide_code=True)
-def rs_build_md(mo):
-    mo.md(r"""
-    ## The Redis Search code: connect, index
-
-    One cell per step, with the code visible in `marimo edit`. In `marimo run`, pick **Show code** from the app menu.
-    Each command in the four searches above and the index cell below is text, written the way `redis-cli` takes it.
-    `shlex.split` turns that text into the arguments `REDIS_CLIENT.execute_command` sends.
-    `rss_vector` runs the model on this machine, and Load, Add one more article, and Clean up call the index functions.
-    """)
-    return
-
-
-@app.cell
-def rs_connect(KEY_PREFIX):
-    # Connect. The names this column owns, and the model that embeds on this machine. Every Redis command below goes through REDIS_CLIENT.
-    import shlex  # splits a command written the way redis-cli takes it into the arguments Redis receives
-
-    from cairn_support.embedder import embed_texts, load_embedding_model
-    from cairn_support.sample_data import HELP_ARTICLES
-    from cairn_support.types import Article
-
-
-    rss_key_prefix = KEY_PREFIX + "help:"  # every key this column writes: cairn:<run>:help:<id>
-    rss_index_name = "idx:" + KEY_PREFIX + "help"  # the index over that prefix: idx:cairn:<run>:help
-    rss_model = load_embedding_model()  # potion-base-8M from the Hugging Face cache, about 30 MB the first time
-    rss_dim = rss_model.dim  # 256, the DIM the index declares below
-
-
-    def rss_vector(text: str) -> bytes:
-        """One text as the bytes Redis stores in the `embedding` field and searches with: DIM float32 values, 1024 bytes for 256 dimensions.
-        Articles and questions go through the same model. A blob of any other length is not indexed, and `hash_indexing_failures` in FT.INFO counts it."""
-        return embed_texts(rss_model, [text])[0].astype("float32").tobytes()
-
-    return (
-        Article,
-        HELP_ARTICLES,
-        rss_dim,
-        rss_index_name,
-        rss_key_prefix,
-        rss_vector,
-        shlex,
+def rs_render(mo, textwrap):
+    from cairn_support.redis_search_replies import (
+        format_ft_search_reply,
+        ft_search_inputs_markdown,
+        ft_search_markdown_table,
+        ft_search_result_summary,
+        ft_search_rows,
     )
 
 
-@app.cell
-def rs_index_fns(
-    Article,
-    HELP_ARTICLES,
-    REDIS_CLIENT,
-    redis,
-    rss_dim,
-    rss_index_name,
-    rss_key_prefix,
-    rss_vector,
-    shlex,
-    time,
-):
-    # Index. Create the index once, write articles under its prefix, read what it holds, and drop it. Each command is written the way redis-cli takes it.
-    # FT.CREATE: the index follows every hash under the prefix. A title match counts double in full-text scoring,
-    # category is a TAG for exact match on one category or several, and year is a NUMERIC field for ranges such as @year:[2024 +inf].
-    # The vector field is HNSW, and the 6 after it counts the three name and value pairs that follow.
-    rss_create_command = f"""
-    FT.CREATE {rss_index_name} ON HASH PREFIX 1 {rss_key_prefix}
-        SCHEMA
-            title TEXT WEIGHT 2.0
-            body TEXT
-            category TAG
-            year NUMERIC SORTABLE
-            embedding VECTOR HNSW 6 TYPE FLOAT32 DIM {rss_dim} DISTANCE_METRIC COSINE
-    """
-    rss_ttl_seconds = 3600  # every key this column writes expires on its own, and Clean up only shortens that
-    rss_extra_article: Article = {  # the 37th article. Add one more article writes it, and the gift question then finds it first
-        "id": "reader",
-        "title": "Returning a gift bought in the holidays",
-        "body": (
-            "Gifts bought between November 1 and December 31 can go back until January 31 with a gift receipt "
-            "or the order number. The refund goes to the buyer's card, or to store credit for the recipient."
-        ),
-        "category": "returns",
-        "year": 2026,
-    }
-
-
-    def rss_create_index() -> bool:
-        """FT.CREATE, once. Returns False when the index already exists, which a second Load treats as fine (principle 1)."""
-        try:
-            REDIS_CLIENT.execute_command(*shlex.split(rss_create_command))
-        except redis.ResponseError as e:
-            if "already exists" not in str(e).lower():
-                raise
-            return False
-        return True
-
-
-    def rss_mapping(article: Article) -> dict:
-        """The hash fields of one article. Four strings and numbers the index reads as TEXT, TAG, and NUMERIC, plus the vector as 1024 bytes."""
-        return {
-            "title": article["title"],
-            "body": article["body"],
-            "category": article["category"],
-            "year": int(article["year"]),
-            "embedding": rss_vector(f"{article['title']}. {article['body']}"),
-        }
-
-
-    def rss_write_articles(articles: list[Article]) -> int:
-        """HSET plus EXPIRE for each article, 12 per pipeline. Each HSET under the prefix is indexed as part of the write (principle 1).
-        Load passes the 36 help articles, and Add one more article passes one."""
-        for start in range(0, len(articles), 12):
-            pipe = REDIS_CLIENT.pipeline(transaction=False)  # a plain pipeline, not MULTI/EXEC
-            for article in articles[start:start + 12]:
-                key = rss_key_prefix + article["id"]
-                pipe.hset(key, mapping=rss_mapping(article))
-                pipe.expire(key, rss_ttl_seconds)
-            pipe.execute()
-            time.sleep(0.25)  # 24 commands per round trip, paced under the free tier's 100 ops per second
-        return len(articles)
-
-
-    def rss_index_info() -> dict | None:
-        """FT.INFO as a dict, or None when there is no index. Under RESP2 the reply is a flat list: name, value, name, value."""
-        try:
-            reply = REDIS_CLIENT.execute_command("FT.INFO", rss_index_name)
-        except redis.ResponseError as e:
-            if "not found" not in str(e).lower():
-                raise
-            return None
-        return dict(zip(reply[::2], reply[1::2]))
-
-
-    def rss_drop() -> tuple[bool, int]:
-        """FT.DROPINDEX without DD, then UNLINK the 36 articles and the extra one by name. Returns whether the index was there and how many keys went."""
-        try:
-            REDIS_CLIENT.execute_command("FT.DROPINDEX", rss_index_name)  # no DD: the documents stay, and the next line removes only the ones this column wrote
-            dropped = True
-        except redis.ResponseError as e:
-            if "not found" not in str(e).lower():
-                raise
-            dropped = False
-        keys = [rss_key_prefix + a["id"] for a in [*HELP_ARTICLES, rss_extra_article]]
-        return dropped, REDIS_CLIENT.unlink(*keys)
-
-    return (
-        rss_create_command,
-        rss_create_index,
-        rss_drop,
-        rss_extra_article,
-        rss_index_info,
-        rss_mapping,
-        rss_ttl_seconds,
-        rss_write_articles,
-    )
-
-
-@app.cell(hide_code=True)
-def rs_machinery_md(mo):
-    mo.md(r"""
-    ## Notebook plumbing: renderers
-
-    One hidden cell follows: the renderers for the `FT.INFO` table, the commands Load and Add send, and each search reply.
-    Read `rs_render` in `iris_basics.py`, or expand it in `marimo edit`.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def rs_render(
-    mo,
-    rss_create_command,
-    rss_index_name,
-    rss_key_prefix,
-    rss_mapping,
-    rss_ttl_seconds,
-    shlex,
-):
-    from cairn_support.formatting import redis_cli  # prints a command the way redis-cli takes it
-
-
-    def rss_table(reply: list, keep=None) -> mo.Html:
-        """An FT.SEARCH reply as a count, a table, and the reply itself. Under RESP2 the reply is the match count, then each key followed by a flat list of field and value.
+    def rss_table(
+        reply: list | dict,
+        *,
+        query: str,
+        source_text: str,
+        params: dict | None = None,
+        keep=None,
+    ) -> mo.Html:
+        """An FT.SEARCH reply as the command, a count, a table, and the raw reply. RESP3 is a map with ``total_results`` and ``results``; RESP2 is a flat list.
         `keep` is a filter the app applies to the rows after Redis answers."""
-        rows = [{"key": key, **dict(zip(fields[::2], fields[1::2]))} for key, fields in zip(reply[1::2], reply[2::2])]
-        kept = [row for row in rows if keep(row)] if keep else rows
-        count = f"{reply[0]} matched, {len(rows)} returned" + (f", {len(kept)} kept by the filter in the app" if keep else "")
-        lines = ["| title | category | year | vector_score |", "|---|---|---|---|"]
-        lines += [f"| {row['title'].replace('|', '&#124;')} | {row['category']} | {row['year']} | {float(row['vector_score']):.4f} |" for row in kept]
-        raw = [f"1) (integer) {reply[0]}"]
-        for n, item in enumerate(reply[1:], start=2):  # even positions are keys, odd positions their field lists
-            raw.append(f'{n}) "{item}"' if n % 2 == 0 else f"{n}) " + " ".join(f'"{value}"' for value in item))
+        total, rows = ft_search_rows(reply)
+        kept = [row for row in rows if keep(row)] if callable(keep) else rows
+        summary = ft_search_result_summary(total, len(rows), len(kept) if callable(keep) else None)
+        table = ft_search_markdown_table(kept) if kept else None
+        command = textwrap.dedent(query).strip()
         return mo.vstack(
             [
-                mo.md(f"**{count}**"),
-                mo.md("\n".join(lines) if kept else "_No article._"),
-                mo.accordion({"The reply as Redis sent it": mo.md("```text\n" + "\n".join(raw) + "\n```")}),
-            ]
+                mo.md(ft_search_inputs_markdown(source_text, params)),
+                mo.md(f"```bash\n{command}\n```"),
+                mo.md(f"**{summary}**"),
+                mo.md(table if table else "_No article._"),
+                mo.accordion(
+                    {"The reply as Redis sent it": mo.md("```text\n" + format_ft_search_reply(reply) + "\n```")}
+                ),
+            ],
+            gap=0.5,
         )
 
-
-    def rss_index_table(info: dict | None) -> mo.Html:
-        """FT.INFO's two numbers for this index, or the note that there is no index."""
-        if info is None:
-            return mo.md(f"**`{rss_index_name}`**, no index. Select Load to create it and write the 36 articles.")
-        return mo.md(
-            "\n".join(
-                [
-                    "| index | num_docs | hash_indexing_failures |",
-                    "|---|---|---|",
-                    f"| `{rss_index_name}` | {int(info['num_docs'])} | {int(info['hash_indexing_failures'])} |",
-                ]
-            )
-        )
-
-
-    def rss_create_line() -> str:
-        """FT.CREATE as Redis receives it, split from the same text rss_create_index sends."""
-        return redis_cli(shlex.split(rss_create_command))
-
-
-    def rss_hset_lines(article: dict) -> str:
-        """The HSET and EXPIRE for one article, the vector shown as `<1024 bytes>` and a long body cut."""
-        key = rss_key_prefix + article["id"]
-        mapping = rss_mapping(article)
-        return "\n".join(
-            [
-                redis_cli(["HSET", key, *[token for pair in mapping.items() for token in pair]]),
-                redis_cli(["EXPIRE", key, rss_ttl_seconds]),
-            ]
-        )
-
-    return rss_create_line, rss_hset_lines, rss_index_table, rss_table
+    return (rss_table,)
 
 
 @app.cell(column=2, hide_code=True)
@@ -1649,17 +2148,18 @@ def cr_build_md(mo):
 
 
 @app.cell
-def cr_model_fns(KEY_PREFIX):
+def cr_model_fns(CAIRN_SCOPE):
     # Model. Three classes, each field's index kind, and the data_model they export. Sends nothing.
     from context_surfaces import ContextField, ContextModel, ContextRelationship, export_data_model
 
     from cairn_support.sample_data import SHOP_RECORDS
 
+    _redis_prefix = f"cairn:{CAIRN_SCOPE}:"
 
     class Customer(ContextModel):
         """A Cairn Outfitters shopper."""
 
-        __redis_key_template__ = KEY_PREFIX + "customer:{customer_id}"  # the text before the first brace becomes the index prefix
+        __redis_key_template__ = _redis_prefix + "customer:{customer_id}"  # the text before the first brace becomes the index prefix
 
         customer_id: str = ContextField(description="Customer id, such as C001", is_key_component=True)  # get_customer_by_id takes this
         name: str = ContextField(description="Full name", index="text")  # text: search_customer_by_text
@@ -1672,7 +2172,7 @@ def cr_model_fns(KEY_PREFIX):
     class Product(ContextModel):
         """An item Cairn Outfitters sells."""
 
-        __redis_key_template__ = KEY_PREFIX + "product:{sku}"
+        __redis_key_template__ = _redis_prefix + "product:{sku}"
 
         sku: str = ContextField(description="Stock keeping unit, such as P100", is_key_component=True)
         title: str = ContextField(description="Product title", index="text")
@@ -1683,7 +2183,7 @@ def cr_model_fns(KEY_PREFIX):
     class Order(ContextModel):
         """One order: a customer, a product, and a status. No text field, so no search_order_by_text."""
 
-        __redis_key_template__ = KEY_PREFIX + "order:{order_id}"
+        __redis_key_template__ = _redis_prefix + "order:{order_id}"
 
         order_id: str = ContextField(description="Order id, such as O1001", is_key_component=True)
         customer_id: str = ContextField(description="The buyer's customer id", index="tag")
@@ -1769,7 +2269,7 @@ def cr_connect(Reply, json_request, json_session, os, redis):
 
 @app.cell
 def cr_admin_fns(
-    RUN_TAG,
+    CAIRN_SCOPE,
     SHOP_RECORDS,
     crs_admin,
     crs_connection_config,
@@ -1780,7 +2280,7 @@ def cr_admin_fns(
     os,
 ):
     # Surface. The admin calls: the create request, create the surface, make an agent key and find its mcp_url, import the records, read, list by name, and delete.
-    crs_surface_name = "cairn-" + RUN_TAG
+    crs_surface_name = "cairn-" + CAIRN_SCOPE
 
 
     def crs_create_body() -> dict:
@@ -1789,7 +2289,7 @@ def cr_admin_fns(
         return {
             "name": crs_surface_name,
             "description": "Made by the Redis Iris basics notebook. Safe to delete.",
-            "metadata": {"created_by": "iris-basics-notebook", "run": RUN_TAG},
+            "metadata": {"created_by": "iris-basics-notebook", "scope": CAIRN_SCOPE},
             "data_model": crs_data_model,
             "data_source": {"type": "redis", "connection_config": crs_connection_config(os.environ["REDIS_URL"])},
         }
@@ -1875,7 +2375,7 @@ def cr_redis_fns(REDIS_CLIENT, crs_entity_prefixes, crs_record_keys, redis):
             except redis.ResponseError:  # dropped between the two commands
                 continue
             definition = info.get("index_definition", [])
-            if isinstance(definition, list):  # RESP2: a flat key-value list
+            if isinstance(definition, list):  # legacy flat key-value list from older wire shapes
                 definition = dict(zip(definition[::2], definition[1::2]))
             prefixes = list(definition.get("prefixes", []))
             if prefixes and all(prefix in crs_entity_prefixes for prefix in prefixes):
