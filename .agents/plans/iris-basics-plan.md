@@ -1,5 +1,7 @@
 # Plan: finish the Redis Iris basics notebook
 
+> **Superseded on 2026-10-16 by [iris-story-arc-plan.md](iris-story-arc-plan.md).** Kept for history only. Its rulings no longer apply; read the new plan instead.
+
 Last updated 2026-10-12. Read this file first in a new session. The notebook on disk and the live kernel are the source of truth, and this plan says what has been done, what is left, in what order, and how each step is checked. By Nick's request `.agents/` holds only this plan until Phase 6 adds one current-state doc per column. Everything that used to be here (the 2026-09-30 research briefs, the Agent Memory current-state doc and its archive, the four build specs, the ten build reports and reviews from 2026-10-08, the September plans, `staging/`, the 2026-09-30 conformance review, and a copy of the marimo-pair skill) was removed on 2026-10-09. Tracked files are in git history through commit `cb0bc0d`, and a full copy of the folder as it was is at `C:/Users/NickCooper/AppData/Local/Temp/iris-agents-backup-2026-10-09/`.
 
 ## Progress log
