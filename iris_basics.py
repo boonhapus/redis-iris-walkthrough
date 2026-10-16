@@ -814,7 +814,7 @@ def rs_3b_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
     return (rs_floor_slider,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def rs_3b_meaning(
     EMBEDDING_MODEL,
     REDIS_CLIENT,
@@ -999,7 +999,7 @@ def rs_3c_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
     return (rss_year_slider,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def rs_3c_meaning(
     EMBEDDING_MODEL,
     REDIS_CLIENT,
@@ -1167,60 +1167,135 @@ def rs_render(mo, textwrap):
 
 @app.cell(column=2, hide_code=True)
 def lc_title(mo):
-    mo.md(r"""
+    mo.md(f"""
     # Redis LangCache
 
-    Customers rarely ask the same question the same way twice, and an exact-match cache misses every rewording.
-    Redis LangCache embeds each prompt itself and matches it by meaning, so a reworded question can get a stored answer without an LLM call.
-    Select Seed to store five Cairn Outfitters gear-care answers, then ask Cairn support and set the threshold, strategy, and TTL to see three principles:
+    As Cairn Outfitters, you store gear-care answers in LangCache as entries, mapped like..
 
-    1. **Your app searches before the LLM and stores after it.** `POST /entries/search` answers 200 with `data: []` on a miss, so the app calls the LLM and sends `POST /entries`, which answers 201 with an `entryId`. Both carry one Bearer token, and the pane beside the chat shows each turn's search, its reply, and the store after a miss.
-    2. **The threshold trades wrong answers for misses.** A request's `similarityThreshold`, the same name the Agent Memory column tunes, is the floor on each entry's `similarity` and overrides the cache's default, 0.85 at creation. Move the slider and seven questions re-sort into hit, wrong answer, and miss, while `exact` in `searchStrategies` hits the same words regardless of case, at `similarity` 1.
-    3. **A cached answer lives until its time to live (TTL) runs out or your app deletes it.** A new cache's default TTL is no expiration, so the app sends `ttlMillis` with every `POST /entries` to cap how stale an answer gets. Pick 10 seconds and a new question misses, hits at once when repeated, then misses again, so Clean up's `DELETE /entries/{entryId}` reads 404 after its TTL.
+      `prompt → {{ response, entryId }}`
 
-    Embeddings: LangCache embeds inside the service, so this column sends text and never a vector. You pick the embedding provider and model in the console when you create the service: Redis's own provider, OpenAI with your key, or your own endpoint that speaks the OpenAI embeddings API.
-    `LLM_API_KEY` is the chat's key and plays no part in that choice.
-
-    Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, shown once at creation, plus `LLM_API_KEY`, which the chat needs on a miss.
-    The first two, the base URL and the `{cacheId}` in every path, are on the service's Connectivity page, and the third is the Bearer token.
-    Docs: [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
-    [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/),
-    [create a service](https://redis.io/docs/latest/operate/iris/langcache/create-service/),
-    [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/), and
-    [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
-
-    Each line reads source, target, and what passes between them:
-
-    ```text
-    App       -> LangCache        POST /entries/search: prompt, similarityThreshold, searchStrategies, maxResults 5
-    LangCache -> embedding model  the prompt, embedded by the model chosen at creation
-    LangCache -> your Redis       a vector search over the cache's index in the database you selected
-    LangCache -> App              200, data: [entries at or above the threshold, best first], or data: []
-    App       -> LLM              the question alone, only when data is empty
-    App       -> LangCache        POST /entries: prompt, response, ttlMillis, then 201 with an entryId
+    ```json
+    {{
+      "prompt": "How do I wash my down sleeping bag?",
+      "response": "Use a front-loading machine and a down-specific soap..",
+      "entryId": "01J..",
+      "ttlMillis": 900000
+    }}
     ```
+
+    [**Redis LangCache**](https://redis.io/docs/latest/develop/ai/context-engine/langcache/) stores those answers and matches a new question to them by meaning. Your app searches before the model. On a miss, it calls the model and stores the answer.
+
+    A reworded question can reuse a stored answer, with no second model call.
+
+    ---
+
+    ## We'll learn how to..
+
+    1. Store an answer with `POST /entries`.
+    2. Search with `POST /entries/search` before calling the model.
+    3. Set `similarityThreshold` and `ttlMillis`.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def lc_store_button(lcs_session, mo):
+def lc_store_button(lcs_session, mo, textwrap):
     _ = lcs_session  # the buttons appear once the session exists, so a press never runs ahead of the settings check
     lcs_seed_button = mo.ui.run_button(label="Seed")
     lcs_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
 
+    _heading = mo.md(
+        textwrap.dedent(
+            """
+            ### 1. Store an answer with `POST /entries`
+
+            Seed stores five gear-care answers; the table below is this kernel's ledger because entries cannot be listed.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                LangCache derives the `entryId` from the prompt, so a second Seed returns the same five ids and replaces each response and TTL. Each answer the chat stores on a miss joins the ledger.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea",
+    )
+
+    _request = mo.md(
+        textwrap.dedent(
+            """
+            ```text
+            POST /v1/caches/<LANGCACHE_CACHE_ID>/entries
+            Authorization: Bearer <LANGCACHE_API_KEY>
+            Content-Type: application/json
+
+            {"prompt": "How do I wash my down sleeping bag?", "response": "Use a front-loading machine and a down-specific soap, then dry it on low heat with clean tennis balls to break up the clumps.", "ttlMillis": 900000}
+            ```
+
+            Reading it piece by piece:
+
+            - `prompt` is the question that was answered.
+            - `response` is the stored gear-care answer.
+            - `ttlMillis` is how long the entry lives. Seed uses 900000 ms. A new cache's default TTL is no expiration, so the app sends `ttlMillis` every time.
+            - A 201 returns the `entryId`.
+            """
+        ).strip()
+    )
+
+    _buttons_note = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                **Seed** sends `POST /entries` for five answers. **Clean up** sends `DELETE /entries/{entryId}` for every id in the ledger. 204 is deleted. 404 means the TTL ran out first.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="What the buttons do",
+    )
+
+    _hops = mo.md(
+        textwrap.dedent(
+            """
+            Each line reads source, target, and what passes between them:
+
+            ```text
+            App       -> LangCache        POST /entries/search: prompt, similarityThreshold, searchStrategies, maxResults 5
+            LangCache -> embedding model  the model chosen when the service was created
+            LangCache -> your Redis       a vector search over the cache's index
+            LangCache -> App              200, data: [entries at or above the threshold, best first], or data: []
+            App       -> LLM              the question alone, only when data is empty
+            App       -> LangCache        POST /entries: prompt, response, ttlMillis, then 201 with an entryId
+            ```
+
+            LangCache embeds inside the service. This column sends text, never a vector. `LLM_API_KEY` is the chat key and is not the embedding provider. You pick that model when you create the service: Redis's own provider, OpenAI with your key, or your own endpoint that speaks the OpenAI embeddings API.
+
+            Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, plus `LLM_API_KEY` for a miss. The host and the cache id are on the service's Connectivity page, and the API key is the Bearer token.
+
+            Docs: [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
+            [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/),
+            [create a service](https://redis.io/docs/latest/operate/iris/langcache/create-service/),
+            [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/), and
+            [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
+            """
+        ).strip()
+    )
+
     mo.vstack(
         [
-            mo.md(r"""
-    ## Seed five gear-care answers and keep their ids
-
-    Seed stores five answers with `POST /entries`, each with `ttlMillis` 900000, and LangCache answers 201 with an `entryId` it derives from the prompt.
-    Entries cannot be listed, so the table below is this kernel's ledger, and there is no Refresh.
-    A second Seed gets the same five ids and replaces each response and TTL. Each answer the chat stores on a miss joins the ledger with the TTL you picked.
-    Clean up sends `DELETE /entries/{entryId}` for every id in the ledger. 204 is deleted, and 404 means the TTL ran out first.
-    """),
+            _heading,
+            _key_idea,
+            _request,
+            _buttons_note,
             mo.hstack([lcs_seed_button, lcs_cleanup_button], justify="start"),
-        ]
+            mo.accordion({"How a search reaches Redis": _hops}),
+        ],
+        gap=0.75,
     )
     return lcs_cleanup_button, lcs_seed_button
 
@@ -1270,25 +1345,92 @@ def lc_store(
 
 
 @app.cell(hide_code=True)
-def lc_controls(mo):
+def lc_controls(mo, textwrap):
     # No control sits upstream of this chat. A LangCache turn has no session, and the model sees the question alone,
     # so a changed threshold, strategy, or TTL applies to the next turn and the history stays, which the steps below
     # rely on. All three controls live in lc_chat and are read at call time through lcs_settings().
-    mo.md(r"""
-    ## Ask Cairn support and watch each search
 
-    Type `/` in the chat box to pick a starter message. Send the goose-down question first. It says launder where the stored prompt says wash, yet the down-bag answer is served. The pane shows the search and its reply.
-    Send the synthetic bag question next. The same answer comes back at a higher similarity, and it is wrong for a synthetic bag, so the pane says wrong answer.
-    Move `similarityThreshold` to 0.96, and the table loses the wrong answer and every hit with it.
+    _search_heading = mo.md("### 2. Search with `POST /entries/search` before calling the model")
 
-    Set `ttlMillis` to 10 seconds and send the synthetic bag question again. At 0.96 it misses, the model answers, and the app stores the answer for 10000 ms.
-    Send it again right away, and the chat's own answer is served at similarity 1. Wait fifteen seconds and send it a third time, and the miss returns.
+    _search_key = mo.callout(
+        mo.md(
+            "The app searches first. A miss is HTTP 200 with `data: []`, not a 404. On a miss the model answers and the app stores with `POST /entries`."
+        ),
+        kind="info",
+        title="Key idea",
+    )
 
-    Set `searchStrategies` to `exact` and send the all-caps copy of the down-bag prompt, which `semantic` missed. It hits at similarity 1. Send the goose-down question again, and `exact` misses it.
-    Set the strategy back to `semantic`, the slider to 0.85, and the TTL to 1 minute, then send the snapped tent pole question. It misses and is stored.
-    Send the broken tent pole rewording, and the chat's own answer is served at about 0.94.
-    Select Clean up to delete by id. The 10 second answers have expired, so their `DELETE` answers 404. The seeds answer 204, and so does the tent pole answer if its minute has not passed.
-    """)
+    _search_request = mo.md(
+        textwrap.dedent(
+            """
+            ```text
+            POST /v1/caches/<LANGCACHE_CACHE_ID>/entries/search
+            {"prompt": "What's the right way to launder a goose-down sleeping bag?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
+            ```
+
+            Reading it piece by piece:
+
+            - `prompt` is the question.
+            - `similarityThreshold` is the floor. The cache default is 0.85.
+            - `searchStrategies` is `semantic` or `exact`.
+            - `maxResults` is 5.
+            """
+        ).strip()
+    )
+
+    _search_try = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Type `/` in the chat box to pick a starter message.
+
+                - Send the goose-down question first. It says launder where the stored prompt says wash, yet the down-bag answer is served. The pane shows the search and its reply.
+                - Send "How do I wash my synthetic sleeping bag?" next. The same answer comes back at a higher similarity, and it is wrong for a synthetic bag, so the pane says wrong answer.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
+
+    _ttl_heading = mo.md("### 3. Set `similarityThreshold` and `ttlMillis`")
+
+    _ttl_key = mo.callout(
+        mo.md(
+            "The threshold trades wrong answers for misses. `ttlMillis` caps how stale a stored answer gets, because a new cache never expires entries on its own."
+        ),
+        kind="info",
+        title="Key idea",
+    )
+
+    _ttl_try = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                - Move `similarityThreshold` to 0.96. The table loses the wrong answer and every hit with it.
+                - Set `ttlMillis` to 10 seconds and send the synthetic bag question again. At 0.96 it misses, the model answers, and the app stores the answer for 10000 ms. Send it again right away and the chat's own answer is served at similarity 1. Wait fifteen seconds and send it a third time, and the miss returns.
+                - Set `searchStrategies` to `exact` and send "HOW DO I WASH MY DOWN SLEEPING BAG?", the all-caps copy which `semantic` missed. It hits at similarity 1. Send the goose-down question again and `exact` misses it.
+                - Set the strategy back to `semantic`, the slider to 0.85, and the TTL to 1 minute. Send the snapped tent pole question ("At Cairn Outfitters: How do I fix a snapped tent pole?"). It misses and is stored. Send the broken tent pole rewording ("At Cairn Outfitters: What should I do about a broken tent pole?"). The chat's own answer is served at about 0.94.
+                - Select Clean up. The 10 second answers have expired, so their `DELETE` answers 404. The seeds answer 204, and so does the tent pole answer if its minute has not passed.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
+
+    mo.vstack(
+        [
+            _search_heading,
+            _search_key,
+            _search_request,
+            _search_try,
+            _ttl_heading,
+            _ttl_key,
+            _ttl_try,
+        ],
+        gap=0.75,
+    )
     return
 
 
@@ -1754,43 +1896,113 @@ def lc_render(dt, json, lcs_entries, mo, time):
 
 
 @app.cell(column=3, hide_code=True)
-def cr_title(mo):
-    mo.md(r"""
+def cr_title(CAIRN_SCOPE, mo):
+    mo.md(f"""
     # Redis Context Retriever
 
-    Giving an agent tools over your customer data means writing each tool, indexing each entity, and hosting a server it can reach.
-    Redis Context Retriever generates a surface of MCP tools from a data model you declare, and answers each call from your own Redis database.
-    Select Create to build a surface from three Cairn Outfitters classes, then call its tools from the console to see three principles:
+    As Cairn Outfitters, you store customers, products, and orders in your own Redis as JSON, mapped like..
 
-    1. **Each field's `index` kind decides which tools the surface lists.** Three `ContextModel` classes mark each indexed field `text`, `tag`, or `numeric` in `ContextField(index=...)`, three of the field types the Search column declares in `FT.CREATE`. `export_data_model(entities=[...])` turns the classes into the `data_model`, and `tools/list` then shows `search_customer_by_text` and no `search_order_by_text`, because Order has no `text` field.
-    2. **`connection_config` ties the surface to your own Redis database.** `POST /context-surfaces` carries that `data_model` and a `data_source.connection_config` built from the same `REDIS_URL` the Search column uses, with `addr`, `username`, `password`, `db`, and `tls_enabled`. On import the service writes JSON documents at each class's `__redis_key_template__` and builds one Redis Search index per entity, which `JSON.GET` and `FT._LIST` show.
-    3. **An admin key creates the surface, and the agent holds only an agent key.** `CTX_ADMIN_KEY` goes in `X-API-Key` on every admin request, and Create uses it to make one agent key with an `expires_at` and read that key's `mcp_url`. The console sends `tools/call` to that `mcp_url` with the agent key alone, and `get_customer_by_id` for `C001` returns the record with a `_retrieval` stamp naming the surface.
+      `cairn:<scope>:customer:<customer-id>: {{ name, tier, region, lifetime_value }}`
 
-    Embeddings: none here. The three classes declare `text`, `tag`, and `numeric` fields and no `vector` field, so no tool in this column matches by meaning.
-
-    Context Retriever does not support Redis Flex or Active-Active databases.
-    Settings: `CTX_ADMIN_KEY` from the Redis Cloud Admin keys page, shown once, plus `REDIS_URL` for a database with Search and JSON that the hosted service can reach.
-    Create sends that database's password to the service, which keeps it until Clean up deletes the surface.
-    `CTX_API_URL` and `CTX_MCP_URL` are optional, and their defaults suit Redis Cloud.
-    Docs: [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/) and
-    [concepts](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/concepts/).
-
-    Each line reads source, target, and what passes between them:
-
-    ```text
-    App     -> data_model  export_data_model over Customer, Product, and Order, in this kernel
-    App     -> admin API   POST /context-surfaces: data_model and connection_config, with the admin key
-    App     -> admin API   POST .../agent-keys with expires_at, then GET .../agent-keys for the key's mcp_url
-    App     -> admin API   POST .../data once per entity, the 20 Cairn records
-    service -> your Redis  JSON documents at the key templates, one index per entity, a read per tools/call
-    App     -> mcp_url     tools/list after Create and on Refresh, then one tools/call per Send, with the agent key
+    ```json
+    {{
+      "cairn:{CAIRN_SCOPE}:customer:C001": {{
+        "name": "Ada Lovelace",
+        "tier": "gold",
+        "region": "emea",
+        "lifetime_value": 4200
+      }}
+    }}
     ```
+
+    [**Redis Context Retriever**](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/) builds a set of MCP tools from a data model you declare, and answers each call from that database.
+
+    Each field's index kind decides which tools an agent can call.
+
+    ---
+
+    ## We'll learn how to..
+
+    1. Declare the data model.
+    2. Create a surface and import the records.
+    3. Call the tools with an agent key.
     """)
     return
 
 
+@app.cell
+def cr_model_fns(CAIRN_SCOPE):
+    # Model. Three classes, each field's index kind, and the data_model they export. Sends nothing.
+    from context_surfaces import ContextField, ContextModel, ContextRelationship, export_data_model
+
+    from cairn_support.sample_data import SHOP_RECORDS
+
+    _redis_prefix = f"cairn:{CAIRN_SCOPE}:"
+
+    class Customer(ContextModel):
+        """A Cairn Outfitters shopper."""
+
+        __redis_key_template__ = _redis_prefix + "customer:{customer_id}"
+
+        customer_id: str = ContextField(description="Customer id, such as C001", is_key_component=True)
+        name: str = ContextField(description="Full name", index="text")
+        tier: str = ContextField(description="Loyalty tier", index="tag", allowed_values=["bronze", "silver", "gold"])
+        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
+        lifetime_value: float = ContextField(description="Lifetime spend in USD", index="numeric")
+        orders: list["Order"] = ContextRelationship(description="Orders this customer placed", target="Order", source_field="customer_id")
+
+
+    class Product(ContextModel):
+        """An item Cairn Outfitters sells."""
+
+        __redis_key_template__ = _redis_prefix + "product:{sku}"
+
+        sku: str = ContextField(description="Stock keeping unit, such as P100", is_key_component=True)
+        title: str = ContextField(description="Product title", index="text")
+        category: str = ContextField(description="Product category", index="tag")
+        price: float = ContextField(description="Price in USD", index="numeric")
+
+
+    class Order(ContextModel):
+        """One order: a customer, a product, and a status. No text field, so no search_order_by_text."""
+
+        __redis_key_template__ = _redis_prefix + "order:{order_id}"
+
+        order_id: str = ContextField(description="Order id, such as O1001", is_key_component=True)
+        customer_id: str = ContextField(description="The buyer's customer id", index="tag")
+        sku: str = ContextField(description="The product's sku", index="tag")
+        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
+        status: str = ContextField(description="Order status", index="tag", allowed_values=["placed", "shipped", "delivered", "returned"])
+        total: float = ContextField(description="Order total in USD", index="numeric")
+        customer: "Customer" = ContextRelationship(description="Buyer", target="Customer", source_field="customer_id")
+        product: "Product" = ContextRelationship(description="Item bought", target="Product", source_field="sku")
+
+
+    crs_models = [Customer, Product, Order]
+
+    crs_data_model = export_data_model(
+        "Cairn Outfitters", "Customers, products, and orders of an outdoor gear shop",
+        entities=crs_models,
+    )
+
+    crs_record_keys = [
+        model.__redis_key_template__.format(**row)
+        for model in crs_models
+        for row in SHOP_RECORDS[model.__name__]
+    ]
+
+    crs_entity_prefixes = [model.__redis_key_template__.split("{")[0] for model in crs_models]
+    return (
+        SHOP_RECORDS,
+        crs_data_model,
+        crs_entity_prefixes,
+        crs_models,
+        crs_record_keys,
+    )
+
+
 @app.cell(hide_code=True)
-def cr_model(crs_data_model, crs_record_keys, json, mo):
+def cr_model(crs_data_model, crs_record_keys, mo, textwrap):
     # The declared model, as the reader sees it: one row per entity with the index kind of each field and the tools the rule
     # predicts. The service's own list comes after Create, in cr_surface, so the prediction is checked against tools/list.
     _families = {
@@ -1824,24 +2036,27 @@ def cr_model(crs_data_model, crs_record_keys, json, mo):
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Declare three classes and read the data model they export
-
-    `Customer`, `Product`, and `Order` are `ContextModel` classes in `cr_model_fns` below, and each field's `ContextField(index=...)` is `text`, `tag`, `numeric`, or none.
-    `export_data_model(entities=[...])` turns them into the `data_model` JSON that Create sends, with one `redis_key_template` per entity under this run's prefix.
-    The table predicts the tools from the index kinds, and `tools/list` after Create checks the prediction. `get_` needs a key component, `filter_` a `tag` or `numeric` field, `summarize_` a `numeric` field, and `search_` a `text` field.
-    `intersect_results`, `union_results`, `except_results`, and `expand_results` are listed once for every surface.
-    """),
-            mo.md("\n".join(_rows)),
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        Each field's index is `text`, `tag`, or `numeric`, three of the field types Redis Search declares in `FT.CREATE`. `get_` needs a key component, `filter_` a tag or numeric field, `summarize_` a numeric field, and `search_` a text field. Order has no text field, so the surface has no `search_order_by_text`.
+                        """
+                    ).strip()
+                ),
+                kind="info",
+                title="Key idea",
+            ),
+            mo.md("The index kinds on those classes predict these tools.\n\n" + "\n".join(_rows)),
             mo.md(f"The templates name {len(crs_record_keys)} keys, from `{crs_record_keys[0]}` to `{crs_record_keys[-1]}`. Nothing has been sent yet."),
-            mo.accordion({"The data_model, from export_data_model": mo.md(f"```json\n{json.dumps(crs_data_model, indent=2)}\n```")}),
-        ]
+        ],
+        gap=0.75,
     )
     return
 
 
 @app.cell(hide_code=True)
-def cr_create_button(crs_admin_session, mo):
+def cr_create_button(crs_admin_session, mo, textwrap):
     _ = crs_admin_session  # the buttons appear once the admin session exists, so a press never runs ahead of the settings check
     crs_create_button = mo.ui.run_button(label="Create")
     crs_refresh_button = mo.ui.run_button(label="Refresh")
@@ -1849,16 +2064,52 @@ def cr_create_button(crs_admin_session, mo):
 
     mo.vstack(
         [
-            mo.md(r"""
-    ## Create the surface, import 20 records, and list its tools
-
-    Create sends four kinds of admin request, each with `CTX_ADMIN_KEY` in `X-API-Key`.
-    `POST /context-surfaces` carries the `data_model` and your database password, `POST .../agent-keys` makes a key that expires in an hour, `GET .../agent-keys` reads that key's `mcp_url`, and `POST .../data` runs once per entity.
-    The service keeps the password to reach your database until Clean up deletes the surface.
-    Refresh lists the tools again and re-reads your database. Clean up deletes every surface named `cairn-<run>`, unlinks the 20 documents the delete leaves behind, and drops any index the service left.
-    """),
+            mo.md(
+                textwrap.dedent(
+                    """
+                    ### 2. Create a surface and import the records
+                    """
+                ).strip()
+            ),
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        `POST /context-surfaces` sends the `data_model` and a `connection_config` built from the same `REDIS_URL` the Search column uses (`addr`, `username`, `password`, `db`, `tls_enabled`). On import the service writes JSON at each class's key template and builds one Redis Search index per entity. Context Retriever does not support Redis Flex or Active-Active databases.
+                        """
+                    ).strip()
+                ),
+                kind="info",
+                title="Key idea",
+            ),
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        - **Create** sends four admin requests, each with `CTX_ADMIN_KEY` in `X-API-Key`: `POST /context-surfaces` (the `data_model` and the database password), `POST .../agent-keys` (expires in an hour), `GET .../agent-keys` (the key's `mcp_url`), and `POST .../data` once per entity.
+                        - The service keeps the password until **Clean up** deletes the surface.
+                        - **Refresh** lists the tools again and re-reads the database.
+                        - **Clean up** deletes every surface named `cairn-<run>`, unlinks the 20 documents the delete leaves behind, and drops any index the service left.
+                        """
+                    ).strip()
+                ),
+                kind="success",
+                title="What the buttons do",
+            ),
             mo.hstack([crs_create_button, crs_refresh_button, crs_cleanup_button], justify="start"),
-        ]
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        A lost reply can still mean the surface was created. Select **Clean up** before **Create** again, so a second surface never takes the password.
+                        """
+                    ).strip()
+                ),
+                kind="warn",
+                title="Watch out",
+            ),
+        ],
+        gap=0.75,
     )
     return crs_cleanup_button, crs_create_button, crs_refresh_button
 
@@ -1998,7 +2249,7 @@ def cr_surface(
 
 
 @app.cell(hide_code=True)
-def cr_controls(crs_tools, mo):
+def cr_controls(crs_tools, mo, textwrap):
     # The pick, upstream of the console form so a new pick rebuilds the form with its tool and arguments. Examples come from
     # each tool's inputSchema, with a few named overrides. Three presets step outside the model.
     crs_examples = {
@@ -2041,20 +2292,42 @@ def cr_controls(crs_tools, mo):
         searchable=True,
     )  # displayed in the workbench, upstream of the form so a new pick prefills it
 
-    mo.md(r"""
-    ## Call the tools from the console and read the replies
-
-    Pick `get_customer_by_id` and select Send. The reply is Ada Lovelace's record with a `_retrieval` stamp that names the surface, read from the key `JSON.GET` shows above.
-    Change `C001` to `C999` in the arguments and send again to see how the surface answers an id it does not hold.
-
-    Pick `search_customer_by_text` with `Ada`, then look for an order search in the list. Order has no `text` field, so the surface generated none.
-    Pick `filter_customer`, then the no-condition preset. The first returns gold customers as data, and the second comes back with `isError` and the reason in the text.
-
-    The tag-condition preset puts a numeric field where the schema allows tag fields. The schema should reject it with a JSON-RPC error, code -32602, a shape an agent must tell apart from a tool error.
-    The last preset names a tool the surface never generated. An agent gets the tools the data model made and nothing else, so expect a JSON-RPC error for that one too.
-
-    Compare the `X-API-Key` in the request below, `****` plus the agent key's last four characters, with the `****` in the create request above: the admin key never appears in a tool call.
-    """)
+    mo.vstack(
+        [
+            mo.md(
+                textwrap.dedent(
+                    """
+                    ### 3. Call the tools with an agent key
+                    """
+                ).strip()
+            ),
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        The console sends `tools/call` to the agent key's `mcp_url`. The admin key never appears in a tool call. An agent has to tell three replies apart: data (`result.content[0].text`), a tool error (HTTP 200, `isError` true), and a JSON-RPC error (top-level `error`, code -32602 when the arguments break the schema).
+                        """
+                    ).strip()
+                ),
+                kind="info",
+                title="Key idea",
+            ),
+            mo.callout(
+                mo.md(
+                    textwrap.dedent(
+                        """
+                        - Pick `get_customer_by_id` and select Send. The reply is Ada Lovelace's record with a `_retrieval` stamp. Change `C001` to `C999` and send again to see an id the surface does not hold.
+                        - Pick `search_customer_by_text` with `Ada`. Order has no text field, so there is no `search_order_by_text`. Pick `filter_customer`, then the preset "filter_customer, no condition". The first returns gold customers as data. The second comes back with `isError` and the reason in the text.
+                        - The preset "filter_customer, a tag condition on a numeric field" should be a JSON-RPC error, code -32602. The preset "run_query, a tool the surface does not list" should also be a JSON-RPC error. Compare the `X-API-Key` in the request below, `****` plus the agent key's last four characters, with the `****` in the create request above.
+                        """
+                    ).strip()
+                ),
+                kind="success",
+                title="Try it",
+            ),
+        ],
+        gap=0.75,
+    )
     return (crs_pick,)
 
 
@@ -2119,79 +2392,16 @@ def cr_workbench(
 @app.cell(hide_code=True)
 def cr_build_md(mo):
     mo.md(r"""
-    ## The Context Retriever code: model, client, surface, database, call
+    ## The Context Retriever code
 
-    One cell per step, with the code visible in `marimo edit`. In `marimo run`, pick **Show code** from the app menu.
+    Client, surface, and database are collapsed. The open cell is `crs_call`, which sorts each Send into data, a tool error, or a JSON-RPC error. Expand a cell in `marimo edit`, or pick **Show code** from the app menu in `marimo run`.
     Every `crs_admin` call carries the admin key, every `crs_mcp` call carries the agent key, and `REDIS_CLIENT` reads your database directly.
     Create and Clean up call the surface and database functions, and each Send calls `crs_call`.
     """)
     return
 
 
-@app.cell
-def cr_model_fns(CAIRN_SCOPE):
-    # Model. Three classes, each field's index kind, and the data_model they export. Sends nothing.
-    from context_surfaces import ContextField, ContextModel, ContextRelationship, export_data_model
-
-    from cairn_support.sample_data import SHOP_RECORDS
-
-    _redis_prefix = f"cairn:{CAIRN_SCOPE}:"
-
-    class Customer(ContextModel):
-        """A Cairn Outfitters shopper."""
-
-        __redis_key_template__ = _redis_prefix + "customer:{customer_id}"  # the text before the first brace becomes the index prefix
-
-        customer_id: str = ContextField(description="Customer id, such as C001", is_key_component=True)  # get_customer_by_id takes this
-        name: str = ContextField(description="Full name", index="text")  # text: search_customer_by_text
-        tier: str = ContextField(description="Loyalty tier", index="tag", allowed_values=["bronze", "silver", "gold"])  # tag: filter_customer, count_customer
-        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
-        lifetime_value: float = ContextField(description="Lifetime spend in USD", index="numeric")  # numeric: summarize_customer, sort_by
-        orders: list["Order"] = ContextRelationship(description="Orders this customer placed", target="Order", source_field="customer_id")
-
-
-    class Product(ContextModel):
-        """An item Cairn Outfitters sells."""
-
-        __redis_key_template__ = _redis_prefix + "product:{sku}"
-
-        sku: str = ContextField(description="Stock keeping unit, such as P100", is_key_component=True)
-        title: str = ContextField(description="Product title", index="text")
-        category: str = ContextField(description="Product category", index="tag")
-        price: float = ContextField(description="Price in USD", index="numeric")
-
-
-    class Order(ContextModel):
-        """One order: a customer, a product, and a status. No text field, so no search_order_by_text."""
-
-        __redis_key_template__ = _redis_prefix + "order:{order_id}"
-
-        order_id: str = ContextField(description="Order id, such as O1001", is_key_component=True)
-        customer_id: str = ContextField(description="The buyer's customer id", index="tag")
-        sku: str = ContextField(description="The product's sku", index="tag")
-        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
-        status: str = ContextField(description="Order status", index="tag", allowed_values=["placed", "shipped", "delivered", "returned"])
-        total: float = ContextField(description="Order total in USD", index="numeric")
-        customer: "Customer" = ContextRelationship(description="Buyer", target="Customer", source_field="customer_id")
-        product: "Product" = ContextRelationship(description="Item bought", target="Product", source_field="sku")
-
-
-    crs_models = [Customer, Product, Order]
-    crs_data_model = export_data_model(  # always with entities=[...]: with None, the SDK exports every class ever defined in this kernel
-        "Cairn Outfitters", "Customers, products, and orders of an outdoor gear shop", entities=crs_models
-    )
-    crs_record_keys = [model.__redis_key_template__.format(**row) for model in crs_models for row in SHOP_RECORDS[model.__name__]]  # the 20 keys the service writes
-    crs_entity_prefixes = [model.__redis_key_template__.split("{")[0] for model in crs_models]  # the index prefixes, for the database pane and Clean up
-    return (
-        SHOP_RECORDS,
-        crs_data_model,
-        crs_entity_prefixes,
-        crs_models,
-        crs_record_keys,
-    )
-
-
-@app.cell
+@app.cell(hide_code=True)
 def cr_connect(Reply, json_request, json_session, os, redis):
     # Client. The admin session with the admin key from .env, the MCP session for the agent key, and the connection_config the surface gets.
     from cairn_support.types import Surface, ToolCall
@@ -2248,7 +2458,7 @@ def cr_connect(Reply, json_request, json_session, os, redis):
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def cr_admin_fns(
     CAIRN_SCOPE,
     SHOP_RECORDS,
@@ -2343,7 +2553,7 @@ def cr_admin_fns(
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def cr_redis_fns(REDIS_CLIENT, crs_entity_prefixes, crs_record_keys, redis):
     # Database. The notebook's own reads of what the service wrote, and the part of Clean up the service leaves to you.
     def crs_indexes() -> list[dict]:
@@ -2547,56 +2757,132 @@ def am_title(mo):
     mo.md(r"""
     # Redis Agent Memory
 
-    An agent that forgets a customer's two dogs between conversations asks about them again every time.
-    Redis Agent Memory keeps each conversation in session memory and durable facts in long-term memory, written by the app or extracted from session events.
-    Select Seed to write memories for two Cairn Outfitters customers, Tom and Priya, then chat as either to see three principles:
+    As Cairn Outfitters, you store what you know about a customer as long-term memories, mapped like..
 
-    1. **Long-term memory recalls by meaning.** "Which foods should I avoid?" shares no keyword with "I'm allergic to peanuts and tree nuts", yet the search returns it for Priya. The search is a vector search, and `similarityThreshold` is its cosine similarity floor, the same name the LangCache column tunes.
-    2. **The `ownerId` filter scopes recall to one customer.** The app sends `filter: {ownerId: ...}` with every search, so Tom's agent does not see Priya's allergy.
-    3. **The app builds the prompt.** Each turn writes the message to session memory, searches long-term memory, and puts what it recalls in the system prompt.
+      `{ id, text, ownerId }`
 
-    Embeddings: Agent Memory embeds inside the service. It stores each long-term memory with a vector embedding and searches those vectors, so the app sends text and never a vector.
-    The service's own AI model settings, which cover embedding, extraction, and summarization, are chosen in the console when you create it: Redis-managed keys by default, or your own provider key and models.
-    The embedding model is fixed after creation, and `LLM_API_KEY` is only the chat's key.
-
-    Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY` for the chat.
-    Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
-    [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/), and
-    [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
-
-    Each line reads source, target, and what passes between them:
-
-    ```text
-    App        -> long-term   POST /long-term-memory, the Seed memories, each with an ownerId
-    App        -> session     POST /session-memory/events, the user's message, every turn
-    App        -> long-term   POST /long-term-memory/search: text, similarityThreshold, ownerId
-    long-term  -> App         the memories at or above the threshold, best first, no score
-    App        -> LLM         the system prompt with the recalled memories, and the history
-    session    -> long-term   extraction in the background, a few minutes after a turn
+    ```json
+    {
+      "id": "priya-seed-2",
+      "text": "I'm allergic to peanuts and tree nuts",
+      "ownerId": "Priya"
+    }
     ```
+
+    [**Redis Agent Memory**](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/) keeps each conversation in session memory and durable facts in long-term memory. A search matches a question to those facts by meaning.
+
+    The app puts what it recalls into the prompt it sends the model.
+
+    ---
+
+    ## We'll learn how to..
+
+    1. Store a long-term memory for one customer.
+    2. Search that customer's memories by meaning.
+    3. Put the memories you recall into the system prompt.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def am_store_button(ams_client, mo):
+def am_store_button(ams_client, mo, textwrap):
     _ = ams_client  # the buttons appear once the client exists, so a press never runs ahead of the settings check
     ams_seed_button = mo.ui.run_button(label="Seed")
     ams_refresh_button = mo.ui.run_button(label="Refresh")
     ams_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
 
+    _heading = mo.md(
+        textwrap.dedent(
+            """
+            ### 1. Store a long-term memory for one customer
+
+            Seed writes three memories for Tom and three for Priya. The tables below list what the store holds for each customer.
+            """
+        ).strip()
+    )
+
+    _key_idea = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                The app chooses each memory's `id`, so a second Seed rewrites the same six records and creates nothing new. Every memory is tagged with an `ownerId`: Tom or Priya.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea",
+    )
+
+    _request = mo.md(
+        textwrap.dedent(
+            """
+            One of the six memories Seed writes:
+
+            ```json
+            {
+              "id": "priya-seed-2",
+              "text": "I'm allergic to peanuts and tree nuts",
+              "ownerId": "Priya"
+            }
+            ```
+
+            Reading it piece by piece:
+
+            - `id` is the app's. This fact is `priya-seed-2`, so a later Seed updates that same record.
+            - `text` is the fact, in the customer's words.
+            - `ownerId` is the customer. Tom's memories and Priya's never share one.
+            - Seed sends no `memoryType`, so the store files these as `semantic`. A memory extracted from a conversation can be `episodic`.
+            """
+        ).strip()
+    )
+
+    _buttons_note = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                **Seed** sends the six memories with `POST /long-term-memory`. **Refresh** lists them again, including anything extracted from a session a few minutes after a turn. **Clean up** deletes every session and every long-term memory tagged Tom or Priya.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="What the buttons do",
+    )
+
+    _hops = mo.md(
+        textwrap.dedent(
+            """
+            Each line reads source, target, and what passes between them:
+
+            ```text
+            App        -> long-term   POST /long-term-memory, the Seed memories, each with an ownerId
+            App        -> session     POST /session-memory/events, the user's message, every turn
+            App        -> long-term   POST /long-term-memory/search: text, similarityThreshold, ownerId
+            long-term  -> App         the memories at or above the threshold, best first, no score
+            App        -> LLM         the system prompt with the recalled memories, and the history
+            session    -> long-term   extraction in the background, a few minutes after a turn
+            ```
+
+            Agent Memory embeds inside the service. It stores each long-term memory with a vector embedding and searches those vectors, so the app sends text and never a vector. The service's own AI model settings, which cover embedding, extraction, and summarization, are chosen in the console when you create it: Redis-managed keys by default, or your own provider key and models. The embedding model is fixed after creation, and `LLM_API_KEY` is only the chat's key.
+
+            Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY` for the chat.
+
+            Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
+            [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/), and
+            [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
+            """
+        ).strip()
+    )
+
     mo.vstack(
         [
-            mo.md(r"""
-    ## Seed and list two customers' long-term memories
-
-    Seed writes three memories per customer with `POST /long-term-memory`, each tagged with the `ownerId` the app chooses.
-    Refresh lists them again, including anything the store has extracted from a session a few minutes after a turn.
-    Seeds carry type `semantic`. An extracted memory carries the type the extractor chooses, such as `episodic`.
-    Clean up deletes every session and every long-term memory tagged Tom or Priya.
-    """),
+            _heading,
+            _key_idea,
+            _request,
+            _buttons_note,
             mo.hstack([ams_seed_button, ams_refresh_button, ams_cleanup_button], justify="start"),
-        ]
+            mo.accordion({"How a turn reaches the model": _hops}),
+        ],
+        gap=0.75,
     )
     return ams_cleanup_button, ams_refresh_button, ams_seed_button
 
@@ -2646,21 +2932,117 @@ async def am_store(
 
 
 @app.cell(hide_code=True)
-def am_owner(ams_seeds, mo):
+def am_owner(ams_seeds, mo, textwrap):
     ams_owner = mo.ui.dropdown(options=list(ams_seeds), value=next(iter(ams_seeds)), label="Chat as")  # displayed in the workbench, upstream of the chat so a switch starts a new session
 
-    mo.md(r"""
-    ## Chat with the Cairn agent as Tom or Priya and watch the recall
+    _search_heading = mo.md("### 2. Search that customer's memories by meaning")
 
-    Type `/` in the chat box to pick a starter message. Send the first one as Tom. The agent has nothing on food, and the Priya bars show the allergy the `filter` kept out.
-    Send the next two as Tom, and his dogs and his Dolomites trip appear in the system prompt.
+    _search_key = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Long-term search is a vector search. `similarityThreshold` is the cosine similarity floor, the same name the LangCache column tunes. The request also sends `ownerId`, so Tom's agent does not see Priya's allergy.
 
-    Switch to Priya, which starts a new conversation, and send the same three. The foods question now recalls the allergy, with no keyword shared.
-    Move `similarityThreshold` and watch memories enter and leave the system prompt.
+                "Which foods should I avoid?" shares no words with "I'm allergic to peanuts and tree nuts", and the search still returns it for Priya.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea",
+    )
 
-    Send the packing question next. Alone it is a weak match, so set N to 2 and the trip question rides along in the search text.
-    The last message tells the agent something new. A few minutes later, Refresh can list a memory the store extracted from it.
-    """)
+    _search_request = mo.md(
+        textwrap.dedent(
+            """
+            ```json
+            {
+              "text": "Which foods should I avoid?",
+              "similarityThreshold": 0.30,
+              "filter": {"ownerId": {"eq": "Priya"}},
+              "limit": 10
+            }
+            ```
+
+            Reading it piece by piece:
+
+            - `text` is the question, or the last N user messages joined together.
+            - `similarityThreshold` is the floor. The slider starts at 0.30.
+            - `filter.ownerId` is the customer chosen in **Chat as**.
+            - `limit` is 10.
+            - The reply lists memories and does not include a score.
+            """
+        ).strip()
+    )
+
+    _search_try = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Type `/` in the chat box to pick a starter message.
+
+                - Send the first one as Tom. The agent has nothing on food, and the Priya bars show the allergy the filter kept out.
+                - Send the next two as Tom. His dogs and his Dolomites trip appear in the system prompt.
+                - Switch to Priya, which starts a new conversation, and send the same three. The foods question now recalls the allergy, with no keyword shared.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
+
+    _prompt_heading = mo.md("### 3. Put the memories you recall into the system prompt")
+
+    _prompt_key = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Each turn writes the user's message to session memory, searches long-term memory, and the app puts what it recalls into the system prompt. Agent Memory does not build that prompt.
+                """
+            ).strip()
+        ),
+        kind="info",
+        title="Key idea",
+    )
+
+    _prompt_try = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                - Move `similarityThreshold` and watch memories enter and leave the system prompt. Dark bars at or above the slider are the ones that go in.
+                - Send the packing question next. Alone it is a weak match, so set N to 2 and the trip question rides along in the search text.
+                - The last message tells the agent something new. A few minutes later, **Refresh** can list a memory the store extracted from it.
+                """
+            ).strip()
+        ),
+        kind="success",
+        title="Try it",
+    )
+
+    _watch = mo.callout(
+        mo.md(
+            textwrap.dedent(
+                """
+                Extraction runs in the background, a few minutes after a turn. The prompt for this turn never reads the message you just sent.
+                """
+            ).strip()
+        ),
+        kind="warn",
+        title="Watch out",
+    )
+
+    mo.vstack(
+        [
+            _search_heading,
+            _search_key,
+            _search_request,
+            _search_try,
+            _prompt_heading,
+            _prompt_key,
+            _prompt_try,
+            _watch,
+        ],
+        gap=0.75,
+    )
     return (ams_owner,)
 
 
