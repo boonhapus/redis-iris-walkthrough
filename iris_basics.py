@@ -219,13 +219,7 @@ def rs_title(EMBEDDING_MODEL, HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX, mo):
     The `embedding` holds {_dim} numbers that capture what the article *means*. An embedding model that runs on this machine makes them from the title and body.
     """)
 
-    _schema = mo.md(f"""
-    ## Step 1. Declare the schema
-
-    > Index every hash whose key starts with `{RS_KEY_PREFIX}:`, and say what each field is for.
-
-    ```bash
-    FT.CREATE {RS_IDX_NAME}
+    rss_create_command = f"""FT.CREATE {RS_IDX_NAME}
       ON HASH
       PREFIX 1 {RS_KEY_PREFIX}:
     SCHEMA
@@ -236,7 +230,15 @@ def rs_title(EMBEDDING_MODEL, HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX, mo):
       embedding  VECTOR   HNSW 6
         TYPE FLOAT32
         DIM {_dim}
-        DISTANCE_METRIC COSINE
+        DISTANCE_METRIC COSINE"""
+
+    _schema = mo.md(f"""
+    ## Step 1. Declare the schema
+
+    > Index every hash whose key starts with `{RS_KEY_PREFIX}:`, and say what each field is for.
+
+    ```bash
+    {rss_create_command}
     ```
 
     Reading it piece by piece:
@@ -284,12 +286,11 @@ def rs_title(EMBEDDING_MODEL, HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX, mo):
     )
 
     mo.vstack([_story, _schema, _key_idea, _write, _try_it, rs_create_button], gap=0.75)
-    return (rs_create_button,)
+    return rs_create_button, rss_create_command
 
 
 @app.cell(hide_code=True)
 def rs_create(
-    EMBEDDING_MODEL,
     HELP_ARTICLES,
     REDIS_CLIENT,
     RS_IDX_NAME,
@@ -297,27 +298,14 @@ def rs_create(
     mo,
     redis,
     rs_create_button,
+    rss_create_command,
     rss_vector,
     shlex,
 ):
     # Create. On a press: FT.CREATE, then every article as a hash with an hour to live. On every run: FT.INFO, which the search steps check.
     if rs_create_button.value:
-        _schema = f"""
-        FT.CREATE {RS_IDX_NAME}
-          ON HASH
-          PREFIX 1 {RS_KEY_PREFIX}:
-        SCHEMA
-          title      TEXT     WEIGHT 2.0
-          body       TEXT
-          category   TAG
-          year       NUMERIC  SORTABLE
-          embedding  VECTOR   HNSW 6
-            TYPE FLOAT32
-            DIM {EMBEDDING_MODEL.dim}
-            DISTANCE_METRIC COSINE
-        """
         try:
-            REDIS_CLIENT.execute_command(*shlex.split(_schema))
+            REDIS_CLIENT.execute_command(*shlex.split(rss_create_command))
         except redis.ResponseError as _error:
             if "already exists" not in str(_error):  # pressing Create again is fine
                 raise
@@ -630,14 +618,9 @@ def rs_filter(
         mo.stop("index" in str(_error).lower(), _hint)
         raise
     mo.stop(not _pre, mo.md("_No articles came back. They expire an hour after Create, so press **Create** again in step 1._"))
-    mo.hstack(
-        [
-            rss_table(_post, f"Post-filter: `KNN 5`, then the app drops articles before {_earliest}"),
-            rss_table(_pre, f"Pre-filter: `@year:[{_earliest} +inf]` before `=>`, then `KNN 5`"),
-        ],
-        widths="equal",
-        gap=1.5,
-    )
+    _post_table = rss_table(_post, f"Post-filter: `KNN 5`, then the app drops articles before {_earliest}")
+    _pre_table = rss_table(_pre, f"Pre-filter: `@year:[{_earliest} +inf]` before `=>`, then `KNN 5`")
+    mo.hstack([_post_table, _pre_table], widths="equal", gap=1.5)
     return
 
 
@@ -1160,26 +1143,22 @@ def cr_create(
     mo,
 ):
     # Create and Clean up, then the current state. This cell never reads the state getter, so storing the surface doesn't rerun it.
-    _surface = crs_surface()
-    _note = "" if _surface else "No surface yet. Press **Create**."
+    _surface, _note = crs_surface(), ""
     if crs_create_button.value:
         if _surface:
             _note = "This kernel already holds a surface. Press **Clean up** first, so a second one never takes your password."
         else:
-            _surface, _note = crs_create_surface(), ""
+            _surface = crs_create_surface()
             crs_set_surface(_surface)
     if crs_cleanup_button.value:
         _note, _surface = crs_cleanup(), None
+    mo.stop(not _surface, mo.md(_note or "No surface yet. Press **Create**."))
 
-    _view = [mo.md(_note)] if _note else []
-    if _surface:
-        _shown, _tools = crs_shown(_surface), crs_list_tools(_surface)
-        _signatures = [f"{t['name']}({', '.join(a + '*' * (a in t['inputSchema'].get('required', [])) for a in t['inputSchema'].get('properties', {}))})" for t in _tools]
-        _view += [
-            mo.md(f"- Surface `{_shown['id']}`. Imported {', '.join(f'{n} {name.lower()}s' for name, n in _surface['imports'].items())}.\n- Agent key `{_shown['agent_key']}`, expires {_shown['key_expires_at']}. Its `mcp_url` is `{_shown['mcp_url']}`.\n- `tools/list` returned {len(_tools)} tools, {len(json.dumps(_tools)):,} characters of JSON. Required arguments are starred.\n\n```text\n" + "\n".join(_signatures) + "\n```"),
-            mo.md(f"`JSON.GET {crs_record_keys[0]}`\n\n```json\n{json.dumps(REDIS_CLIENT.json().get(crs_record_keys[0]), indent=2)}\n```"),
-        ]
-    mo.vstack(_view, gap=0.75)
+    _shown, _tools = crs_shown(_surface), crs_list_tools(_surface)
+    _signatures = [f"{t['name']}({', '.join(a + '*' * (a in t['inputSchema'].get('required', [])) for a in t['inputSchema'].get('properties', {}))})" for t in _tools]
+    _listing = mo.md(f"{_note}\n\n- Surface `{_shown['id']}`. Imported {', '.join(f'{n} {name.lower()}s' for name, n in _surface['imports'].items())}.\n- Agent key `{_shown['agent_key']}`, expires {_shown['key_expires_at']}. Its `mcp_url` is `{_shown['mcp_url']}`.\n- `tools/list` returned {len(_tools)} tools, {len(json.dumps(_tools)):,} characters of JSON. Required arguments are starred.\n\n```text\n" + "\n".join(_signatures) + "\n```")
+    _record = mo.md(f"`JSON.GET {crs_record_keys[0]}`\n\n```json\n{json.dumps(REDIS_CLIENT.json().get(crs_record_keys[0]), indent=2)}\n```")
+    mo.vstack([_listing, _record], gap=0.75)
     return
 
 
@@ -1273,10 +1252,9 @@ def cr_lifecycle(
     mo,
     redis,
 ):
-    # The surface, kept for the other cells. The notebook's one mo.state, under private names: a cell that references a getter reruns
+    # The surface, kept for the other cells. The notebook's one mo.state, with a private getter: a cell that references a getter reruns
     # on every set, which would redefine the turn functions and reset the Chapter 4 chat. Other cells call crs_surface() instead.
-    _get_surface, _set_surface = mo.state(None)
-    crs_set_surface = _set_surface
+    _get_surface, crs_set_surface = mo.state(None)
 
 
     def crs_surface() -> dict | None:
@@ -1304,7 +1282,7 @@ def cr_lifecycle(
                     dropped.append(name)
             except redis.ResponseError:  # dropped between the two commands
                 continue
-        _set_surface(None)
+        crs_set_surface(None)
         return f"Surfaces deleted: {len(ids)}; record keys unlinked: {unlinked} of {len(crs_record_keys)}; leftover indexes dropped: {len(dropped)}."
 
 
@@ -1495,8 +1473,8 @@ def am_title(ams_client, mo):
     ## You'll learn how to
 
     1. Keep each customer's memories apart with an `ownerId` filter that runs before ranking, the way Chapter 1's `@year` filter did.
-    2. Recall a memory by meaning, even when it shares no words with the question.
-    3. Tell session memory, which holds one chat, from long-term memory, which the service extracts from sessions in the background.
+    2. Tell session memory, which holds one chat, from long-term memory, which the service extracts from sessions in the background.
+    3. Recall a memory by meaning, even when it shares no words with the question.
     4. Run the complete turn: memory, help articles, tools, and the model.
 
     ## Step 1. Store each customer's memories
@@ -1618,8 +1596,33 @@ def am_store_fns(CAST, ams_client, asyncio, models):
 def am_chat_md(CAST, mo):
     ams_owner = mo.ui.dropdown(options=CAST, value="Priya", label="Chat as")  # shown beside the chat, and read by am_turn_fn, so a switch starts a new session
 
-    _step = mo.md(r"""
-    ## Step 2. Recall them by meaning
+    _session = mo.md(r"""
+    ## Step 2. Write each message to session memory
+
+    Each turn starts by writing the customer's message to this chat's session with `POST /session-memory/events`. For Priya's sleeping bag question:
+
+    ```json
+    {
+      "sessionId": "c001-3f9a2b7c1d4e",
+      "actorId": "C001",
+      "role": "USER",
+      "content": [{"text": "Which sleeping bag should I get for the trip?"}],
+      "createdAt": "2026-10-23T15:04:05Z"
+    }
+    ```
+
+    Reading it piece by piece:
+
+    - `sessionId` is the app's, one per chat. Switching **Chat as** to another customer starts a new one.
+    - `actorId` is the customer's id. A session takes its `ownerId` from its first event, so the memories the service extracts from it are hers.
+    - `role` is `USER`: the app writes the customer's messages, not the assistant's replies.
+    - `content` holds the message as typed, and `createdAt` says when, by the app's clock.
+    """)
+
+    _extraction = mo.callout(mo.md("Session memory holds the messages of one chat. The service extracts long-term memories from it in the background, within about five minutes of a turn, so a turn never recalls the message it just wrote."), kind="warn", title="Watch out: extraction is slow")
+
+    _recall = mo.md(r"""
+    ## Step 3. Recall them by meaning
 
     Each turn asks Agent Memory (`POST /long-term-memory/search`) for the customer's memories closest in meaning to what they just said. For Priya's sleeping bag question:
 
@@ -1642,9 +1645,7 @@ def am_chat_md(CAST, mo):
     `ams_turn` is the whole recipe. It writes the message to session memory, recalls with this request, and hands the memories to Chapter 3's `crs_answer`, which adds them to the prompt. The app decides what the model sees, and now that includes what she told it before.
     """)
 
-    _extraction = mo.callout(mo.md("Session memory holds the messages of one chat. The service extracts long-term memories from it in the background, within about five minutes of a turn, so a turn never recalls the message it just wrote. The customer's id travels as each event's `actorId`, and the extracted memories carry it as their `ownerId`."), kind="warn", title="Watch out: extraction is slow")
-
-    mo.vstack([_step, _extraction], gap=0.75)
+    mo.vstack([_session, _extraction, _recall], gap=0.75)
     return (ams_owner,)
 
 
@@ -1805,7 +1806,7 @@ async def am_pane(
     for _ in range(list(CAST.values()).index(ams_owner.value)):
         _chat = mo.vstack([_chat])
 
-    mo.vstack([mo.md("## Step 3. Run the whole turn"), _try_it, mo.hstack([_chat, _data], widths=[5, 6], gap=1.5, align="start")], gap=0.75)
+    mo.vstack([mo.md("## Step 4. Run the whole turn"), _try_it, mo.hstack([_chat, _data], widths=[5, 6], gap=1.5, align="start")], gap=0.75)
     return
 
 
