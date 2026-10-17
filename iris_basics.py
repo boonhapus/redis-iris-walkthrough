@@ -4,13 +4,40 @@ __generated_with = "0.24.2"
 app = marimo.App(width="columns", app_title="Redis Iris basics")
 
 
-@app.cell(column=0)
-def _():
+@app.cell(column=0, hide_code=True)
+def prologue(CAST, mo):
+    mo.md(f"""
+    # Cairn Outfitters: a support assistant, one Redis Iris service at a time
+
+    Cairn Outfitters, a made-up outdoor-gear shop, is launching an AI support assistant. You build it in four chapters. Each chapter adds a Redis Iris service, and the gap it leaves is what the next one fixes.
+
+    ## The cast
+
+    - **Priya**, customer `{CAST['Priya']}`, leaves for a canoe trip in Maine in three weeks. Her tent is still on order.
+    - **Tom**, customer `{CAST['Tom']}`, is the second customer, here whenever a lesson needs two people.
+
+    Each customer id is how later chapters find a customer's records (Chapter 3) and keep one customer's memories apart from another's (Chapter 4).
+
+    ## The chapters
+
+    1. **Search** (Redis Search, in your database) finds the help article closest in meaning to what a customer types. But an article isn't an answer.
+    2. **Semantic caching** (Redis LangCache, a hosted service) has a model write the answer from those articles, and reuses it when the question comes in other words. But a cache shared by everyone can't answer about Priya's own order.
+    3. **Context engineering and retrieval** (Redis Context Retriever, a hosted service) gives the model Priya's orders and products through tools. But a week later, a new chat has forgotten what she told it.
+    4. **Agent memory** (Redis Agent Memory, a hosted service) keeps what customers say and recalls it by meaning, so the assistant remembers Priya.
+
+    ## How to run it
+
+    Check the settings below first. Then work through the columns from left to right, one chapter each: the next chapter starts at the top of the column to the right. Each chapter builds on the last, so start with **Create** in Chapter 1. A chapter's buttons (**Create**, **Ask**, **Seed**) do its work. **Clean up everything** is at the end of Chapter 4. Cells that only run a request or draw a table hide their code, and the functions each chapter builds on show it.
+    """)
+    return
+
+
+@app.cell
+def imports():
     # Common imports for Notebook work
     import asyncio
     import datetime as dt
     import json
-    import textwrap
     import time
     import uuid
 
@@ -18,11 +45,12 @@ def _():
     import marimo as mo
 
     # Notebook-local data support, typing information, or internal machinery.
-    from cairn_support.formatting import log
-    from cairn_support.sessions import json_request, json_session
+    from cairn_support.sample_data import CAST
+    from cairn_support.sessions import json_request, json_session, recording
     from cairn_support.types import ChatMessage, ChatTurn, Reply
 
     return (
+        CAST,
         ChatMessage,
         ChatTurn,
         Reply,
@@ -31,9 +59,8 @@ def _():
         json,
         json_request,
         json_session,
-        log,
         mo,
-        textwrap,
+        recording,
         time,
         uuid,
     )
@@ -67,7 +94,7 @@ def env_check(mo):
     # 2. One table row per setting: a green check or a red cross, the name, and where to find it.
     _check = '<span style="color: var(--green-9)">&#10003;</span>'
     _cross = '<span style="color: var(--red-9)">&#10007;</span>'
-    _rows = ["| Set | Variable | Where to find it |", "|---|---|:--|"]
+    _rows = ["| Set | Variable | Where to find it |", "|:-:|:--|:--|"]
     for _name, _where in _settings.items():
         _rows.append(f"| {_cross if _name in _missing else _check} | `{_name}` | {_where} |")
 
@@ -126,17 +153,18 @@ def redis_client(os):
 
 @app.cell
 def ai_model():
-    from cairn_support.llm import stream_llm
+    # stream_llm streams a reply. answer_with_tools also runs the tool calls the model asks for (Chapter 3 on).
+    from cairn_support.llm import answer_with_tools, stream_llm
 
 
-    # The LLM model needed for all chat interfaces.
+    # The chat model that writes every answer in Chapters 2 to 4.
     # Supported models by OpenAI, Anthropic, Google (gemini)
     AI_MODEL = "gpt-4o-mini"
-    return AI_MODEL, stream_llm
+    return AI_MODEL, answer_with_tools, stream_llm
 
 
 @app.cell
-def _():
+def embedding():
     from cairn_support.embedder import embed_texts, load_embedding_model
 
 
@@ -146,922 +174,466 @@ def _():
 
 
 @app.cell(column=1, hide_code=True)
-def rs_title(CAIRN_SCOPE, mo):
-    mo.md(f"""
-    # Redis Search
+def rs_title(EMBEDDING_MODEL, HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX, mo):
+    _article = HELP_ARTICLES[0]
+    _key = f"{RS_KEY_PREFIX}:{_article['id']}"
+    _body = _article["body"][:44].rsplit(" ", 1)[0] + " ..."  # the first few words, as a preview
+    _dim = EMBEDDING_MODEL.dim
 
-    As Cairn Outfitters, you store your **Help Center** articles in Redis as hashes, mapped like..
+    rs_create_button = mo.ui.run_button(label="Create", tooltip="Create the index and load the articles")
 
-      `cairn:<scope>:help:<article-id>: {{ title, body, category, year }}`
+    _story = mo.md(f"""
+    # Chapter 1. Search: find the right article
+
+    Before the assistant has a chat model, Cairn's customers search the help center in their own words.
+
+    - Tom types *my trail shoes feel cramped*, and wants the boot-size guide. No article says "cramped". He also tries *Trailhead*, the name of Cairn's boot line.
+    - Priya, packing for her canoe trip, mistypes *waterproofng*. She should still get the waterproofing article.
+    - Priya then searches *Where is my parcel?*, because her tent hasn't arrived.
+
+    **Redis Search** answers all three. It's an index over Redis keys that can match words, labels, numbers, and meaning. It runs inside your Redis database. You talk to it with Redis commands, which this chapter writes the way you'd type them into `redis-cli`, Redis's command-line tool. The notebook sends the same text from Python, so you never need a terminal.
+
+    ## You'll learn how to
+
+    1. Declare an index, and see that writing a document indexes it.
+    2. Find articles by meaning with `KNN`.
+    3. Set a similarity floor with `VECTOR_RANGE`, so "nothing matches" is an answer.
+    4. Filter before ranking, with a rule on `year`.
+
+    ## The articles
+
+    Each of the {len(HELP_ARTICLES)} help articles is one Redis **hash**: a key that holds named fields, like a small dictionary. Besides a title and body, each has a category and the `year` it was written. The key is the prefix `{RS_KEY_PREFIX}:` plus the article's id.
 
     ```json
     {{
-      "cairn:{CAIRN_SCOPE}:help:ship-times": {{
-        "title": "How long does delivery take?",
-        "body": "Standard orders leave our Denver warehouse..",
-        "category": "shipping",
-        "year": "2025",
-        "embedding": "OSgjvXX2dD7aP5M9maqqv.."
+      "{_key}": {{
+        "title": "{_article['title']}",
+        "body": "{_body}",
+        "category": "{_article['category']}",
+        "year": "{_article['year']}",
+        "embedding": "OSgjvXX2dD7aP5M9maqqv..."
       }}
     }}
     ```
 
-    [**Redis Search**](https://redis.io/docs/latest/develop/ai/search-and-query/) is an index over those keys. You declare it once with `FT.CREATE`, pointing at a key prefix. After that, every `HSET` under that prefix is searchable automatically—no separate "index this document" step.
-
-    Redis Search allow you to use Redis as a Document database, Vector database, Secondary index, or Search engine.
-
-    ---
-
-    ## We'll learn how to..
-
-    1. Create the index.
-    2. Add documents to the index.
-    3. Use `FT.SEARCH` to find the relevant information.
+    The `embedding` holds {_dim} numbers that capture what the article *means*. An embedding model that runs on this machine makes them from the title and body.
     """)
-    return
 
+    _schema = mo.md(f"""
+    ## Step 1. Declare the schema
 
-@app.cell
-def rs_config(CAIRN_SCOPE):
-    from cairn_support.sample_data import HELP_ARTICLES
+    > Index every hash whose key starts with `{RS_KEY_PREFIX}:`, and say what each field is for.
 
-    RS_SCOPE = f"cairn:{CAIRN_SCOPE}:"
-    RS_KEY_PREFIX = f"{RS_SCOPE}help"
-    RS_IDX_NAME   = f"idx:{RS_SCOPE}help"
-    return HELP_ARTICLES, RS_IDX_NAME, RS_KEY_PREFIX
+    ```bash
+    FT.CREATE {RS_IDX_NAME}
+      ON HASH
+      PREFIX 1 {RS_KEY_PREFIX}:
+    SCHEMA
+      title      TEXT     WEIGHT 2.0
+      body       TEXT
+      category   TAG
+      year       NUMERIC  SORTABLE
+      embedding  VECTOR   HNSW 6
+        TYPE FLOAT32
+        DIM {_dim}
+        DISTANCE_METRIC COSINE
+    ```
 
+    Reading it piece by piece:
 
-@app.cell(hide_code=True)
-def rs_config_create(
-    EMBEDDING_MODEL,
-    RS_IDX_NAME,
-    RS_KEY_PREFIX,
-    mo,
-    textwrap,
-):
-    rs_button_create = mo.ui.run_button(label="Run the FT.CREATE command")
-    rs_button_delete = mo.ui.run_button(label="Drop the index", kind="danger")
+    - `ON HASH` indexes hashes. `PREFIX 1 <prefix>` picks the keys. A number after a keyword counts the items that follow: the **1** counts the prefixes, and in `HNSW 6` the **6** counts `TYPE`, `DIM`, and `DISTANCE_METRIC`, each with its value.
+    - `title` and `body` are `TEXT`, so Redis can search their words. `WEIGHT 2.0` counts a word found in the title double when it scores those searches. It has no effect on vector search.
+    - `category` is a `TAG`, an exact label. `year` is `NUMERIC`, so Redis can match a range, and `SORTABLE` keeps it ready for sorting.
+    - `embedding` is a `VECTOR`. `HNSW` finds near neighbors by hopping through a graph, without comparing the question with every article. `TYPE FLOAT32` is 4 bytes per number, `DIM` must equal the embedding model's {_dim} numbers, and `COSINE` compares direction and ignores length.
+    """)
 
     _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Each field's type decides what you can ask later: `TEXT` finds words, `TAG` matches exact labels, `NUMERIC` handles ranges, and `VECTOR` finds meaning. Fields left out of the schema are still stored, but you can't search on them.
-                """
-            ).strip()
-        ),
+        mo.md("Each field's type decides what you can ask later: `TEXT` finds words, `TAG` matches exact labels, `NUMERIC` handles ranges, and `VECTOR` finds meaning. A field left out of the schema is still stored, but you can't search on it."),
         kind="info",
         title="Key idea: the schema decides what you can search",
     )
 
-    _md_create = mo.md(
-        textwrap.dedent(
-            f"""
-            ```bash
-            FT.CREATE {RS_IDX_NAME}
-              ON HASH
-              PREFIX 1 {RS_KEY_PREFIX}:
-            SCHEMA
-              title      TEXT     WEIGHT 2.0
-              body       TEXT
-              category   TAG
-              year       NUMERIC  SORTABLE
-              embedding  VECTOR   HNSW 6
-                TYPE FLOAT32
-                DIM {EMBEDDING_MODEL.dim}
-                DISTANCE_METRIC COSINE
-            ```
-            """
-        ).strip()
-    )
+    _write = mo.md(f"""
+    ### Writing is indexing
 
-    _buttons_note = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                **Run the FT.CREATE command** creates the index, and the same press loads the articles in step 2. Pressing it again is harmless. **Drop the index** deletes only the index; the articles stay in Redis until they expire.
-                """
-            ).strip()
-        ),
+    > Store an article as a hash, and delete it after an hour.
+
+    ```bash
+    HSET {_key}
+      title "{_article['title']}"
+      body "{_body}"
+      category {_article['category']}
+      year {_article['year']}
+      embedding <{_dim * 4} bytes>
+
+    EXPIRE {_key} 3600
+    ```
+
+    Reading it piece by piece:
+
+    - `HSET <key>` creates the hash, or updates it. The key is the index's prefix plus the article's id, so Redis indexes the hash the moment it's written. There's no separate "index this" call.
+    - `title`, `body`, `category`, and `year` are the schema's fields. Redis stores every value as a string, and the index reads `year` as a number because the schema says `NUMERIC`.
+    - `embedding` is the vector: {_dim} numbers at 4 bytes each, {_dim * 4} raw bytes, to match `TYPE FLOAT32` and `DIM {_dim}`. A value that doesn't fit its field, such as an embedding of the wrong length, raises no error. Redis stores the hash and leaves it out of the index, and `FT.INFO` counts it under `hash_indexing_failures`.
+    - `EXPIRE <key> 3600` deletes the key after an hour (3,600 seconds), and a deleted key leaves the index too. The demo cleans up after itself.
+    """)
+
+    _try_it = mo.callout(
+        mo.md(f"Press **Create**. It sends `FT.CREATE` first, then an `HSET` and an `EXPIRE` for each of the {len(HELP_ARTICLES)} articles, batched together in one pipeline. A line below says what was written. Press it again whenever you like: the index already exists, and the articles are rewritten with a fresh hour."),
         kind="success",
-        title="What the buttons do",
+        title="Try it",
     )
 
-    _md_options = mo.md(
-        textwrap.dedent(
-            """
-            - `ON HASH` indexes hashes. `ON JSON` would index JSON documents instead.
-            - `PREFIX 1` means one prefix follows; an index can watch several.
-            - `WEIGHT 2.0` makes a word found in the title count double when full-text results are scored. It has no effect on vector search.
-            - `SORTABLE` keeps `year` ready for fast sorting with `SORTBY year`.
-            - `HNSW` builds a graph that finds near neighbors quickly, without comparing the question with every article. `FLAT` compares with every one: exact, but slow on large data. In `HNSW 6`, the `6` counts the items that follow: `TYPE`, `DIM` and `DISTANCE_METRIC`, each with its value.
-            - `TYPE FLOAT32` stores each number in the vector as 4 bytes.
-            - `DIM` must match the number of values the model outputs. The notebook fills it in from the model.
-            - `COSINE` compares the direction of two vectors and ignores their length. Step 3 reports it as a distance: 1 − cosine similarity.
-
-            To change a field's type later, drop the index and create it again: the hashes stay in Redis and are indexed again. [`FT.ALTER`](https://redis.io/docs/latest/commands/ft.alter/) can only add fields.
-            """
-        ).strip()
-    )
-
-    _md_syntax = mo.md(
-        textwrap.dedent(
-            """
-            [`FT.CREATE`](https://redis.io/docs/latest/commands/ft.create/) for a [hash index](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/#hash-documents):
-
-            ```bash
-            FT.CREATE <name>
-              ON HASH
-              PREFIX <count> <prefix> [<prefix> ...]
-            SCHEMA
-              <field> <type> [<options>]
-              ...
-            ```
-
-            - [Schema definition](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/schema-definition/)
-            - [Field and type options](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/field-and-type-options/)
-            - [Vectors](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/)
-            """
-        ).strip()
-    )
-
-    mo.vstack(
-        [
-            mo.md("### 1. Create the index"),
-            _key_idea,
-            _md_create,
-            mo.hstack([rs_button_create, rs_button_delete], justify="start"),
-            _buttons_note,
-            mo.accordion(
-                {
-                    "More on each option": _md_options,
-                    "General syntax and docs": _md_syntax,
-                }
-            ),
-        ],
-        gap=0.75,
-    )
-    return rs_button_create, rs_button_delete
+    mo.vstack([_story, _schema, _key_idea, _write, _try_it, rs_create_button], gap=0.75)
+    return (rs_create_button,)
 
 
 @app.cell(hide_code=True)
-def rs_config_run(
+def rs_create(
     EMBEDDING_MODEL,
+    HELP_ARTICLES,
     REDIS_CLIENT,
     RS_IDX_NAME,
     RS_KEY_PREFIX,
-    log,
     mo,
     redis,
-    rs_button_create,
-    rs_button_delete,
+    rs_create_button,
+    rss_vector,
     shlex,
-    textwrap,
 ):
-    _output = mo.md("Press a button in the cell above to get started.")
-
-    #
-    # CREATE FLOW
-    #
-    if rs_button_create.value:
+    # Create. On a press: FT.CREATE, then every article as a hash with an hour to live. On every run: FT.INFO, which the search steps check.
+    if rs_create_button.value:
+        _schema = f"""
+        FT.CREATE {RS_IDX_NAME}
+          ON HASH
+          PREFIX 1 {RS_KEY_PREFIX}:
+        SCHEMA
+          title      TEXT     WEIGHT 2.0
+          body       TEXT
+          category   TAG
+          year       NUMERIC  SORTABLE
+          embedding  VECTOR   HNSW 6
+            TYPE FLOAT32
+            DIM {EMBEDDING_MODEL.dim}
+            DISTANCE_METRIC COSINE
+        """
         try:
-            _stmt = f"""
-            FT.CREATE {RS_IDX_NAME}
-              ON HASH
-              PREFIX 1 {RS_KEY_PREFIX}:
-            SCHEMA
-              title      TEXT     WEIGHT 2.0
-              body       TEXT
-              category   TAG
-              year       NUMERIC  SORTABLE
-              embedding  VECTOR   HNSW 6
-                                TYPE FLOAT32
-                                DIM {EMBEDDING_MODEL.dim}
-                                DISTANCE_METRIC COSINE
-            """
-            _ = textwrap.dedent(_stmt)
-            _ = shlex.split(_)
-            _ = REDIS_CLIENT.execute_command(*_)
-        except redis.exceptions.RedisError as e:
-            log(e, level="warning" if "already" in str(e) else "error")
-            _ = ""
-        finally:
-            _output = mo.md(f"**`{RS_IDX_NAME}`** was {'' if _ == 'OK' else 'already '}created.")
-
-    #
-    # DELETE FLOW
-    #
-    if rs_button_delete.value:
-        try:
-            _ = REDIS_CLIENT.execute_command("FT.DROPINDEX", RS_IDX_NAME)
-        except redis.exceptions.RedisError:
-            _ = ""
-        finally:
-            _output = mo.md(f"**`{RS_IDX_NAME}`** was {'' if _ == 'OK' else 'not '}dropped.")
-
-    _output
-    return
-
-
-@app.cell(hide_code=True)
-def rs_config_load_prose(
-    EMBEDDING_MODEL,
-    HELP_ARTICLES,
-    RS_KEY_PREFIX,
-    mo,
-    textwrap,
-):
-    _article = HELP_ARTICLES[0]
-    _key = f"{RS_KEY_PREFIX}:{_article['id']}"
-    _body = textwrap.shorten(_article["body"], width=48, placeholder=" ...")
-
-    _md_intro = mo.md(
-        textwrap.dedent(
-            f"""
-            ### 2. Load the documents
-
-            Each help article becomes one Redis [**hash**](https://redis.io/docs/latest/develop/data-types/hashes/): a key that holds named fields, like a small dictionary. Redis Search calls each hash it indexes a **document**. The notebook writes all {len(HELP_ARTICLES)} articles with `HSET`, one hash per article.
-            """
-        ).strip()
-    )
-
-    _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Each key starts with the prefix from step 1, so Redis indexes the hash the moment `HSET` writes it. There's no separate "index this" call. When a key is deleted or expires, it drops out of the index too.
-                """
-            ).strip()
-        ),
-        kind="info",
-        title="Key idea: writing is indexing",
-    )
-
-    _md_command = mo.md(
-        textwrap.dedent(
-            f"""
-            > Store the first article as a hash, and delete it after an hour.
-
-            ```bash
-            HSET {_key}
-              title "{_article['title']}"
-              body "{_body}"
-              category {_article['category']}
-              year {_article['year']}
-              embedding <{EMBEDDING_MODEL.dim * 4} bytes>
-
-            EXPIRE {_key} 3600
-            ```
-
-            Reading it piece by piece:
-
-            - `HSET <key>` creates the hash, or updates it if it already exists. The key is the prefix plus the article's id.
-            - `title`, `body`, `category` and `year` are the fields the schema declared in step 1. Redis stores every hash value as a string; the index reads `year` as a number because the schema says `NUMERIC`.
-            - `embedding` is the vector. The model turns the title and body into {EMBEDDING_MODEL.dim} numbers on this machine, and the notebook stores them as {EMBEDDING_MODEL.dim * 4} raw bytes, 4 per number, to match `TYPE FLOAT32` and `DIM {EMBEDDING_MODEL.dim}`.
-            - `EXPIRE <key> 3600` deletes the key after an hour (3,600 seconds), so the demo cleans up after itself.
-            """
-        ).strip()
-    )
-
-    _watch_out = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                f"""
-                If a value doesn't fit its field's type, Redis doesn't raise an error. It stores the hash but leaves it out of the index, so no search returns it. That happens with an embedding that isn't exactly {EMBEDDING_MODEL.dim * 4} bytes, for example after switching to a model with a different size, or with a `year` that isn't a number. `FT.INFO` counts these under `hash_indexing_failures`.
-                """
-            ).strip()
-        ),
-        kind="warn",
-        title="Watch out: a bad value hides the whole article",
-    )
-
-    _md_syntax = mo.md(
-        textwrap.dedent(
-            """
-            [`HSET`](https://redis.io/docs/latest/commands/hset/) and [`EXPIRE`](https://redis.io/docs/latest/commands/expire/):
-
-            ```bash
-            HSET <key> <field> <value> [<field> <value> ...]
-
-            EXPIRE <key> <seconds>
-            ```
-
-            More on [indexing hash documents](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/#hash-documents).
-            """
-        ).strip()
-    )
-
-    _runs_with_step_1 = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                f"""
-                There's no button here. **Run the FT.CREATE command** in step 1 also writes the articles, and the line below reports how many. The notebook sends all {len(HELP_ARTICLES) * 2} commands, an `HSET` and an `EXPIRE` per article, in one [pipeline](https://redis.io/docs/latest/develop/using-commands/pipelining/): a single round trip. Pressing the button again rewrites them and restarts the hour.
-                """
-            ).strip()
-        ),
-        kind="neutral",
-        title="Runs with the step 1 button",
-    )
-
-    mo.vstack(
-        [
-            _md_intro,
-            _key_idea,
-            _md_command,
-            _watch_out,
-            mo.accordion({"General syntax and docs": _md_syntax}),
-            _runs_with_step_1,
-        ],
-        gap=0.75,
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def rs_config_load(
-    EMBEDDING_MODEL,
-    HELP_ARTICLES,
-    REDIS_CLIENT,
-    RS_KEY_PREFIX,
-    embed_texts,
-    mo,
-    rs_button_create,
-):
-    _output = mo.md("Create the index, then load help articles.")
-
-
-    #
-    # LOAD FLOW
-    #
-    if rs_button_create.value:
+            REDIS_CLIENT.execute_command(*shlex.split(_schema))
+        except redis.ResponseError as _error:
+            if "already exists" not in str(_error):  # pressing Create again is fine
+                raise
         with REDIS_CLIENT.pipeline(transaction=False) as _pipe:
-            for article in HELP_ARTICLES:
-                _key = f"{RS_KEY_PREFIX}:{article['id']}"
-                _val = article.copy()
-
-                _full_text = f"{article['title']}. {article['body']}"
-                _vector = embed_texts(EMBEDDING_MODEL, [_full_text])[0].astype("float32").tobytes()
-                _val["embedding"] = _vector
-
-                _pipe.hset(_key, mapping=_val)
-                _pipe.expire(_key, time=3600)
-
+            for _article in HELP_ARTICLES:
+                _key = f"{RS_KEY_PREFIX}:{_article['id']}"
+                _fields = {_name: _value for _name, _value in _article.items() if _name != "id"}  # the id is in the key
+                _fields["embedding"] = rss_vector(f"{_article['title']}. {_article['body']}")
+                _pipe.hset(_key, mapping=_fields)
+                _pipe.expire(_key, 3600)
             _pipe.execute()
 
-        _output = mo.md(
-            f"Wrote **{len(HELP_ARTICLES)}** articles under `{RS_KEY_PREFIX}:` with `TTL=3600`."
-        )
+    rss_index_info = None  # stays None while there is no index
+    try:
+        _info = REDIS_CLIENT.execute_command("FT.INFO", RS_IDX_NAME)
+        rss_index_info = _info if isinstance(_info, dict) else dict(zip(_info[::2], _info[1::2]))  # RESP3 is a map, RESP2 a flat list
+    except redis.ResponseError:
+        pass
+    _docs = int(rss_index_info["num_docs"]) if rss_index_info else 0
 
-    _output
-    return
+    if rs_create_button.value:
+        _line = f"Wrote **{len(HELP_ARTICLES)}** articles under `{RS_KEY_PREFIX}:` with `EXPIRE 3600`. `{RS_IDX_NAME}` holds **{_docs}** documents."
+    elif _docs:
+        _line = f"`{RS_IDX_NAME}` holds **{_docs}** documents."
+    else:
+        _line = "No articles are indexed yet. Press **Create** in step 1."
+    mo.md(_line)
+    return (rss_index_info,)
+
+
+@app.cell
+def rs_search_fn(
+    CAIRN_SCOPE,
+    EMBEDDING_MODEL,
+    REDIS_CLIENT,
+    embed_texts,
+    shlex,
+):
+    # Search. Names the index and the articles, and defines the one function every later chapter calls (the KNN query, written as text the way redis-cli takes it). Create, in the hidden cell above, does the work.
+    from cairn_support.redis_search_replies import ft_search_rows  # reads an FT.SEARCH reply, RESP2 or RESP3, as one dict per hit
+    from cairn_support.sample_data import HELP_ARTICLES
+
+
+    RS_KEY_PREFIX = f"cairn:{CAIRN_SCOPE}:help"  # one hash per article, at <prefix>:<article id>
+    RS_IDX_NAME = f"idx:{RS_KEY_PREFIX}"
+
+
+    def rss_vector(text: str) -> bytes:
+        """The text's embedding as raw FLOAT32 bytes, the form the hash stores and PARAMS takes."""
+        return embed_texts(EMBEDDING_MODEL, [text])[0].astype("float32").tobytes()
+
+
+    def rss_search(question: str, k: int = 3, where: str = "*") -> list[dict]:
+        """KNN over the help center: the `k` articles closest in meaning to `question` among those `where` lets in, best first. Raises redis.ResponseError when the index doesn't exist."""
+        command = f"""
+        FT.SEARCH {RS_IDX_NAME} "({where})=>[KNN {k} @embedding $vector AS vector_score]"
+             RETURN  5  title body category year vector_score
+             SORTBY     vector_score
+             DIALECT 2
+             PARAMS  2  vector
+        """
+        reply = REDIS_CLIENT.execute_command(*shlex.split(command), rss_vector(question))
+        return ft_search_rows(reply)[1]
+
+    return (
+        HELP_ARTICLES,
+        RS_IDX_NAME,
+        RS_KEY_PREFIX,
+        ft_search_rows,
+        rss_search,
+        rss_vector,
+    )
 
 
 @app.cell(hide_code=True)
-def rs_3a_meaning_prose(
-    EMBEDDING_MODEL,
-    REDIS_CLIENT,
-    RS_IDX_NAME,
-    log,
-    mo,
-    redis,
-    shlex,
-    textwrap,
-):
-    rs_idx_state = ""
-    try:
-        _stmt = f"""FT.INFO {RS_IDX_NAME}"""
-        _ = textwrap.dedent(_stmt)
-        _ = shlex.split(_)
-        rs_idx_state = REDIS_CLIENT.execute_command(*_)
-    except redis.exceptions.RedisError as e:
-        log(e, level="warning" if "already" in str(e) else "error")
-
-    SEARCH_PRESETS: list[dict] = [
-        {"label": "by Meaning", "query": "trail shoes feel cramped"},
-        {"label": "by Exact", "query": "Trailhead"},
-        {"label": "by Typo", "query": "waterproofng"},
-    ]
-
+def rs_knn_md(EMBEDDING_MODEL, RS_IDX_NAME, mo):
     rs_meaning_pick = mo.ui.dropdown(
-        options={f"{preset['label']}: {preset['query']}": preset["query"] for preset in SEARCH_PRESETS},
-        value=f"{SEARCH_PRESETS[0]['label']}: {SEARCH_PRESETS[0]['query']}",
-        label="User Query",
+        options={
+            "Tom: my trail shoes feel cramped": "my trail shoes feel cramped",
+            "Tom: Trailhead": "Trailhead",
+            "Priya: waterproofng": "waterproofng",
+        },
+        value="Tom: my trail shoes feel cramped",
+        label="Who asks",
     )
 
-    _md_intro = mo.md(
-        textwrap.dedent(
-            f"""
-            ### 3a. Search by meaning with `KNN`
+    _intro = mo.md(f"""
+    ## Step 2. Search by meaning with `KNN`
 
-            In step 2, each article was stored with an **embedding**: a list of {EMBEDDING_MODEL.dim} numbers that captures what its title and body *mean*. To search by meaning, the notebook embeds the shopper's question with the same model, then asks Redis which stored embeddings are **closest** to the question's. Close embeddings mean similar meaning, even when the two texts share no words.
-            """
-        ).strip()
-    )
+    Tom's question shares no word with the article he needs. So the notebook embeds the question with the same embedding model that embedded the articles, and asks Redis for the stored embeddings **closest** to it. That is a k-nearest-neighbors search, `KNN`. Close embeddings mean similar meaning, even when the texts share no words. The `rss_search` function above sends this command, and every later chapter calls it.
+
+    > Among all articles, find the 3 closest in meaning to the question.
+
+    ```bash
+    FT.SEARCH {RS_IDX_NAME} "(*)=>[KNN 3 @embedding $vector AS vector_score]"
+         RETURN  5  title body category year vector_score
+         SORTBY     vector_score
+         DIALECT 2
+         PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+    ```
+
+    Reading it piece by piece:
+
+    - `(*)` is the **filter**: which articles take part, and `*` means all of them. `=>` passes them to the vector search on its right.
+    - `[KNN 3 @embedding $vector AS vector_score]` finds the **3** articles whose `embedding` is nearest to `$vector`, and names each distance `vector_score`.
+    - `RETURN 5 ...` sends back these **5** fields and leaves the embedding behind. `SORTBY vector_score` puts the closest article first.
+    - `DIALECT 2` turns on the query syntax that understands `=>[KNN ...]` and `$` parameters.
+    - `PARAMS 2 vector <bytes>` fills in `$vector`. The **2** counts the items that follow: the name `vector` and its value, the question's embedding as raw `FLOAT32` bytes. Bytes can't be typed into a command, so the notebook appends them as one extra argument.
+    """)
 
     _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Redis measures "close" with the metric the index declared in step 1, `DISTANCE_METRIC COSINE`, and returns it as **`vector_score`**, a cosine distance. **0** means the same meaning, around **1** means unrelated, and **lower is closer**.
-
-                **KNN** stands for *k nearest neighbors*. `KNN 3` returns the **3** closest articles, and it always returns three, even when none of them is a good match.
-                """
-            ).strip()
-        ),
+        mo.md("Redis measures closeness with the metric the index declared in step 1, `DISTANCE_METRIC COSINE`, and returns it as **`vector_score`**, a cosine distance. **0** means the same meaning, around **1** means unrelated, and **lower is closer**. `KNN 3` always returns three articles, even when none of them is a good match."),
         kind="info",
         title="Key idea: nearest neighbors",
     )
 
-    _md_command = mo.md(
-        textwrap.dedent(
-            f"""
-            > Among all articles, find the 3 closest semantic matches to the user's question.
-
-            ```bash
-            FT.SEARCH {RS_IDX_NAME} "(*)=>[KNN 3 @embedding $vector AS vector_score]"
-                 RETURN  4  title category year vector_score
-                 SORTBY     vector_score
-                 DIALECT 2
-                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
-            ```
-
-            Reading it piece by piece:
-
-            - `(*)` is the **filter**: which articles take part. `*` means all of them.
-            - `=>` passes those articles to the vector search on its right.
-            - `[KNN 3 @embedding $vector AS vector_score]` finds the **3** articles whose `embedding` field is nearest to `$vector`, and names each distance `vector_score`.
-            - `RETURN 4 ...` sends back these **4** fields for each hit, and leaves the embedding itself behind.
-            - `SORTBY vector_score` puts the closest article first.
-            - `DIALECT 2` turns on the query syntax that understands `=>[KNN ...]` and `$` parameters. Vector queries need it.
-            - `PARAMS 2 vector <bytes>` fills in `$vector`. The **2** counts the items that follow: the name `vector` and its value, the question's embedding as raw `FLOAT32` bytes. Bytes can't be typed into a command, so the notebook appends them as one extra argument. That's why the command shown with the results ends at `vector`.
-            """
-        ).strip()
-    )
-
-    _md_syntax = mo.md(
-        textwrap.dedent(
-            """
-            [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/) with a `KNN` query:
-
-            ```bash
-            FT.SEARCH <index> "<filter>=>[KNN <k> @<vector field> $<param> AS <score name>]"
-              RETURN <count> <field> [<field> ...]
-              SORTBY <field>
-              DIALECT 2
-              PARAMS <nargs> <name> <value> [<name> <value> ...]
-            ```
-
-            More in the [vector search guide](https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/).
-            """
-        ).strip()
-    )
-
     _try_it = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Pick each query below and watch where its target article lands in the results.
+        mo.md("""
+    Pick each question and watch where its target article lands.
 
-                - **by Meaning**, *trail shoes feel cramped*: **Finding your boot size** comes first, though no article contains "cramped" or "shoes".
-                - **by Typo**, *waterproofng*: **Restoring waterproofing on shells and boots** still comes first. The model splits words into pieces, and `water` and `proof` survive the typo.
-                - **by Exact**, *Trailhead*: **Resoling worn boots**, the only article that names this boot, comes third. An article's embedding sums up all of its text, so one product name barely moves it. Exact names are a job for full-text search on the `TEXT` fields: `FT.SEARCH <index> "Trailhead"` returns that article alone.
-                """
-            ).strip()
-        ),
+    - **Tom: my trail shoes feel cramped.** **Finding your boot size** comes first, at 0.5326, though no article contains "cramped" or "shoes". The next two score 0.7250 and 0.7351.
+    - **Priya: waterproofng.** **Restoring waterproofing on shells and boots** still comes first, at 0.5219. The embedding model splits words into pieces, and `water` and `proof` survive the typo.
+    - **Tom: Trailhead.** **Resoling worn boots**, the only article that names the Trailhead boots, comes third, at 0.8677, barely behind the first (0.8549). An embedding sums up all of an article's text, so one product name barely moves it. Exact names are a job for full-text search on the `TEXT` fields: `FT.SEARCH <index> "Trailhead"`.
+    """),
         kind="success",
         title="Try it",
     )
 
-    mo.vstack(
-        [
-            _md_intro,
-            _key_idea,
-            _md_command,
-            mo.accordion({"General syntax and docs": _md_syntax}),
-            _try_it,
-            rs_meaning_pick,
-        ],
-        gap=0.75,
-    )
-    return rs_idx_state, rs_meaning_pick
+    mo.vstack([_intro, _key_idea, _try_it, rs_meaning_pick], gap=0.75)
+    return (rs_meaning_pick,)
 
 
-@app.cell
-def rs_3a_meaning(
-    EMBEDDING_MODEL,
-    REDIS_CLIENT,
-    RS_IDX_NAME,
-    convert_to_embedding,
-    log,
-    mo,
-    rs_idx_state,
-    rs_meaning_pick,
-    rss_table,
-    shlex,
-):
-    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
-
-    log(f"Converting '{rs_meaning_pick.value}' to embedding", level="info")
-    _embedding = convert_to_embedding(model=EMBEDDING_MODEL, content=rs_meaning_pick.value)
-    log(f"Converted! ({len(_embedding)} bytes)", level="info")
-
-    _query = "(*)=>[KNN 3 @embedding $vector AS vector_score]"
-    _stmt = f"""
-    FT.SEARCH {RS_IDX_NAME} "{_query}"
-         RETURN  4  title category year vector_score
-         SORTBY     vector_score
-         DIALECT 2
-         PARAMS  2  vector
-    """
-    _ = shlex.split(_stmt)
-    _reply = REDIS_CLIENT.execute_command(*_, _embedding)
-
-    rss_table(_reply, query=_stmt, source_text=rs_meaning_pick.value)
+@app.cell(hide_code=True)
+def rs_knn(mo, redis, rs_meaning_pick, rss_index_info, rss_search, rss_table):
+    _hint = mo.md("_No articles to search yet. Press **Create** in step 1._")
+    mo.stop(not rss_index_info or not int(rss_index_info["num_docs"]), _hint)
+    try:
+        _rows = rss_search(rs_meaning_pick.value)
+    except redis.ResponseError as _error:  # Clean up everything dropped the index, and rss_index_info doesn't know yet
+        mo.stop("index" in str(_error).lower(), _hint)
+        raise
+    mo.stop(not _rows, mo.md("_No articles came back. They expire an hour after Create, so press **Create** again in step 1._"))
+    rss_table(_rows, f"`KNN 3` for *{rs_meaning_pick.value}*")
     return
 
 
 @app.cell(hide_code=True)
-def rs_3b_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
-    rs_floor_slider = mo.ui.slider(
-        start=0.0,
-        stop=1.0,
-        step=0.05,
-        value=0.4,
-        show_value=True,
-        debounce=True,
-        label="Similarity floor (cosine similarity)",
-    )
+def rs_floor_md(EMBEDDING_MODEL, RS_IDX_NAME, mo):
+    rs_floor_slider = mo.ui.slider(start=0.0, stop=1.0, step=0.05, value=0.4, show_value=True, debounce=True, label="Similarity floor (cosine similarity)")
 
-    _md_intro = mo.md(
-        textwrap.dedent(
-            """
-            ### 3b. Set a similarity floor with `VECTOR_RANGE`
+    _intro = mo.md(f"""
+    ## Step 3. Set a similarity floor with `VECTOR_RANGE`
 
-            `KNN` always returns *k* articles, so it can never tell you that nothing matches. [`VECTOR_RANGE`](https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/) asks a different question: instead of "the 3 closest articles", it asks for "every article within this distance". The answer can be **no articles at all**.
-            """
-        ).strip()
-    )
+    `KNN` always returns its 3, so it can't say that nothing matches. Tom's *Trailhead* got three articles in step 2, and every one was a weak match. `VECTOR_RANGE` asks a different question: not "the 3 closest articles" but "every article within this distance". The answer can be **no articles at all**.
+
+    > Among all articles, find up to 5 within 0.60 cosine distance of the question.
+
+    ```bash
+    FT.SEARCH {RS_IDX_NAME} "@embedding:[VECTOR_RANGE $radius $vector]=>{{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}}"
+         RETURN  5  title body category year vector_score
+         SORTBY     vector_score
+         LIMIT   0  5
+         DIALECT 2
+         PARAMS  4  radius  0.60  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+    ```
+
+    What's new since step 2:
+
+    - `@embedding:[VECTOR_RANGE $radius $vector]` keeps every article whose `embedding` is within `$radius` of `$vector`. It's a filter on its own, so no `(*)=>` comes before it.
+    - `=>{{...}}` sets options for that range. `$YIELD_DISTANCE_AS` names the distance, as `AS` did in step 2. `$EPSILON` is an accuracy setting, explained below.
+    - `LIMIT 0 5` skips no hits and returns at most **5**.
+    - `PARAMS 4` counts four items now, because there are two parameters: `radius` with its value, and `vector` with the question's bytes.
+    - The slider is a **similarity floor**, where higher is stricter. `$radius` is a **distance**, where lower is stricter. For cosine, distance is `1 - similarity`, so the notebook sends `radius = 1 - floor`: a floor of 0.40 becomes a radius of 0.60.
+    """)
 
     _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                An empty reply tells the app it has nothing relevant, so it can say so, ask a follow-up question, or hand off to a person, instead of presenting a weak match as the answer. LangCache and Agent Memory, in later columns, work the same way: when nothing clears their `similarityThreshold`, the reply is empty.
-                """
-            ).strip()
-        ),
+        mo.md("An empty reply tells the app it has nothing relevant, so it can say so, ask a follow-up question, or hand off to a person, instead of passing off a weak match as the answer. Chapters 2 and 4 use this same floor under another name: LangCache and Agent Memory call it `similarityThreshold`, and an empty reply means nothing cleared it."),
         kind="info",
         title="Key idea: an empty reply is an answer",
     )
 
-    _md_command = mo.md(
-        textwrap.dedent(
-            f"""
-            > Among all articles, find up to 5 semantic matches within 0.60 cosine distance of the user's question.
+    _epsilon = mo.md("""
+    The `HNSW` index finds neighbors by hopping through a graph instead of comparing the question with every article. That's fast, but a range search *can* stop early and miss an article near the edge of the radius. `$EPSILON` keeps it exploring candidates up to `radius * (1 + EPSILON)` away, and the default is `0.01`. It doesn't loosen the rule: only articles within `$radius` come back.
 
-            ```bash
-            FT.SEARCH {RS_IDX_NAME} "@embedding:[VECTOR_RANGE $radius $vector]=>{{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}}"
-                 RETURN  4  title category year vector_score
-                 SORTBY     vector_score
-                 LIMIT   0  5
-                 DIALECT 2
-                 PARAMS  4  radius  0.60  vector <{EMBEDDING_MODEL.dim * 4} bytes>
-            ```
-
-            What's new since 3a:
-
-            - `@embedding:[VECTOR_RANGE $radius $vector]` keeps every article whose `embedding` is within `$radius` of `$vector`. It's a filter on its own, so it needs no `(*)=>` in front.
-            - `=>{{...}}` sets options for that range. `$YIELD_DISTANCE_AS` names the distance, as `AS` did in 3a. `$EPSILON` is a search-accuracy setting, explained below.
-            - `LIMIT 0 5` skips no hits and returns at most **5**.
-            - `PARAMS 4` counts four items now, because there are two parameters: `radius` with its value, and `vector` with the question's bytes.
-            """
-        ).strip()
-    )
-
-    _floor_vs_radius = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                The slider is a **similarity floor**, where higher is stricter. Redis wants a **distance radius**, where lower is stricter. For cosine, distance is 1 − similarity, so the notebook sends `radius = 1 − floor`: a floor of **0.40** becomes a radius of **0.60**.
-                """
-            ).strip()
-        ),
-        kind="neutral",
-        title="Similarity floor vs. distance radius",
-    )
-
-    _md_epsilon = mo.md(
-        textwrap.dedent(
-            """
-            The `HNSW` index from step 1 finds neighbors by hopping through a graph instead of comparing the question with every article. That's fast, but a range search can stop early and miss a match near the edge. `$EPSILON` keeps it exploring candidates up to `radius × (1 + EPSILON)` away; the default is `0.01`. It doesn't loosen the rule: only articles within `$radius` come back.
-
-            It matters even with 36 articles. With the default, a floor of 0.40 returns nothing for *trail shoes feel cramped*, although **Finding your boot size** sits at a distance of about 0.54. With `0.5`, Redis finds it.
-            """
-        ).strip()
-    )
-
-    _md_syntax = mo.md(
-        textwrap.dedent(
-            """
-            [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/) with a `VECTOR_RANGE` query:
-
-            ```bash
-            FT.SEARCH <index> "@<vector field>:[VECTOR_RANGE $<radius> $<vector>]=>{$YIELD_DISTANCE_AS: <score name>}"
-              RETURN <count> <field> [<field> ...]
-              SORTBY <field>
-              LIMIT <offset> <count>
-              DIALECT 2
-              PARAMS <nargs> <name> <value> [<name> <value> ...]
-            ```
-
-            Other metrics, `L2` and `IP`, use the same `$radius` on a different distance scale. See [vector field options](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/).
-            """
-        ).strip()
-    )
+    Whether the default misses depends on the index. Right after a fresh index is first loaded, a floor of 0.40 can return nothing for *my trail shoes feel cramped*, although **Finding your boot size** sits at a distance of about 0.53. With `0.5`, Redis finds it. That's why the notebook sends `$EPSILON: 0.5`.
+    """)
 
     _try_it = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                The question still comes from the dropdown in 3a.
+        mo.md("""
+    The question still comes from the dropdown in step 2.
 
-                - With *trail shoes feel cramped*, the default floor of 0.40 lets one article through: **Finding your boot size**, at a distance of about 0.54. Raise the floor to 0.50 and the reply is empty.
-                - Switch the dropdown to *Trailhead*. The reply is empty at the default floor, while `KNN 3` in 3a still returned three articles.
-                """
-            ).strip()
-        ),
+    - With Tom's *my trail shoes feel cramped*, the slider's starting floor of 0.40 lets one article through: **Finding your boot size**, at a distance of 0.5326. Raise the floor to 0.50, a radius of 0.50, and the reply is empty.
+    - Switch the dropdown to Priya's *waterproofng*. At 0.40 only **Restoring waterproofing on shells and boots** gets through (0.5219).
+    - Switch to Tom's *Trailhead*. The reply is empty at 0.40, and still empty at 0.30, while `KNN 3` in step 2 returned three articles.
+    """),
         kind="success",
         title="Try it",
     )
 
-    mo.vstack(
-        [
-            _md_intro,
-            _key_idea,
-            _md_command,
-            _floor_vs_radius,
-            mo.accordion(
-                {
-                    "What EPSILON does": _md_epsilon,
-                    "General syntax and docs": _md_syntax,
-                }
-            ),
-            _try_it,
-            rs_floor_slider,
-        ],
-        gap=0.75,
-    )
+    mo.vstack([_intro, _key_idea, mo.accordion({"What EPSILON does": _epsilon}), _try_it, rs_floor_slider], gap=0.75)
     return (rs_floor_slider,)
 
 
 @app.cell(hide_code=True)
-def rs_3b_meaning(
-    EMBEDDING_MODEL,
+def rs_floor(
     REDIS_CLIENT,
     RS_IDX_NAME,
-    convert_to_embedding,
-    log,
+    ft_search_rows,
     mo,
+    redis,
     rs_floor_slider,
-    rs_idx_state,
     rs_meaning_pick,
+    rss_index_info,
     rss_table,
+    rss_vector,
     shlex,
 ):
-    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
-
-    log(f"Converting '{rs_meaning_pick.value}' to embedding", level="info")
-    _embedding = convert_to_embedding(model=EMBEDDING_MODEL, content=rs_meaning_pick.value)
-    log(f"Converted! ({len(_embedding)} bytes)", level="info")
-
-    _radii = round(1 - rs_floor_slider.value, 2)
-    _query = "@embedding:[VECTOR_RANGE $radius $vector]=>{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}"
-    _stmt = f"""
-    FT.SEARCH {RS_IDX_NAME} "{_query}"
-         RETURN  4  title category year vector_score
+    _hint = mo.md("_No articles to search yet. Press **Create** in step 1._")
+    mo.stop(not rss_index_info or not int(rss_index_info["num_docs"]), _hint)
+    _radius = round(1 - rs_floor_slider.value, 2)
+    _command = f"""
+    FT.SEARCH {RS_IDX_NAME} "@embedding:[VECTOR_RANGE $radius $vector]=>{{$YIELD_DISTANCE_AS: vector_score; $EPSILON: 0.5}}"
+         RETURN  5  title body category year vector_score
          SORTBY     vector_score
          LIMIT   0  5
          DIALECT 2
-         PARAMS  4  radius  {_radii}  vector
+         PARAMS  4  radius  {_radius}  vector
     """
-    _ = shlex.split(_stmt)
-    _reply = REDIS_CLIENT.execute_command(*_, _embedding)
-
-    rss_table(
-        _reply,
-        query=_stmt,
-        source_text=rs_meaning_pick.value,
-        params={
-            "Similarity floor": rs_floor_slider.value,
-            "$radius": _radii,
-        },
-    )
+    try:
+        _indexed = ft_search_rows(REDIS_CLIENT.execute_command("FT.SEARCH", RS_IDX_NAME, "*", "LIMIT", 0, 0))[0]  # a live count: rss_index_info only changes on Create
+        mo.stop(not _indexed, mo.md("_No articles came back. They expire an hour after Create, so press **Create** again in step 1._"))
+        _reply = REDIS_CLIENT.execute_command(*shlex.split(_command), rss_vector(rs_meaning_pick.value))
+    except redis.ResponseError as _error:  # Clean up everything dropped the index, and rss_index_info doesn't know yet
+        mo.stop("index" in str(_error).lower(), _hint)
+        raise
+    rss_table(ft_search_rows(_reply)[1], f"`VECTOR_RANGE` for *{rs_meaning_pick.value}*, floor {rs_floor_slider.value:.2f}, radius {_radius:.2f}")
     return
 
 
 @app.cell(hide_code=True)
-def rs_3c_meaning_prose(EMBEDDING_MODEL, RS_IDX_NAME, mo, textwrap):
-    rss_year_slider = mo.ui.slider(
-        start=2022,
-        stop=2026,
-        step=1,
-        value=2022,
-        show_value=True,
-        debounce=True,
-        label="Year floor",
-    )
+def rs_filter_md(EMBEDDING_MODEL, RS_IDX_NAME, mo):
+    rs_year_slider = mo.ui.slider(start=2022, stop=2026, step=1, value=2025, show_value=True, debounce=True, label="Earliest year")
 
-    _md_intro = mo.md(
-        textwrap.dedent(
-            """
-            ### 3c. Filter inside the vector search, not after it
+    _intro = mo.md(f"""
+    ## Step 4. Filter before ranking
 
-            Real searches mix meaning with plain rules: only recent articles, only one category, only one customer's data. Step 1 declared `year` as a `NUMERIC` field, so Redis can apply a year rule itself. This step runs the same search two ways and compares **where** the rule is applied.
-            """
-        ).strip()
-    )
+    Priya searches *Where is my parcel?*, because her tent hasn't arrived. Older articles may describe policies that have changed, so the assistant should skip articles from before an earliest year. There are two places to apply that rule, and they don't give the same results.
 
-    _scenario = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                - **Question:** *Where is my parcel?*, embedded into `$vector`.
-                - **Goal:** the **5** articles closest in meaning, with `KNN 5`.
-                - **Rule:** only articles from the **year floor** on. Set it with the slider below.
-                """
-            ).strip()
-        ),
-        kind="neutral",
-        title="The same on both sides",
-    )
+    > Among articles from 2022 and later, find the 5 closest in meaning to the question.
 
-    _md_command = mo.md(
-        textwrap.dedent(
-            f"""
-            **Post-filter**, the left results:
+    ```bash
+    FT.SEARCH {RS_IDX_NAME} "(@year:[2022 +inf])=>[KNN 5 @embedding $vector AS vector_score]"
+         RETURN  5  title body category year vector_score
+         SORTBY     vector_score
+         DIALECT 2
+         PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
+    ```
 
-            > Among all articles, find the 5 closest semantic matches to the user's question.
+    Reading it piece by piece:
 
-            ```bash
-            FT.SEARCH {RS_IDX_NAME} "*=>[KNN 5 @embedding $vector AS vector_score]"
-                 RETURN  4  title category year vector_score
-                 SORTBY     vector_score
-                 DIALECT 2
-                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
-            ```
+    - `@year:[2022 +inf]` is a numeric range on the `year` field: 2022 and later, with no upper limit. It works because step 1 declared `year` as `NUMERIC`. The **Earliest year** slider puts its year in place of 2022.
+    - It sits left of `=>`, where `*` sat in step 2, so Redis applies it **before** the vector search ranks anything. The rest is as in step 2, with `KNN 5`.
+    - The notebook runs the **pre-filter**, the command above, beside a **post-filter**: step 2's command with `KNN 5`, then the app drops older articles in Python.
 
-            The notebook then drops any article older than the year floor.
-
-            **Pre-filter**, the right results:
-
-            > Among articles from 2022 and later, find the 5 closest semantic matches to the user's question.
-
-            ```bash
-            FT.SEARCH {RS_IDX_NAME} "(@year:[2022 +inf])=>[KNN 5 @embedding $vector AS vector_score]"
-                 RETURN  4  title category year vector_score
-                 SORTBY     vector_score
-                 DIALECT 2
-                 PARAMS  2  vector <{EMBEDDING_MODEL.dim * 4} bytes>
-            ```
-
-            - `@year:[2022 +inf]` is a [numeric range](https://redis.io/docs/latest/develop/ai/search-and-query/query/range/) on the `year` field: 2022 and later, with no upper limit. The searches below put the slider's floor in place of 2022.
-            - `*` without parentheses means the same as `(*)` in 3a. The rest works as in 3a, with `KNN 5` in place of `KNN 3`.
-            """
-        ).strip()
-    )
+    ```python
+    post = [hit for hit in rss_search(question, k=5) if int(hit["year"]) >= earliest]
+    pre = rss_search(question, k=5, where=f"@year:[{{earliest}} +inf]")
+    ```
+    """)
 
     _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Whatever sits left of `=>` decides which articles may compete, and the KNN on the right ranks only those. Filter **after** the KNN and you can end up with fewer than 5 results: older articles took slots that newer ones never got a chance at. Filter **before** it and Redis returns 5 whenever at least 5 articles pass the rule.
-                """
-            ).strip()
-        ),
+        mo.md("Whatever sits left of `=>` decides which articles may compete, and the KNN on the right ranks only those. Filter **after** the KNN and you can end up with fewer than 5 results, because older articles took slots that newer ones never got a chance at. Filter **before** it and Redis returns 5 whenever at least 5 articles pass the rule. You'll use the same idea twice more: Context Retriever's filter tools in Chapter 3, and the `ownerId` filter on every Agent Memory search in Chapter 4, so one customer's records never crowd out another's."),
         kind="info",
-        title="Key idea: filter first, then rank",
-    )
-
-    _md_more_filters = mo.md(
-        textwrap.dedent(
-            """
-            - `@year:[2024 2025]` is a closed range: 2024 through 2025.
-            - `@category:{shipping}` matches a `TAG`. `@category:{shipping | returns}` matches either one.
-            - `@title:boots` is a full-text match on a `TEXT` field.
-            - `(@category:{shipping} @year:[2025 +inf])` needs both, because a space means AND.
-
-            A rule can only use fields the index declares in step 1. See [combined queries](https://redis.io/docs/latest/develop/ai/search-and-query/query/combined/).
-            """
-        ).strip()
-    )
-
-    _md_agent = mo.md(
-        textwrap.dedent(
-            """
-            Agent Memory sends a `filter` on `ownerId` with every search, and it's applied inside the vector search, like the right-hand query. Filtering afterward would let other customers' memories fill the *k* slots and leave this customer with fewer results, or none.
-            """
-        ).strip()
+        title="Key idea: filter before ranking",
     )
 
     _try_it = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Move the year floor and compare the two sides.
+        mo.md("""
+    The slider starts at 2025. Move the earliest year and compare the two sides.
 
-                - At **2022** and **2023**, both sides show the same five articles.
-                - At **2025**, the post-filter keeps 3 of its 5. The pre-filter still returns five, adding **Free shipping threshold** and **Backordered and out of stock items**.
-                - At **2026**, the post-filter keeps one. The pre-filter still fills all five slots, including weak matches like **Choosing a pack size by torso length**, because KNN returns *k* whenever enough articles pass.
-                """
-            ).strip()
-        ),
+    - At **2025**, the post-filter keeps 3 of its 5. The pre-filter still returns five, adding **Free shipping threshold** and **Backordered and out of stock items**.
+    - At **2022** and **2023**, both sides show the same five articles.
+    - At **2026**, the post-filter keeps one, **Missing and overdue shipments**. The pre-filter still fills all five slots, down to weak matches like **Choosing a pack size by torso length**, because KNN returns *k* whenever enough articles pass.
+    """),
         kind="success",
         title="Try it",
     )
 
-    mo.vstack(
-        [
-            _md_intro,
-            _scenario,
-            _md_command,
-            _key_idea,
-            mo.accordion(
-                {
-                    "Other rules you can put before =>": _md_more_filters,
-                    "Why it matters for Agent Memory": _md_agent,
-                }
-            ),
-            _try_it,
-            rss_year_slider,
-        ],
-        gap=0.75,
-    )
-    return (rss_year_slider,)
+    mo.vstack([_intro, _key_idea, _try_it, rs_year_slider], gap=0.75)
+    return (rs_year_slider,)
 
 
 @app.cell(hide_code=True)
-def rs_3c_meaning(
-    EMBEDDING_MODEL,
-    REDIS_CLIENT,
-    RS_IDX_NAME,
-    convert_to_embedding,
+def rs_filter(
     mo,
-    rs_idx_state,
+    redis,
+    rs_year_slider,
+    rss_index_info,
+    rss_search,
     rss_table,
-    rss_year_slider,
-    shlex,
 ):
-    mo.stop(not rs_idx_state, mo.md("_No index yet. Run the `FT.CREATE` button above._"))
-
-    _year = rss_year_slider.value
-    _vector = convert_to_embedding(model=EMBEDDING_MODEL, content="Where is my parcel?")
-
-    _unfiltered = f"""
-    FT.SEARCH {RS_IDX_NAME}
-         "*=>[KNN 5 @embedding $vector AS vector_score]"
-         RETURN  4  title category year vector_score
-         SORTBY     vector_score
-         DIALECT 2
-         PARAMS  2  vector
-    """
-    _filtered = f"""
-    FT.SEARCH {RS_IDX_NAME} 
-         "(@year:[{_year} +inf])=>[KNN 5 @embedding $vector AS vector_score]"
-         RETURN  4  title category year vector_score
-         SORTBY     vector_score
-         DIALECT 2
-         PARAMS  2  vector
-    """
-    _top5 = REDIS_CLIENT.execute_command(*shlex.split(_unfiltered), _vector)
-    _knn5 = REDIS_CLIENT.execute_command(*shlex.split(_filtered), _vector)
-
+    _hint = mo.md("_No articles to search yet. Press **Create** in step 1._")
+    mo.stop(not rss_index_info or not int(rss_index_info["num_docs"]), _hint)
+    _earliest = rs_year_slider.value
+    _question = "Where is my parcel?"
+    try:
+        _post = [_hit for _hit in rss_search(_question, k=5) if int(_hit["year"]) >= _earliest]
+        _pre = rss_search(_question, k=5, where=f"@year:[{_earliest} +inf]")
+    except redis.ResponseError as _error:  # Clean up everything dropped the index, and rss_index_info doesn't know yet
+        mo.stop("index" in str(_error).lower(), _hint)
+        raise
+    mo.stop(not _pre, mo.md("_No articles came back. They expire an hour after Create, so press **Create** again in step 1._"))
     mo.hstack(
         [
-            mo.vstack(
-                [
-                    mo.md("**Post-filter** — KNN on all articles, then the app drops older years"),
-                    rss_table(
-                        _top5,
-                        query=_unfiltered,
-                        source_text="Where is my parcel?",
-                        params={"Year floor (app filter)": _year},
-                        keep=lambda row: int(row["year"]) >= _year,
-                    ),
-                ],
-                gap=0.5,
-            ),
-            mo.vstack(
-                [
-                    mo.md("**Pre-filter** — `@year` range before `=>`, then KNN 5"),
-                    rss_table(
-                        _knn5,
-                        query=_filtered,
-                        source_text="Where is my parcel?",
-                        params={"@year floor": _year},
-                    ),
-                ],
-                gap=0.5,
-            ),
+            rss_table(_post, f"Post-filter: `KNN 5`, then the app drops articles before {_earliest}"),
+            rss_table(_pre, f"Pre-filter: `@year:[{_earliest} +inf]` before `=>`, then `KNN 5`"),
         ],
         widths="equal",
         gap=1.5,
@@ -1070,862 +642,381 @@ def rs_3c_meaning(
 
 
 @app.cell(hide_code=True)
-def rs_build_md(mo, textwrap):
-    _hidden = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Two helper functions run behind the steps above: `convert_to_embedding` turns each question into the bytes Redis searches, and `rss_table` draws each result. Their cells are at the bottom of this column with the code collapsed. Expand them in `marimo edit`, or pick **Show code** from the app menu in `marimo run`.
-                """
-            ).strip()
-        ),
-        kind="neutral",
-        title="Hidden: the helper code",
-    )
+def rs_ends(mo):
+    _ends_on = mo.md("**Where this stops.** She gets a short list, mostly shipping articles. She wanted an answer, and no article knows where her tent is. In Chapter 2, a model reads these articles and writes the answer.")
 
-    _md_commands = mo.md(
-        textwrap.dedent(
-            """
-            Each step's code is in the cell right under its explanation. `FT.CREATE` and every `FT.SEARCH` there are written as text, the way `redis-cli` takes them. `shlex.split` turns that text into the arguments `REDIS_CLIENT.execute_command` sends. A search also needs the question's embedding as raw bytes: `convert_to_embedding`, in the `rs_connect` cell, makes them by running the model on this machine.
-            """
-        ).strip()
-    )
+    _docs = mo.md("""
+    - The [Redis Search overview](https://redis.io/docs/latest/develop/ai/search-and-query/) and the [hashes page](https://redis.io/docs/latest/develop/data-types/hashes/)
+    - [`FT.CREATE`](https://redis.io/docs/latest/commands/ft.create/), the [schema definition](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/schema-definition/), and the [field and type options](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/field-and-type-options/)
+    - [`HSET`](https://redis.io/docs/latest/commands/hset/), [`EXPIRE`](https://redis.io/docs/latest/commands/expire/), and [indexing hash documents](https://redis.io/docs/latest/develop/ai/search-and-query/indexing/#hash-documents)
+    - [`FT.SEARCH`](https://redis.io/docs/latest/commands/ft.search/) and the [vector search guide](https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/), which covers `KNN` and `VECTOR_RANGE`
+    - [Range queries](https://redis.io/docs/latest/develop/ai/search-and-query/query/range/) and [combined queries](https://redis.io/docs/latest/develop/ai/search-and-query/query/combined/), for other rules you can put before `=>`, such as `@category:{shipping}`
+    """)
 
-    _md_results = mo.md(
-        textwrap.dedent(
-            """
-            `rss_table`, in the `rs_render` cell, turns each `FT.SEARCH` reply into what you see under each search: the inputs, the command, a hit count, a table and the raw reply. It reads the reply with helpers from `cairn_support.redis_search_replies`.
-            """
-        ).strip()
-    )
-
-    mo.vstack(
-        [
-            _hidden,
-            mo.accordion(
-                {
-                    "How commands reach Redis": _md_commands,
-                    "How results are drawn": _md_results,
-                }
-            ),
-        ],
-        gap=0.75,
-    )
+    mo.vstack([_ends_on, mo.accordion({"Docs for this chapter": _docs})], gap=0.75)
     return
 
 
 @app.cell(hide_code=True)
-def rs_connect(embed_texts):
-    def convert_to_embedding(model, content: str) -> bytes:
-        """Convert text to an embedding vector."""
-        return embed_texts(model, [content])[0].astype("float32").tobytes()
+def rs_render(mo):
+    from html import escape
 
-    return (convert_to_embedding,)
+    from cairn_support.redis_search_replies import ft_search_markdown_table
 
 
-@app.cell(hide_code=True)
-def rs_render(mo, textwrap):
-    from cairn_support.redis_search_replies import (
-        format_ft_search_reply,
-        ft_search_inputs_markdown,
-        ft_search_markdown_table,
-        ft_search_result_summary,
-        ft_search_rows,
-    )
+    def rss_text(text: str) -> mo.Html:
+        """Text as the model gets it, in a code block. mo.md would add a blank line before every list item."""
+        return mo.Html(f'<span class="markdown prose dark:prose-invert contents"><div class="language-text codehilite"><pre><span></span><code>{escape(text)}</code></pre></div></span>')
 
 
-    def rss_table(
-        reply: list | dict,
-        *,
-        query: str,
-        source_text: str,
-        params: dict | None = None,
-        keep=None,
-    ) -> mo.Html:
-        """An FT.SEARCH reply as the command, a count, a table, and the raw reply. RESP3 is a map with ``total_results`` and ``results``; RESP2 is a flat list.
-        `keep` is a filter the app applies to the rows after Redis answers."""
-        total, rows = ft_search_rows(reply)
-        kept = [row for row in rows if keep(row)] if callable(keep) else rows
-        summary = ft_search_result_summary(total, len(rows), len(kept) if callable(keep) else None)
-        table = ft_search_markdown_table(kept) if kept else None
-        command = textwrap.dedent(query).strip()
-        return mo.vstack(
-            [
-                mo.md(ft_search_inputs_markdown(source_text, params)),
-                mo.md(f"```bash\n{command}\n```"),
-                mo.md(f"**{summary}**"),
-                mo.md(table if table else "_No article._"),
-                mo.accordion(
-                    {"The reply as Redis sent it": mo.md("```text\n" + format_ft_search_reply(reply) + "\n```")}
-                ),
-            ],
-            gap=0.5,
-        )
+    def rss_table(rows: list[dict], caption: str = "") -> mo.Html:
+        """The hits as a markdown table (title, category, year, vector_score) under a one-line caption with the hit count."""
+        table = ft_search_markdown_table(rows) if rows else "_No article._"
+        return mo.md(f"**Hits: {len(rows)}.** {caption}\n\n{table}")
 
-    return (rss_table,)
+    return rss_table, rss_text
 
 
 @app.cell(column=2, hide_code=True)
 def lc_title(mo):
-    mo.md(f"""
-    # Redis LangCache
+    _intro = mo.md("""
+    # Chapter 2. Semantic caching: answer once, serve many
 
-    As Cairn Outfitters, you store gear-care answers in LangCache as entries, mapped like..
+    Priya wanted an answer, not a list of articles. So Cairn puts a model on top of Chapter 1: search the help center, then let the model write the answer from the articles. It works, but customers ask the same care questions in different words, and each one pays for a model call and the wait for it.
 
-      `prompt → {{ response, entryId }}`
+    **Redis LangCache** is a hosted cache that matches by meaning, and unlike Chapter 1's Redis commands, you call it over HTTP. It stores each answer under the question it answered, and a reworded question can reuse it.
 
-    ```json
-    {{
-      "prompt": "How do I wash my down sleeping bag?",
-      "response": "Use a front-loading machine and a down-specific soap..",
-      "entryId": "01J..",
-      "ttlMillis": 900000
-    }}
+    ## You'll learn how to
+
+    1. Put a cache in front of the model: search it first, store the model's answer after, with a TTL (time to live). This is cache-aside.
+    2. Set `similarityThreshold`, the similarity floor from Chapter 1, and see what the choice trades.
+    """)
+
+    _hops = mo.md("""
+    Each line reads source, target, and what passes between them:
+
+    ```text
+    App       -> LangCache        POST /entries/search: prompt, similarityThreshold
+    LangCache -> embedding model  the model chosen when the service was created
+    LangCache -> your Redis       a vector search over the cache's index
+    LangCache -> App              200, data: [the best entry at or above the threshold], or data: []
+    App       -> your Redis       only when data is empty: FT.SEARCH for the help articles closest to the question (Chapter 1)
+    App       -> LLM              only when data is empty: the question, with those articles in the system prompt
+    App       -> LangCache        POST /entries: prompt, response, ttlMillis, then 201 with an entryId
+    ```
+    """)
+
+    _requests = mo.md("""
+    ## Step 1. Search the cache before the model
+
+    > Has anyone asked this before?
+
+    ```text
+    POST /v1/caches/<LANGCACHE_CACHE_ID>/entries/search
+    Authorization: Bearer <LANGCACHE_API_KEY>
+    Content-Type: application/json
+
+    {"prompt": "How do I wash my down sleeping bag?", "similarityThreshold": 0.85}
     ```
 
-    [**Redis LangCache**](https://redis.io/docs/latest/develop/ai/context-engine/langcache/) stores those answers and matches a new question to them by meaning. Your app searches before the model. On a miss, it calls the model and stores the answer.
+    Reading it piece by piece:
 
-    A reworded question can reuse a stored answer, with no second model call.
+    - The path holds the cache's id. `Authorization` carries the one credential, which the notebook shows as a placeholder and never prints.
+    - `prompt` is the question. LangCache embeds it inside the service and compares it with the stored prompts, so the app sends text, never a vector.
+    - `similarityThreshold` is Chapter 1's similarity floor under LangCache's name: an entry scoring at or above it is a hit, so a higher number is stricter.
+    - The reply is HTTP 200 either way. `data` holds the best entry at or above the floor, with its `similarity` (LangCache returns one entry unless a request sets `maxResults`). A miss is `data: []`, not a 404.
 
-    ---
+    ## Step 2. Store the answer after the model
 
-    ## We'll learn how to..
+    > Keep what the model wrote, so the next customer who asks the same thing doesn't cost a model call.
 
-    1. Store an answer with `POST /entries`.
-    2. Search with `POST /entries/search` before calling the model.
-    3. Set `similarityThreshold` and `ttlMillis`.
+    ```text
+    POST /v1/caches/<LANGCACHE_CACHE_ID>/entries
+    Authorization: Bearer <LANGCACHE_API_KEY>
+    Content-Type: application/json
+
+    {"prompt": "How do I wash my down sleeping bag?", "response": "<the model's answer>", "ttlMillis": 900000}
+    ```
+
+    Reading it piece by piece:
+
+    - `prompt` is the question the answer was written for. Later questions are compared with it.
+    - `response` is the answer the model wrote.
+    - `ttlMillis` is how long the entry lives: 900000 ms is 15 minutes. A new cache never expires entries unless you send it, so the app sends it every time.
+    - A 201 returns the `entryId`. LangCache derives it from the prompt, so storing the same prompt again replaces the entry. Entries can't be listed, so the app keeps each id it gets in a ledger, and Clear sends `DELETE /entries/{entryId}` for each one.
     """)
-    return
-
-
-@app.cell(hide_code=True)
-def lc_store_button(lcs_session, mo, textwrap):
-    _ = lcs_session  # the buttons appear once the session exists, so a press never runs ahead of the settings check
-    lcs_seed_button = mo.ui.run_button(label="Seed")
-    lcs_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
-
-    _heading = mo.md(
-        textwrap.dedent(
-            """
-            ### 1. Store an answer with `POST /entries`
-
-            Seed stores five gear-care answers; the table below is this kernel's ledger because entries cannot be listed.
-            """
-        ).strip()
-    )
 
     _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                LangCache derives the `entryId` from the prompt, so a second Seed returns the same five ids and replaces each response and TTL. Each answer the chat stores on a miss joins the ledger.
-                """
-            ).strip()
-        ),
+        mo.md("A hit means the question is close in meaning, not that the answer is right. A threshold only trades wrong answers for misses, so cache only answers that are right for anyone who asks."),
         kind="info",
-        title="Key idea",
+        title="Key idea: similar isn't the same",
     )
 
-    _request = mo.md(
-        textwrap.dedent(
-            """
-            ```text
-            POST /v1/caches/<LANGCACHE_CACHE_ID>/entries
-            Authorization: Bearer <LANGCACHE_API_KEY>
-            Content-Type: application/json
+    _try_it = mo.callout(
+        mo.md("""
+    Ask the four questions in order with **Ask**, at 0.85 unless a step says otherwise. Each miss stores its answer, so asking a question twice hits it. Press **Clear** to start again: it deletes the entries this notebook stored, and any others expire after 15 minutes. **Ask** runs `lcs_answer`, the code shown below the results.
 
-            {"prompt": "How do I wash my down sleeping bag?", "response": "Use a front-loading machine and a down-specific soap, then dry it on low heat with clean tennis balls to break up the clumps.", "ttlMillis": 900000}
-            ```
-
-            Reading it piece by piece:
-
-            - `prompt` is the question that was answered.
-            - `response` is the stored gear-care answer.
-            - `ttlMillis` is how long the entry lives. Seed uses 900000 ms. A new cache's default TTL is no expiration, so the app sends `ttlMillis` every time.
-            - A 201 returns the `entryId`.
-            """
-        ).strip()
-    )
-
-    _buttons_note = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                **Seed** sends `POST /entries` for five answers. **Clean up** sends `DELETE /entries/{entryId}` for every id in the ledger. 204 is deleted. 404 means the TTL ran out first.
-                """
-            ).strip()
-        ),
-        kind="success",
-        title="What the buttons do",
-    )
-
-    _hops = mo.md(
-        textwrap.dedent(
-            """
-            Each line reads source, target, and what passes between them:
-
-            ```text
-            App       -> LangCache        POST /entries/search: prompt, similarityThreshold, searchStrategies, maxResults 5
-            LangCache -> embedding model  the model chosen when the service was created
-            LangCache -> your Redis       a vector search over the cache's index
-            LangCache -> App              200, data: [entries at or above the threshold, best first], or data: []
-            App       -> LLM              the question alone, only when data is empty
-            App       -> LangCache        POST /entries: prompt, response, ttlMillis, then 201 with an entryId
-            ```
-
-            LangCache embeds inside the service. This column sends text, never a vector. `LLM_API_KEY` is the chat key and is not the embedding provider. You pick that model when you create the service: Redis's own provider, OpenAI with your key, or your own endpoint that speaks the OpenAI embeddings API.
-
-            Settings: `LANGCACHE_HOST` (with `https://`), `LANGCACHE_CACHE_ID`, and `LANGCACHE_API_KEY`, plus `LLM_API_KEY` for a miss. The host and the cache id are on the service's Connectivity page, and the API key is the Bearer token.
-
-            Docs: [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/),
-            [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/),
-            [create a service](https://redis.io/docs/latest/operate/iris/langcache/create-service/),
-            [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/), and
-            [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/).
-            """
-        ).strip()
-    )
-
-    mo.vstack(
-        [
-            _heading,
-            _key_idea,
-            _request,
-            _buttons_note,
-            mo.hstack([lcs_seed_button, lcs_cleanup_button], justify="start"),
-            mo.accordion({"How a search reaches Redis": _hops}),
-        ],
-        gap=0.75,
-    )
-    return lcs_cleanup_button, lcs_seed_button
-
-
-@app.cell(hide_code=True)
-def lc_store(
-    GEAR_CARE_ANSWERS,
-    lcs_chatbot,
-    lcs_cleanup_button,
-    lcs_entries,
-    lcs_entry,
-    lcs_forget,
-    lcs_seed,
-    lcs_seed_button,
-    lcs_store_table,
-    lcs_wire,
-    mo,
-):
-    _note = ""
-    if lcs_seed_button.value:
-        _results = lcs_seed()
-        _failed = [f"{r['key']}: {r['status']} {r['type']}" for r in _results if r["status"] != 201]
-        _note = (
-            f"Stored {len(_results) - len(_failed)} of {len(_results)} answers, each 201 with an `entryId`, for 900000 ms."
-            + (f" Failed: {', '.join(_failed)}." if _failed else "")
-        )
-    if lcs_cleanup_button.value:
-        _deleted, _gone, _failed = lcs_forget()
-        _note = (
-            f"Clean up sent `DELETE` for each id in the ledger. {len(_deleted)} answered 204, and {len(_gone)} answered 404 because the TTL had run out."
-            + (f" Failed: {', '.join(_failed)}." if _failed else "")
-        )
-    _ = lcs_chatbot.value  # a miss stores an answer, so each turn lists the ledger again
-
-    lcs_store = dict(lcs_entries)  # a snapshot of the ledger, so the sweep and the workbench rerun after Seed, Clean up, and each turn
-
-    _sends = []  # with an empty ledger, show the request Seed would send for the first answer
-    if not lcs_store:
-        _first = GEAR_CARE_ANSWERS[0]
-        _sends = [
-            mo.md("**What Seed sends**, for the first answer:"),
-            lcs_wire("POST", "/entries", lcs_entry(_first["prompt"], _first["response"], 900_000)),
-        ]
-
-    mo.vstack(([mo.md(_note)] if _note else []) + [lcs_store_table(lcs_store)] + _sends)
-    return (lcs_store,)
-
-
-@app.cell(hide_code=True)
-def lc_controls(mo, textwrap):
-    # No control sits upstream of this chat. A LangCache turn has no session, and the model sees the question alone,
-    # so a changed threshold, strategy, or TTL applies to the next turn and the history stays, which the steps below
-    # rely on. All three controls live in lc_chat and are read at call time through lcs_settings().
-
-    _search_heading = mo.md("### 2. Search with `POST /entries/search` before calling the model")
-
-    _search_key = mo.callout(
-        mo.md(
-            "The app searches first. A miss is HTTP 200 with `data: []`, not a 404. On a miss the model answers and the app stores with `POST /entries`."
-        ),
-        kind="info",
-        title="Key idea",
-    )
-
-    _search_request = mo.md(
-        textwrap.dedent(
-            """
-            ```text
-            POST /v1/caches/<LANGCACHE_CACHE_ID>/entries/search
-            {"prompt": "What's the right way to launder a goose-down sleeping bag?", "similarityThreshold": 0.85, "searchStrategies": ["semantic"], "maxResults": 5}
-            ```
-
-            Reading it piece by piece:
-
-            - `prompt` is the question.
-            - `similarityThreshold` is the floor. The cache default is 0.85.
-            - `searchStrategies` is `semantic` or `exact`.
-            - `maxResults` is 5.
-            """
-        ).strip()
-    )
-
-    _search_try = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Type `/` in the chat box to pick a starter message.
-
-                - Send the goose-down question first. It says launder where the stored prompt says wash, yet the down-bag answer is served. The pane shows the search and its reply.
-                - Send "How do I wash my synthetic sleeping bag?" next. The same answer comes back at a higher similarity, and it is wrong for a synthetic bag, so the pane says wrong answer.
-                """
-            ).strip()
-        ),
+    1. Question 1, Tom's. It misses: the cache is empty, so the assistant searches the help center, the model writes the answer from the articles, and the app stores it. Read the system prompt: the app decides what the model sees. Note the total time.
+    2. Question 2, another customer's. It hits at about 0.905 with no model call, though it says *launder* where the stored prompt says *wash*. Compare its total with the one you noted for question 1.
+    3. Question 3, Priya's. She's served the down answer at about 0.950, higher than the real rewording. Look for care that only suits down, such as drying with tennis balls. The synthetic article says to skip them.
+    4. Set the threshold to 0.96 and ask question 3, then question 2, again. Both miss: the nearest stored prompt scores 0.950 for question 3 and 0.905 for question 2. Look for the synthetic article's advice in Priya's new answer. No threshold keeps the right hit and drops the wrong one, because the wrong match scores higher.
+    5. Set the threshold back to 0.85 and ask question 4, Priya's. Nothing stored is close (about 0.62), so it misses and the model answers from whatever articles it gets. Look for what it can't say: where her tent is. The app stores that answer for everyone.
+    """),
         kind="success",
         title="Try it",
     )
 
-    _ttl_heading = mo.md("### 3. Set `similarityThreshold` and `ttlMillis`")
-
-    _ttl_key = mo.callout(
-        mo.md(
-            "The threshold trades wrong answers for misses. `ttlMillis` caps how stale a stored answer gets, because a new cache never expires entries on its own."
-        ),
-        kind="info",
-        title="Key idea",
-    )
-
-    _ttl_try = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                - Move `similarityThreshold` to 0.96. The table loses the wrong answer and every hit with it.
-                - Set `ttlMillis` to 10 seconds and send the synthetic bag question again. At 0.96 it misses, the model answers, and the app stores the answer for 10000 ms. Send it again right away and the chat's own answer is served at similarity 1. Wait fifteen seconds and send it a third time, and the miss returns.
-                - Set `searchStrategies` to `exact` and send "HOW DO I WASH MY DOWN SLEEPING BAG?", the all-caps copy which `semantic` missed. It hits at similarity 1. Send the goose-down question again and `exact` misses it.
-                - Set the strategy back to `semantic`, the slider to 0.85, and the TTL to 1 minute. Send the snapped tent pole question ("At Cairn Outfitters: How do I fix a snapped tent pole?"). It misses and is stored. Send the broken tent pole rewording ("At Cairn Outfitters: What should I do about a broken tent pole?"). The chat's own answer is served at about 0.94.
-                - Select Clean up. The 10 second answers have expired, so their `DELETE` answers 404. The seeds answer 204, and so does the tent pole answer if its minute has not passed.
-                """
-            ).strip()
-        ),
-        kind="success",
-        title="Try it",
-    )
-
-    mo.vstack(
-        [
-            _search_heading,
-            _search_key,
-            _search_request,
-            _search_try,
-            _ttl_heading,
-            _ttl_key,
-            _ttl_try,
-        ],
-        gap=0.75,
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def lc_workbench(
-    lcs_chatbot,
-    lcs_get_strategy,
-    lcs_get_threshold,
-    lcs_json,
-    lcs_prompts,
-    lcs_request,
-    lcs_strategy,
-    lcs_threshold,
-    lcs_threshold_table,
-    lcs_ttl,
-    lcs_turn_scores,
-    lcs_turns,
-    lcs_wire,
-    mo,
-):
-    _t = round(lcs_get_threshold(), 2)
-    _strategy = lcs_get_strategy()
-    _ = lcs_chatbot.value  # a turn appends to lcs_turns, and this rerun shows it
-    _turn = lcs_turns[-1] if lcs_turns else None
-
-    if _turn is None:
-        _data = [
-            mo.md("**Next turn**, the first starter message until you send one. The controls are read when you send."),
-            mo.md("**Search request**, from `lcs_request`"),
-            lcs_wire("POST", "/entries/search", lcs_request(lcs_prompts[0], _t, _strategy)),
-        ]
-    else:
-        _decision = _turn["decision"]
-        if _decision in ("hit", "wrong answer"):
-            _line = f"**{_decision}**: similarity {_turn['similarity']:.3f} in {_turn['ms']} ms, served from the cache with no model call."
-        elif _decision == "miss" and "entry_id" in _turn:
-            _line = f"**miss**: `data` was empty, so the model answered and the app stored it for {_turn['ttl_ms']} ms, entryId `{_turn['entry_id']}`."
-        elif _decision == "another app's entry":
-            _line = f"**another app's entry**: the best match, at similarity {_turn['similarity']:.3f}, is not from this kernel, so nothing was served or stored."
-        elif _decision == "error":
-            _line = f"**error**: LangCache answered {_turn['status']}, so nothing was served or stored."
-        else:
-            _line = "**miss, nothing stored**: `data` was empty, and the model call failed or the store did not answer 201, so nothing was stored."
-        _data = [
-            mo.md(f"**Last turn**, {_turn['question']}"),
-            mo.md(_line),
-            mo.md("**Search request**, from `lcs_request`"),
-            lcs_wire("POST", "/entries/search", _turn["search"]),
-            mo.md(f"**Reply**, {_turn['status']}, with other apps' entries hidden"),
-            lcs_json(_turn["reply"]),
-        ]
-        if "store" in _turn:
-            _data += [
-                mo.md(f"**Store request**, from `lcs_entry`, answered {_turn['store_status']} in {_turn['store_ms']} ms"),
-                lcs_wire("POST", "/entries", _turn["store"]),
-            ]
-    _data += [
-        mo.md("---"),
-        mo.md("Moving the slider redraws this pane without a new request. The app sends one search per turn and one store after a miss. The notebook adds seven searches behind the table after each turn while the ledger holds entries."),
-        mo.md(
-            "Each row is a question's best entry from this kernel at 0.50. "
-            "The seven questions are searched with `maxResults` 5 after Seed and after each turn, while the ledger holds entries. "
-            "The slider is the cut LangCache applies when you send `similarityThreshold`: an entry at or above it is served, "
-            "a hit when it is the question's target, a wrong answer when not."
-        ),
-        lcs_threshold,
-        lcs_threshold_table(lcs_turn_scores, _t),
+    _asks = [
+        ("Tom", "How do I wash my down sleeping bag?"),
+        ("Another customer", "What's the right way to launder a goose-down sleeping bag?"),
+        ("Priya", "How do I wash my synthetic sleeping bag?"),
+        ("Priya", "Where's my tent?"),
     ]
+    _questions = {f"{n}. {who}: {text}": text for n, (who, text) in enumerate(_asks, 1)}
 
-    mo.hstack(
-        [
-            mo.vstack([mo.hstack([lcs_strategy, lcs_ttl], justify="start", gap=2), lcs_chatbot]),
-            mo.vstack(_data),
-        ],
-        widths=[5, 6],
-        gap=1.5,
-        align="start",
+    # Ask is a button, not a form: a form ignores a second press when its values haven't changed. A typed question wins over the picked one.
+    lcs_ask = (
+        mo.md("{pick}\n\n{text}\n\n{threshold}")
+        .batch(
+            pick=mo.ui.dropdown(_questions, value=next(iter(_questions)), label="Question", full_width=True),
+            text=mo.ui.text(label="Or type your own", placeholder="Overrides the question above when filled", full_width=True),
+            threshold=mo.ui.slider(start=0.80, stop=1.00, step=0.01, value=0.85, label="similarityThreshold", show_value=True, debounce=True),
+        )
     )
-    return
+    lcs_go = mo.ui.run_button(label="Ask")
+    lcs_clear = mo.ui.run_button(label="Clear", kind="danger", tooltip="Delete this kernel's cache entries by id")
+
+    mo.vstack(
+        [
+            _intro,
+            mo.accordion({"The cache-aside path: who sends what to whom": _hops}),
+            _requests,
+            _key_idea,
+            _try_it,
+            lcs_ask,
+            mo.hstack([lcs_go, lcs_clear], justify="start"),
+        ],
+        gap=0.75,
+    )
+    return lcs_ask, lcs_clear, lcs_go
 
 
 @app.cell(hide_code=True)
-def lc_build_md(mo):
-    mo.md(r"""
-    ## The LangCache code: session, request, store, turn
+async def lc_ask(
+    json,
+    lcs_answer,
+    lcs_ask,
+    lcs_call,
+    lcs_clear,
+    lcs_entries: dict[str, str],
+    lcs_forget,
+    lcs_go,
+    lcs_request,
+    lcs_system,
+    mo,
+    recording,
+    redis,
+    rss_search,
+    rss_text,
+    time,
+):
+    # Clear comes first on purpose: it deletes this kernel's entries by id, says how many went, and stops, so a Clear never asks a question.
+    if lcs_clear.value:
+        _deleted, _expired = lcs_forget()
+        _held = f" {len(lcs_entries)} could not be deleted and are still held." if lcs_entries else ""
+        mo.stop(True, mo.md(f"Cleared with `DELETE /entries/<entryId>`: {_deleted} deleted (204), and {_expired} had already expired (404).{_held}"))
+    mo.stop(not lcs_go.value, mo.md("Pick a question, set a threshold, and press **Ask**."))
+    _question = lcs_ask.value["text"].strip() or lcs_ask.value["pick"]
+    _threshold = round(lcs_ask.value["threshold"], 2)
 
-    One cell per step, with the code visible in `marimo edit`. In `marimo run`, pick **Show code** from the app menu.
-    Every `lcs_call` goes to LangCache, and the rest is the app. Seed and Clean up call the store functions, and each chat turn calls `lcs_turn`.
-    """)
+    # One extra search at threshold 0 finds the nearest stored prompt, so a miss can show how close it came. It runs before the turn, because a miss stores its own answer, which would then be nearest.
+    _probe = lcs_call("POST", "/entries/search", lcs_request(_question, 0))
+    _nearest = _probe.payload["data"][:1] if _probe.status == 200 else []
+    _no_match = "The cache holds nothing this notebook stored." if _probe.status == 200 and not (_nearest or lcs_entries) else "No stored prompt came back from a second search at threshold 0."
+
+    # The turn, timed, with its LangCache requests recorded in order: the search, then the store after a miss.
+    _start = time.perf_counter()
+    try:
+        with recording() as _wire:
+            _answer = await lcs_answer(_question, _threshold)
+    except redis.ResponseError as _error:
+        mo.stop("index" in str(_error).lower(), mo.md("The help center has no index yet. Press **Create** in Chapter 1 first."))
+        raise
+    except Exception as _error:
+        if not _wire or _wire[0].status != 200:  # the cache search itself failed, so there is no search to show
+            raise
+        _answer = f"**No answer.** The turn failed after the cache search: `{type(_error).__name__}: {' '.join(str(_error).split())[:160]}`"
+    _total = round((time.perf_counter() - _start) * 1000)
+    _search, *_stores = _wire
+
+
+    def _fence(kind: str, text: str) -> str:
+        return f"```{kind}\n{text}\n```"
+
+
+    def _request(x) -> str:
+        """A recorded request as the notebook sent it, with the key masked."""
+        return _fence("text", f"{x.method} /v1/caches/<LANGCACHE_CACHE_ID>{x.path}\nAuthorization: Bearer <LANGCACHE_API_KEY>\n\n{json.dumps(x.body, indent=2)}")
+
+
+    _hits = _search.payload["data"]
+    if _hits:
+        _verdict = f"**Hit.** The stored prompt `{_hits[0]['prompt']}` scored {_hits[0]['similarity']:.3f}, at or above your threshold of {_threshold}, so its answer was served with no model call."
+        _middle = []
+    else:
+        _near = f"The nearest stored prompt (found by a second search at threshold 0), `{_nearest[0]['prompt']}`, scored {_nearest[0]['similarity']:.3f}, below your threshold of {_threshold}." if _nearest else _no_match
+        _verdict = f"**Miss.** {_near} So the app searches the help center and asks the model" + (", and stores the answer." if _stores else ".")
+        _articles = rss_search(_question)  # the same search the turn ran, to show what the model saw
+        _middle = [
+            "**Help articles** `rss_search` found, closest first:",
+            "\n".join(f"- {a['title']}" for a in _articles) or "_rss_search found no articles._",
+            "**System prompt** from `lcs_system`, which the model gets with the question as the user message:",
+            rss_text(lcs_system(_articles)),
+            *[f"**Store request**, answered {s.status} in {s.ms} ms{'' if s.status == 201 else ', so nothing was stored'}\n\n{_request(s)}" for s in _stores],
+        ]
+    _timings = [f"cache search {_search.ms} ms", *(f"store {s.ms} ms" for s in _stores), f"total {_total} ms"]
+    mo.vstack(
+        [mo.md(_part) if isinstance(_part, str) else _part for _part in [
+            _verdict,
+            "**Search request**",
+            _request(_search),
+            f"**Reply from LangCache**, {_search.status} in {_search.ms} ms",
+            _fence("json", json.dumps(_search.payload, indent=2)),
+            *_middle,
+            "**Answer**",
+            _answer.replace("$", r"\$"),  # a bare $ would start a math span
+            "**Timings**: " + ", ".join(_timings) + ".",
+        ]],
+        gap=0.75,
+    )
     return
 
 
 @app.cell
 def lc_connect(Reply, json_request, json_session, os):
-    # Client. Three settings from .env, one session that carries the Bearer token, and one function for every LangCache request below.
-    from cairn_support.sample_data import GEAR_CARE_ANSWERS
-
-
+    # Client. One session that carries the Bearer token, the two request bodies, and a ledger of the entries this kernel stored.
     _host = os.environ["LANGCACHE_HOST"].strip().rstrip("/")  # the Connectivity page's URL, with or without https://
     lcs_session = json_session(
         f"{_host if '://' in _host else 'https://' + _host}/v1/caches/{os.environ['LANGCACHE_CACHE_ID'].strip()}",
         {"Authorization": f"Bearer {os.environ['LANGCACHE_API_KEY']}"},  # the one credential, read here and bound to nothing
     )
 
+    # Entries can't be listed, so the app keeps the id of each one it stores: entryId -> prompt. Clear deletes by these ids.
+    lcs_entries: dict[str, str] = {}
+
 
     def lcs_call(method: str, path: str, body: dict | None = None) -> Reply:
         """One request to the cache, with no retry: the HTTP status, the reply as a dict (None on a 204), and the milliseconds it took."""
         return json_request(lcs_session, method, path, body)
 
-    return GEAR_CARE_ANSWERS, lcs_call, lcs_session
+
+    def lcs_request(prompt: str, threshold: float) -> dict:
+        """The search body. `similarityThreshold` is Chapter 1's similarity floor: an entry at or above it is a hit."""
+        return {"prompt": prompt, "similarityThreshold": round(threshold, 2)}
 
 
-@app.cell
-def lc_request_fns():
-    # Request. The two bodies the app sends.
-    def lcs_request(prompt: str, threshold: float, strategy: str) -> dict:
-        """The search body. `similarityThreshold` overrides the cache's default for this request (principle 2), `searchStrategies` is `semantic` or `exact`, and `maxResults` 5 returns the entries under the best one too."""
-        return {"prompt": prompt, "similarityThreshold": round(threshold, 2), "searchStrategies": [strategy], "maxResults": 5}
+    def lcs_entry(prompt: str, response: str) -> dict:
+        """The store body. `ttlMillis` goes with every entry, because a new cache never expires entries unless you send it."""
+        return {"prompt": prompt, "response": response, "ttlMillis": 900_000}
 
 
-    def lcs_entry(prompt: str, response: str, ttl_ms: int) -> dict:
-        """The store body. `ttlMillis` goes with every entry, because a new cache's default TTL is no expiration (principle 3)."""
-        return {"prompt": prompt, "response": response, "ttlMillis": ttl_ms}
-
-
-    return lcs_entry, lcs_request
-
-
-@app.cell
-def lc_store_fns(GEAR_CARE_ANSWERS, lcs_call, lcs_entry, time):
-    # Store. The ledger of what this kernel stored, and the seed and delete functions over it.
-    lcs_entries = {}  # entryId -> prompt, key, ttlMillis, stored_at, source. Entries cannot be listed, so this is what Clean up walks.
-
-
-    def lcs_remember(entry_id: str, prompt: str, key: str, ttl_ms: int, source: str) -> None:
-        """Record a stored entry under the id LangCache returned. The ledger is the app's, because the API has no list call."""
-        lcs_entries[entry_id] = {"prompt": prompt, "key": key, "ttlMillis": ttl_ms, "stored_at": time.time(), "source": source}
-
-
-    def lcs_seed() -> list[dict]:
-        """Store the five gear-care answers with `POST /entries`, each with ttlMillis 900000 (principle 3), and keep every entryId.
-        LangCache derives the id from the prompt, so a second Seed gets the same ids and replaces each response and TTL. Returns one row per answer."""
-        results = []
-        for answer in GEAR_CARE_ANSWERS:
-            status, payload, _ = lcs_call("POST", "/entries", lcs_entry(answer["prompt"], answer["response"], 900_000))
-            if status == 201:
-                lcs_remember(payload["entryId"], answer["prompt"], answer["key"], 900_000, "seed")
-            results.append({"key": answer["key"], "status": status, "entryId": (payload or {}).get("entryId"), "type": (payload or {}).get("type", "")})
-        return results
-
-
-    def lcs_forget() -> tuple[list[str], list[str], list[str]]:
-        """Delete every entry in the ledger by id with `DELETE /entries/{entryId}`. 204 is deleted, 404 is already gone (its TTL ran out, or an earlier Clean up),
-        and anything else is reported and kept. Deleting by id touches nothing another app stored."""
-        deleted, gone, failed = [], [], []
+    def lcs_forget() -> tuple[int, int]:
+        """Delete every ledger entry by id with `DELETE /entries/{entryId}`, never the whole cache. Returns how many answered 204 (deleted) and 404 (expired already). Anything else stays in the ledger."""
+        counts = {204: 0, 404: 0}
         for entry_id in list(lcs_entries):
-            status, payload, _ = lcs_call("DELETE", f"/entries/{entry_id}")
-            if status == 204:
-                deleted.append(entry_id)
-            elif status == 404 and "cache/not-found" not in (payload or {}).get("type", ""):
-                gone.append(entry_id)
-            else:
-                failed.append(f"{entry_id}: {status} {(payload or {}).get('type', '')}")
-                continue
-            del lcs_entries[entry_id]
-        return deleted, gone, failed
+            status, _, _ = lcs_call("DELETE", f"/entries/{entry_id}")
+            if status in counts:
+                counts[status] += 1
+                del lcs_entries[entry_id]
+        return counts[204], counts[404]
 
-    return lcs_entries, lcs_forget, lcs_remember, lcs_seed
+    return lcs_call, lcs_entries, lcs_entry, lcs_forget, lcs_request
 
 
 @app.cell
-def lc_turn_fn(
+def lc_answer_fn(
     AI_MODEL,
-    ChatMessage,
-    ChatTurn,
     lcs_call,
-    lcs_entries,
+    lcs_entries: dict[str, str],
     lcs_entry,
-    lcs_remember,
     lcs_request,
-    lcs_settings,
+    rss_search,
     stream_llm,
 ):
-    # Turn. One chat turn: the search, then a served hit, or the model and the store on a miss.
-    lcs_system = "You are the Cairn Outfitters support agent. Answer the customer in two or three sentences."
+    # Assistant. The cache comes first. On a miss the app decides what the model sees: the articles Chapter 1's search finds.
+    def lcs_system(articles: list[dict]) -> str:
+        """The assistant's base prompt: answer in two or three sentences, from these help articles."""
+        return (
+            "You are the Cairn Outfitters support assistant. Answer in two or three sentences. "
+            "Use the help articles below; if they don't answer the question, say so and say what the customer can do next.\n\n"
+            "Help articles:\n" + "\n".join(f"- {a['title']}: {a['body']}" for a in articles)
+        )
 
 
-    async def lcs_turn(messages: list[ChatMessage]) -> ChatTurn:
-        """One cache-aside turn: search LangCache with the question, serve a hit, or on a miss call the model and store its answer (principle 1)."""
-        question = str(messages[-1].content)
-        threshold, strategy, ttl_ms = lcs_settings()  # the three controls, read when you send
-
-        # Search before the LLM. A miss is 200 with data: [], never a 404, and the reply is best first.
-        status, payload, _ = lcs_call("POST", "/entries/search", lcs_request(question, threshold, strategy))
+    async def lcs_answer(question: str, threshold: float) -> str:
+        """Cache-aside: serve a stored answer when one is close enough, else answer from the help center and store that answer."""
+        # Search the cache before the model. A miss is 200 with data: [], never a 404.
+        status, payload, _ = lcs_call("POST", "/entries/search", lcs_request(question, threshold))
         if status != 200:
-            yield f"LangCache answered {status} ({(payload or {}).get('type', 'no body')}). Nothing was served or stored."
-            return
-        data = payload["data"]
+            raise RuntimeError(f"LangCache answered {status} ({(payload or {}).get('type', 'no body')}) to the search")
 
-        if data and data[0]["id"] in lcs_entries:
-            # A hit: the best entry is one this kernel stored, so its response is the answer and the model is never called.
-            yield data[0]["response"]
-            return
+        # A hit serves the best stored answer, and the model is never called.
+        hits = payload["data"]
+        if hits:
+            return hits[0]["response"]
 
-        if data:
-            # The best entry belongs to another app on this cache. A real app would serve it. The notebook shows its similarity only and stores nothing.
-            yield f"LangCache's best match, at similarity {data[0]['similarity']:.3f}, is an entry this notebook did not store, so it is not shown. Nothing was stored."
-            return
+        # A miss: search the help center, and let the model answer from those articles. It never learns who is asking, because the stored answer goes to everyone.
+        articles = rss_search(question)
+        if not articles:  # they expire an hour after Create, and an answer without them would be stored for everyone
+            raise RuntimeError("the help center holds no articles, so press Create in Chapter 1 again")
+        answer = "".join([text async for text in stream_llm(lcs_system(articles), [{"role": "user", "content": question}], AI_MODEL)])
 
-        # A miss: the model answers the question alone, because a cached answer is keyed by the prompt and must fit anyone who asks it.
-        answer = ""
-        async for text in stream_llm(lcs_system, [{"role": "user", "content": question}], AI_MODEL):
-            answer += text
-            yield text
-
-        # Store after the LLM, with the TTL you picked. LangCache answers 201 with the entryId that Clean up deletes.
-        status, stored, _ = lcs_call("POST", "/entries", lcs_entry(question, answer, ttl_ms))
+        # Store after the model, with the TTL. A 201 returns the entryId, which the ledger keeps so Clear can delete it.
+        status, stored, _ = lcs_call("POST", "/entries", lcs_entry(question, answer))
         if status == 201:
-            lcs_remember(stored["entryId"], question, question, ttl_ms, "chat")
+            lcs_entries[stored["entryId"]] = question
+        return answer
 
-    return (lcs_turn,)
+    return lcs_answer, lcs_system
 
 
 @app.cell(hide_code=True)
-def lc_machinery_md(mo):
-    mo.md(r"""
-    ## Notebook plumbing: control state, chat object, threshold sweep, renderers
+def lc_ends(mo):
+    _ends_on = mo.md("**Where this stops.** Priya's tent is on its way, and the assistant can't tell her where. A personal answer can't come from a shared cache, or from the help center. Chapter 3 gives the assistant her records.")
 
-    Four hidden cells follow: the control state, the chat object with its three controls, the seven searches behind the threshold table, and the renderers for requests and tables.
-    Read `lc_settings`, `lc_chat`, `lc_turn_sweep`, and `lc_render` in `iris_basics.py`, or expand them in `marimo edit`. `lc_chat` records the requests each turn sends, and `lcs_record` in `lc_render` files them for the pane.
+    _docs = mo.md("""
+    - [LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/) and its [concepts](https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/)
+    - [Create a service](https://redis.io/docs/latest/operate/iris/langcache/create-service/)
+    - [API and SDK examples](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-examples/) and the [API reference](https://redis.io/docs/latest/develop/ai/context-engine/langcache/api-reference/)
     """)
+
+    mo.vstack([_ends_on, mo.accordion({"Docs for this chapter": _docs})], gap=0.75)
     return
-
-
-@app.cell(hide_code=True)
-def lc_settings(mo):
-    # Control state. The three controls live in lc_chat, so a turn cannot read their .value from inside the chat cell.
-    # A cell that references these getters reruns on every change, so the turn reads them through lcs_settings() instead.
-    # lc_chat reads the getters for the controls' start values, and marimo exempts the cell that owns a control.
-    lcs_get_threshold, lcs_set_threshold = mo.state(0.85)
-    lcs_get_strategy, lcs_set_strategy = mo.state("semantic")
-    lcs_get_ttl, lcs_set_ttl = mo.state("1 minute")
-    lcs_ttls = {"10 seconds": 10_000, "1 minute": 60_000, "15 minutes": 900_000}  # the dropdown's labels and the ttlMillis each sends
-
-
-    def lcs_settings() -> tuple[float, str, int]:
-        """The controls' current values, read at call time: the threshold rounded to two decimals, the strategy, and ttlMillis. A cell that calls this does not rerun when a control changes."""
-        return round(lcs_get_threshold(), 2), lcs_get_strategy(), lcs_ttls[lcs_get_ttl()]
-
-    return (
-        lcs_get_strategy,
-        lcs_get_threshold,
-        lcs_get_ttl,
-        lcs_set_strategy,
-        lcs_set_threshold,
-        lcs_set_ttl,
-        lcs_settings,
-        lcs_ttls,
-    )
-
-
-@app.cell(hide_code=True)
-def lc_chat(
-    CACHE_ASIDE_SCRIPT,
-    THRESHOLD_PROBES,
-    lcs_get_strategy,
-    lcs_get_threshold,
-    lcs_get_ttl,
-    lcs_note,
-    lcs_record,
-    lcs_set_strategy,
-    lcs_set_threshold,
-    lcs_set_ttl,
-    lcs_ttls,
-    lcs_turn,
-    mo,
-):
-    from cairn_support.sessions import recording  # collects the requests a block sends, for the pane
-
-    # debounce=True: the setter fires when the slider is released, not on every step. The radio and the dropdown set state the same way.
-    lcs_threshold = mo.ui.slider(
-        start=0.5, stop=1.0, step=0.01, value=lcs_get_threshold(), show_value=True, debounce=True,
-        label="similarityThreshold", on_change=lcs_set_threshold,
-    )
-    lcs_strategy = mo.ui.radio(options=["semantic", "exact"], value=lcs_get_strategy(), inline=True, label="searchStrategies", on_change=lcs_set_strategy)
-    lcs_ttl = mo.ui.dropdown(options=list(lcs_ttls), value=lcs_get_ttl(), label="ttlMillis for an answer stored on a miss", on_change=lcs_set_ttl)
-    lcs_prompts = [probe["text"] for probe in THRESHOLD_PROBES] + [
-        CACHE_ASIDE_SCRIPT["prefix"] + CACHE_ASIDE_SCRIPT["ask"],
-        CACHE_ASIDE_SCRIPT["prefix"] + CACHE_ASIDE_SCRIPT["again"],
-    ]
-
-
-    async def _turn(messages):
-        """lcs_turn, with the requests it sends recorded for the pane and a line on what the cache did. mo.ui.chat keeps a turn,
-        and the pane redraws, only when it ends with text, so an error ends the reply with a line too."""
-        error = None
-        with recording() as wire:
-            try:
-                async for text in lcs_turn(messages):
-                    yield text
-            except Exception as e:
-                error = e
-        yield lcs_note(lcs_record(str(messages[-1].content), wire), error)
-
-    # Displayed beside the data in lc_workbench. lcs_turn is the Iris turn above.
-    lcs_chatbot = mo.ui.chat(_turn, prompts=lcs_prompts, max_height=520)
-    return lcs_chatbot, lcs_prompts, lcs_strategy, lcs_threshold, lcs_ttl
-
-
-@app.cell(hide_code=True)
-def lc_turn_sweep(THRESHOLD_PROBES, lcs_call, lcs_request, lcs_store):
-    def lcs_sweep(store: dict[str, dict]) -> dict[str, dict]:
-        """For each of the seven probes, one semantic search at 0.50 with maxResults 5. Keeps the best entry this kernel stored, its similarity,
-        and how many other apps' entries came back, so the slider can re-cut the scores with no new request."""
-        scores = {}
-        for probe in THRESHOLD_PROBES:
-            status, payload, _ = lcs_call("POST", "/entries/search", lcs_request(probe["text"], 0.5, "semantic"))
-            data = payload["data"] if status == 200 else []
-            best = next((item for item in data if item["id"] in store), None)
-            scores[probe["text"]] = {
-                "kind": probe["kind"],
-                "entry": store[best["id"]] if best else None,
-                "similarity": best["similarity"] if best else None,
-                "hidden": sum(item["id"] not in store for item in data),
-            }
-        return scores
-
-
-    # Seven searches after Seed, Clean up, and each turn (a miss stores an answer that can become a probe's best entry).
-    # A slider move reruns the workbench, not this cell. With an empty ledger nothing is searched.
-    lcs_turn_scores = lcs_sweep(lcs_store) if lcs_store else {}
-    return (lcs_turn_scores,)
-
-
-@app.cell(hide_code=True)
-def lc_render(dt, json, lcs_entries, mo, time):
-    # Turn log and labels. lcs_record files each turn for the pane from the requests lc_chat recorded, lcs_note adds a line on what the
-    # cache did, lcs_verdict labels a served entry, and lcs_shown hides other apps' entries. The renderers for requests and tables follow.
-    from cairn_support.sample_data import CACHE_ASIDE_SCRIPT, THRESHOLD_PROBES
-
-    lcs_turns = []  # one record per turn, newest last, so the workbench can show the last turn's requests and reply
-    lcs_targets = {probe["text"]: probe["target"] for probe in THRESHOLD_PROBES}  # the seed each probe is after, or None when no stored answer fits
-    lcs_targets[CACHE_ASIDE_SCRIPT["prefix"] + CACHE_ASIDE_SCRIPT["again"]] = CACHE_ASIDE_SCRIPT["prefix"] + CACHE_ASIDE_SCRIPT["ask"]  # the rewording is after the answer the chat stored for the first question
-
-
-    def lcs_verdict(record: dict, question: str) -> str:
-        """`hit`, or `wrong answer` when a labeled question is served an entry it is not after (principle 2). A seed's key is its name, such as `bag`, a chat answer's key is the question it was stored for, and an unlabeled question trusts the cache."""
-        if question not in lcs_targets:
-            return "hit"
-        return "hit" if record["key"] in (lcs_targets[question], question) else "wrong answer"
-
-
-    def lcs_shown(data: list[dict]) -> list[dict]:
-        """The reply's entries as the pane shows them. An entry this kernel did not store keeps only its similarity, because a cache is shared by every app that points at it."""
-        return [item if item["id"] in lcs_entries else {"hidden": "another app's entry", "similarity": item["similarity"]} for item in data]
-
-
-    def lcs_record(question: str, wire: list) -> dict | None:
-        """File one turn for the pane beside the chat from the requests it sent: the search and its reply, then the store after a miss.
-        The decision is read back from the reply. An entry this kernel stored is `hit` or `wrong answer` (principle 2), because the app serves either one."""
-        if not wire:
-            return None
-        search, store = wire[0], next(iter(wire[1:]), None)
-        record = {"question": question, "search": search.body, "status": search.status, "ms": search.ms}
-        if search.status != 200:
-            record.update(decision="error", reply=search.payload)
-        else:
-            data = search.payload["data"]
-            record["reply"] = {"data": lcs_shown(data)}
-            if data:
-                served = lcs_entries.get(data[0]["id"])
-                record.update(similarity=data[0]["similarity"], served=served)
-                record["decision"] = lcs_verdict(served, question) if served else "another app's entry"
-            elif store is not None and store.status == 201:
-                record.update(decision="miss", entry_id=store.payload["entryId"])
-            else:
-                record["decision"] = "miss, nothing stored"
-            if store is not None:
-                record.update(store=store.body, store_status=store.status, store_ms=store.ms, ttl_ms=store.body["ttlMillis"])
-        lcs_turns.append(record)
-        return record
-
-
-    def lcs_note(record: dict | None, error: Exception | None) -> str:
-        """The line the chat adds under a reply: where a served answer came from, the entryId a miss stored, or why the turn stopped."""
-        if error is not None:
-            kept = " The search still ran, and nothing was stored." if record else ""
-            return f"\n\n*The turn stopped with {type(error).__name__}.{kept}*"
-        if record is None or record["decision"] in ("error", "another app's entry"):
-            return ""  # the turn's own reply says what happened
-        if record["decision"] in ("hit", "wrong answer"):
-            served = record["served"]
-            source = f"Seed as `{served['key']}`" if served["source"] == "seed" else f"this chat {time.time() - served['stored_at']:.0f} s ago"
-            return f"\n\n*Served from the cache at similarity {record['similarity']:.3f} in {record['ms']} ms, no model call. Stored by {source}.*"
-        if record["decision"] == "miss":
-            return f"\n\n*Miss, so the model answered and the app stored it: 201, entryId `{record['entry_id']}`, ttlMillis {record['ttl_ms']}.*"
-        return f"\n\n*Miss. The store answered {record.get('store_status')}, so nothing was cached.*"
-
-
-    def lcs_wire(method: str, path: str, body: dict | None) -> mo.Html:
-        """The request as text: method and path on the cache, the Bearer header with the key masked, the pinned Content-Type, and the JSON body."""
-        lines = [f"{method} /v1/caches/<LANGCACHE_CACHE_ID>{path}", "Authorization: Bearer <LANGCACHE_API_KEY>", "Content-Type: application/json"]
-        if body is not None:
-            lines += ["", json.dumps(body, indent=2)]
-        return mo.md("```text\n" + "\n".join(lines) + "\n```")
-
-
-    def lcs_json(payload) -> mo.Html:
-        """A reply as a JSON block."""
-        return mo.md("```json\n" + json.dumps(payload, indent=2) + "\n```")
-
-
-    def lcs_label(record: dict | None) -> str:
-        """A seed by its key, a chat answer by the question it was stored for, or a dash."""
-        if record is None:
-            return "-"
-        if record["source"] == "seed":
-            return f"`{record['key']}`"
-        prompt = record["prompt"].replace("|", "&#124;")
-        return "chat: " + prompt[:32] + ("..." if len(prompt) > 32 else "")
-
-
-    def lcs_store_table(entries: dict[str, dict]) -> mo.Html:
-        """What this kernel stored, one row per entryId, with when it was stored and when its TTL runs out."""
-        if not entries:
-            return mo.md("_No entries from this kernel. Select Seed to store five._")
-        rows = ["| source | prompt | entryId | ttlMillis | stored at | expires at |", "|---|---|---|---|---|---|"]
-        for entry_id, record in entries.items():
-            stored = dt.datetime.fromtimestamp(record["stored_at"])
-            expires = stored + dt.timedelta(milliseconds=record["ttlMillis"])
-            prompt = record["prompt"].replace("|", "&#124;")
-            rows.append(f"| {record['source']} | {prompt} | `{entry_id}` | {record['ttlMillis']} | {stored:%H:%M:%S} | {expires:%H:%M:%S} |")
-        return mo.md("\n".join(rows))
-
-
-    def lcs_threshold_table(scores: dict[str, dict], threshold: float) -> mo.Html:
-        """One row per probe: its kind, the best entry this kernel stored at 0.50, the similarity, and the verdict at the slider: hit, wrong answer, or miss."""
-        if not scores:
-            return mo.md("_No scores yet. Select Seed, and the seven questions are searched at 0.50._")
-        threshold = round(threshold, 2)
-        counts = {"hit": 0, "wrong answer": 0, "miss": 0}
-        rows = [f"| question | kind | best own entry | similarity | at {threshold:.2f} |", "|---|---|---|---|---|"]
-        for text, score in scores.items():
-            verdict = "miss" if score["entry"] is None or score["similarity"] < threshold else lcs_verdict(score["entry"], text)
-            counts[verdict] += 1
-            similarity = f"{score['similarity']:.3f}" if score["similarity"] is not None else "-"
-            hidden = f" (+{score['hidden']} hidden)" if score["hidden"] else ""
-            rows.append(f"| {text} | {score['kind']} | {lcs_label(score['entry'])}{hidden} | {similarity} | {verdict} |")
-        rows.append(f"| **at {threshold:.2f}** | | | | **{counts['hit']} hit, {counts['wrong answer']} wrong answer, {counts['miss']} miss** |")
-        return mo.md("\n".join(rows))
-
-    return (
-        CACHE_ASIDE_SCRIPT,
-        THRESHOLD_PROBES,
-        lcs_json,
-        lcs_note,
-        lcs_record,
-        lcs_store_table,
-        lcs_threshold_table,
-        lcs_turns,
-        lcs_wire,
-    )
 
 
 @app.cell(column=3, hide_code=True)
 def cr_title(CAIRN_SCOPE, mo):
     mo.md(f"""
-    # Redis Context Retriever
+    # Chapter 3. Context engineering and retrieval: answer about her
 
-    As Cairn Outfitters, you store customers, products, and orders in your own Redis as JSON, mapped like..
+    Chapter 2 ended on Priya's question, "Where's my tent?" A shared cache can't answer it, and neither can the help center, because the answer is in her order. Cairn keeps its customers, products, and orders in Redis as JSON documents. This chapter lets the assistant read them.
 
-      `cairn:<scope>:customer:<customer-id>: {{ name, tier, region, lifetime_value }}`
+    **Redis Context Retriever** turns a data model you declare into tools, which are functions a model can call. It serves them over **MCP**, the Model Context Protocol, a standard way to list tools and call them. The assistant chooses which tools to call, and Context Retriever answers each call from your database.
 
-    ```json
-    {{
-      "cairn:{CAIRN_SCOPE}:customer:C001": {{
-        "name": "Ada Lovelace",
-        "tier": "gold",
-        "region": "emea",
-        "lifetime_value": 4200
-      }}
-    }}
+    Your app also decides what the model sees for each question, and that is **context engineering**. Here it is who is asking, Chapter 1's articles, and what the tools return.
+
+    Priya's customer record is one JSON document, at the key your data model names:
+
+    ```text
+    JSON.GET cairn:{CAIRN_SCOPE}:customer:C001
+    {{"customer_id":"C001","lifetime_value":4200.0,"name":"Priya Shah","region":"amer","tier":"gold"}}
     ```
 
-    [**Redis Context Retriever**](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/) builds a set of MCP tools from a data model you declare, and answers each call from that database.
+    ## You'll learn how to
 
-    Each field's index kind decides which tools an agent can call.
-
-    ---
-
-    ## We'll learn how to..
-
-    1. Declare the data model.
-    2. Create a surface and import the records.
-    3. Call the tools with an agent key.
+    1. Declare a data model, and see that it decides the tools.
+    2. Tell the admin key, which makes the surface, from the agent key, which an agent sends with its tool calls.
+    3. Assemble what the model sees: who is asking, which articles, and what the tools return.
     """)
     return
 
@@ -1939,39 +1030,40 @@ def cr_model_fns(CAIRN_SCOPE):
 
     _redis_prefix = f"cairn:{CAIRN_SCOPE}:"
 
+
     class Customer(ContextModel):
-        """A Cairn Outfitters shopper."""
+        """A Cairn Outfitters shopper, such as Priya (C001) or Tom (C002)."""
 
         __redis_key_template__ = _redis_prefix + "customer:{customer_id}"
 
         customer_id: str = ContextField(description="Customer id, such as C001", is_key_component=True)
         name: str = ContextField(description="Full name", index="text")
         tier: str = ContextField(description="Loyalty tier", index="tag", allowed_values=["bronze", "silver", "gold"])
-        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
+        region: str = ContextField(description="Sales region", index="tag", allowed_values=["amer", "emea", "apac"])
         lifetime_value: float = ContextField(description="Lifetime spend in USD", index="numeric")
         orders: list["Order"] = ContextRelationship(description="Orders this customer placed", target="Order", source_field="customer_id")
 
 
     class Product(ContextModel):
-        """An item Cairn Outfitters sells."""
+        """An item Cairn Outfitters sells, such as the Ultralight Tent 2P."""
 
         __redis_key_template__ = _redis_prefix + "product:{sku}"
 
-        sku: str = ContextField(description="Stock keeping unit, such as P100", is_key_component=True)
+        sku: str = ContextField(description="Stock keeping unit, such as P102", is_key_component=True)
         title: str = ContextField(description="Product title", index="text")
         category: str = ContextField(description="Product category", index="tag")
         price: float = ContextField(description="Price in USD", index="numeric")
 
 
     class Order(ContextModel):
-        """One order: a customer, a product, and a status. No text field, so no search_order_by_text."""
+        """One order: a customer, a product, and a status, such as Priya's tent."""
 
         __redis_key_template__ = _redis_prefix + "order:{order_id}"
 
         order_id: str = ContextField(description="Order id, such as O1001", is_key_component=True)
         customer_id: str = ContextField(description="The buyer's customer id", index="tag")
         sku: str = ContextField(description="The product's sku", index="tag")
-        region: str = ContextField(description="Sales region", index="tag", allowed_values=["emea", "apac"])
+        region: str = ContextField(description="Sales region", index="tag", allowed_values=["amer", "emea", "apac"])
         status: str = ContextField(description="Order status", index="tag", allowed_values=["placed", "shipped", "delivered", "returned"])
         total: float = ContextField(description="Order total in USD", index="numeric")
         customer: "Customer" = ContextRelationship(description="Buyer", target="Customer", source_field="customer_id")
@@ -1979,18 +1071,8 @@ def cr_model_fns(CAIRN_SCOPE):
 
 
     crs_models = [Customer, Product, Order]
-
-    crs_data_model = export_data_model(
-        "Cairn Outfitters", "Customers, products, and orders of an outdoor gear shop",
-        entities=crs_models,
-    )
-
-    crs_record_keys = [
-        model.__redis_key_template__.format(**row)
-        for model in crs_models
-        for row in SHOP_RECORDS[model.__name__]
-    ]
-
+    crs_data_model = export_data_model("Cairn Outfitters", "Customers, products, and orders of an outdoor gear shop", entities=crs_models)
+    crs_record_keys = [model.__redis_key_template__.format(**row) for model in crs_models for row in SHOP_RECORDS[model.__name__]]
     crs_entity_prefixes = [model.__redis_key_template__.split("{")[0] for model in crs_models]
     return (
         SHOP_RECORDS,
@@ -2002,438 +1084,135 @@ def cr_model_fns(CAIRN_SCOPE):
 
 
 @app.cell(hide_code=True)
-def cr_model(crs_data_model, crs_record_keys, mo, textwrap):
-    # The declared model, as the reader sees it: one row per entity with the index kind of each field and the tools the rule
-    # predicts. The service's own list comes after Create, in cr_surface, so the prediction is checked against tools/list.
-    _families = {
-        "key": "`get_{e}_by_id`",
-        "any": "`list_{e}`, `count_{e}`",
-        "filter": "`filter_{e}`",
-        "numeric": "`summarize_{e}`",
-        "text": "`search_{e}_by_text`",
-    }
-    _rows = ["| entity | key | text | tag | numeric | tools the kinds add |", "|---|---|---|---|---|:--|"]
+def cr_model(CAIRN_SCOPE, crs_data_model, crs_record_keys, mo):
+    # The tools the index kinds predict, from crs_data_model. The service's own list comes after Create, in cr_create.
+    _rows = ["The index kinds on those classes predict these tools.", "", "| entity | text | tag | numeric | tools the kinds add |", "|:--|:--|:--|:--|:--|"]
+    _total = 0
     for _entity in crs_data_model["entities"]:
         _e = _entity["name"].lower()
-        _by_kind = {"text": [], "tag": [], "numeric": []}
-        _key = ""
-        for _field in _entity["fields"]:
-            if _field["is_key_component"]:
-                _key = _field["name"]
-            for _index in _field["redis_indices"]:
-                _by_kind.setdefault(_index["type"], []).append(_field["name"])
-        _tools = [_families["key"], _families["any"]]
-        if _by_kind["tag"] or _by_kind["numeric"]:
-            _tools.append(_families["filter"])
-        if _by_kind["numeric"]:
-            _tools.append(_families["numeric"])
-        if _by_kind["text"]:
-            _tools.append(_families["text"])
-        _rows.append(
-            f"| {_entity['name']} | `{_key}` | {', '.join(_by_kind['text']) or '-'} | {', '.join(_by_kind['tag']) or '-'} "
-            f"| {', '.join(_by_kind['numeric']) or '-'} | {', '.join(_tools).format(e=_e)} |"
-        )
+        _kinds = {k: [f["name"] for f in _entity["fields"] for i in f["redis_indices"] if i["type"] == k] for k in ("text", "tag", "numeric")}
+        _rules = {"get_{}_by_id": True, "list_{}": True, "count_{}": True, "filter_{}": _kinds["tag"] or _kinds["numeric"], "summarize_{}": _kinds["numeric"], "search_{}_by_text": _kinds["text"]}
+        _tools = [f"`{name.format(_e)}`" for name, wanted in _rules.items() if wanted]
+        _total += len(_tools)
+        _rows.append(f"| {_entity['name']} | {' | '.join(', '.join(_kinds[k]) or '-' for k in _kinds)} | {', '.join(_tools)} |")
 
-    mo.vstack(
-        [
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        Each field's index is `text`, `tag`, or `numeric`, three of the field types Redis Search declares in `FT.CREATE`. `get_` needs a key component, `filter_` a tag or numeric field, `summarize_` a numeric field, and `search_` a text field. Order has no text field, so the surface has no `search_order_by_text`.
-                        """
-                    ).strip()
-                ),
-                kind="info",
-                title="Key idea",
-            ),
-            mo.md("The index kinds on those classes predict these tools.\n\n" + "\n".join(_rows)),
-            mo.md(f"The templates name {len(crs_record_keys)} keys, from `{crs_record_keys[0]}` to `{crs_record_keys[-1]}`. Nothing has been sent yet."),
-        ],
-        gap=0.75,
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def cr_create_button(crs_admin_session, mo, textwrap):
-    _ = crs_admin_session  # the buttons appear once the admin session exists, so a press never runs ahead of the settings check
     crs_create_button = mo.ui.run_button(label="Create")
-    crs_refresh_button = mo.ui.run_button(label="Refresh")
     crs_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
 
-    mo.vstack(
-        [
-            mo.md(
-                textwrap.dedent(
-                    """
-                    ### 2. Create a surface and import the records
-                    """
-                ).strip()
-            ),
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        `POST /context-surfaces` sends the `data_model` and a `connection_config` built from the same `REDIS_URL` the Search column uses (`addr`, `username`, `password`, `db`, `tls_enabled`). On import the service writes JSON at each class's key template and builds one Redis Search index per entity. Context Retriever does not support Redis Flex or Active-Active databases.
-                        """
-                    ).strip()
-                ),
-                kind="info",
-                title="Key idea",
-            ),
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        - **Create** sends four admin requests, each with `CTX_ADMIN_KEY` in `X-API-Key`: `POST /context-surfaces` (the `data_model` and the database password), `POST .../agent-keys` (expires in an hour), `GET .../agent-keys` (the key's `mcp_url`), and `POST .../data` once per entity.
-                        - The service keeps the password until **Clean up** deletes the surface.
-                        - **Refresh** lists the tools again and re-reads the database.
-                        - **Clean up** deletes every surface named `cairn-<run>`, unlinks the 20 documents the delete leaves behind, and drops any index the service left.
-                        """
-                    ).strip()
-                ),
-                kind="success",
-                title="What the buttons do",
-            ),
-            mo.hstack([crs_create_button, crs_refresh_button, crs_cleanup_button], justify="start"),
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        A lost reply can still mean the surface was created. Select **Clean up** before **Create** again, so a second surface never takes the password.
-                        """
-                    ).strip()
-                ),
-                kind="warn",
-                title="Watch out",
-            ),
-        ],
-        gap=0.75,
-    )
-    return crs_cleanup_button, crs_create_button, crs_refresh_button
+    _classes = mo.md(f"""
+    ## Step 1. The data model decides the tools
+
+    Priya's tent order is a JSON document, and the assistant can't read it yet. You describe the records in the three classes above, and Context Retriever writes the tools that read them.
+
+    Reading the classes piece by piece:
+
+    - `__redis_key_template__` says where a record lives, and `is_key_component=True` marks the field that fills it. Customer C001 is the key `{crs_record_keys[0]}`.
+    - `index="text"`, `"tag"`, and `"numeric"` are three of the field types you declared in Chapter 1's `FT.CREATE`, here for JSON documents.
+    - `allowed_values` travel with the tools, so the model sees the legal tiers, regions, and statuses.
+    - `ContextRelationship` says how entities connect: an order points at its customer and its product.
+    """)
+
+    _key_idea = mo.callout(mo.md("In Chapter 1 the schema decided what you could search. Here the index kinds decide which tools exist: `get_` needs a key component, `filter_` a tag or numeric field, `summarize_` a numeric field, and `search_` a text field. Order has no text field, so there is no `search_order_by_text`."), kind="info", title="Key idea: the data model decides the tools")
+
+    _predicted = mo.md("\n".join(_rows) + f"\n\nThat is {_total} tools. The service adds four set tools: `except_results`, `expand_results`, `intersect_results`, and `union_results`. The whole list, with every description and input schema, is about 35,000 characters of JSON, and the app sends it with every model request.")
+
+    _surface_md = mo.md(f"""
+    ## Step 2. Create the surface
+
+    You send the data model to the service once. It builds a surface, the hosted endpoint that serves your tools, and the notebook adds an agent key and the records:
+
+    ```text
+    POST /context-surfaces
+      {{"name": "cairn-{CAIRN_SCOPE}", "data_model": {{...}}, "data_source": {{"type": "redis",
+        "connection_config": {{"addr": ..., "password": ..., ...}}}}}}
+    POST /context-surfaces/{{id}}/agent-keys   {{"name": "cairn-{CAIRN_SCOPE}-agent"}}
+    POST /context-surfaces/{{id}}/data         {{"entity": "Customer", "records": [...], "options": {{...}}}}   once per entity
+    ```
+
+    Reading it piece by piece:
+
+    - All three carry the admin key in `X-API-Key`. It creates and deletes surfaces, so only the admin functions send it.
+    - `data_model` is the three classes as JSON. `connection_config` is your database, built from `REDIS_URL`, password included, so the hosted service can read and write it.
+    - The second request makes the agent key, the key an agent sends with its tool calls. Its reply holds `mcp_url`, where it sends them, and an expiry the service picks, 90 days out. The admin key never goes there.
+    - Each import writes one JSON document per record and indexes it. The service sets no TTL, so the notebook sets one hour on those keys. After an hour the records expire: press **Clean up**, then **Create**.
+    """)
+
+    _watch_out = mo.callout(mo.md("Create sends the database password from `REDIS_URL` to the hosted service, which keeps it until **Clean up** deletes the surface. Deleting the surface also ends its agent key. **Clean up** finds the surface by name, even after a restart."), kind="warn", title="Watch out: the service holds your password")
+    _try_it = mo.callout(mo.md("Press **Create**, then compare the service's own tool list (`tools/list`) with the table above and read Priya's document. **Clean up** deletes the surface, its documents, and any leftover index. Chapter 4 reuses this surface, so keep it until **Clean up everything**."), kind="success", title="Try it")
+
+    mo.vstack([_classes, _predicted, _key_idea, _surface_md, _watch_out, _try_it, mo.hstack([crs_create_button, crs_cleanup_button], justify="start")], gap=0.75)
+    return crs_cleanup_button, crs_create_button
 
 
 @app.cell(hide_code=True)
 def cr_create(
-    crs_admin_base,
+    REDIS_CLIENT,
+    crs_cleanup,
     crs_cleanup_button,
-    crs_create_agent_key,
-    crs_create_body,
     crs_create_button,
     crs_create_surface,
-    crs_delete_surfaces,
-    crs_drop_indexes,
-    crs_expire_records,
-    crs_import_records,
+    crs_list_tools,
     crs_record_keys,
-    crs_set_calls,
     crs_set_surface,
     crs_shown,
     crs_surface,
-    crs_surface_name,
-    crs_unlink_records,
+    json,
     mo,
 ):
-    # Create and Clean up. The surface goes into state through crs_set_surface, so this cell never reads the getter and never
-    # reruns on its own change. Create runs once per press and is never retried, since a replayed POST would make a second
-    # surface holding the password. The create reply holds the agent key, so it is never this cell's last expression.
-    _note = ""
+    # Create and Clean up, then the current state. This cell never reads the state getter, so storing the surface doesn't rerun it.
+    _surface = crs_surface()
+    _note = "" if _surface else "No surface yet. Press **Create**."
     if crs_create_button.value:
-        if crs_surface():
-            _note = "This kernel already holds a surface. Select Clean up first, so a second surface never takes your password."
+        if _surface:
+            _note = "This kernel already holds a surface. Press **Clean up** first, so a second one never takes your password."
         else:
-            _body = crs_create_body()
-            try:
-                _made = crs_create_surface(_body)
-            except OSError as _error:  # a timeout or a dropped connection: the service may have made the surface before the reply was lost
-                raise RuntimeError(f"Create got no reply ({type(_error).__name__}), so a surface may exist anyway. Select Clean up to delete every surface named {crs_surface_name}.") from _error
-            # From here on the surface, and the password it holds, exist on the service. The finally gives every key the service
-            # managed to write its TTL even when a call raises, and the re-raised error says how to remove the surface.
-            try:
-                _access = crs_create_agent_key(_made["id"])
-                _imports = crs_import_records(_made["id"])
-            except Exception as _error:
-                raise RuntimeError(f"{str(_error).rstrip('.')}. Select Clean up to remove the surface this left.") from _error
-            finally:
-                _expiring = crs_expire_records()
-            _shown = crs_shown("POST", crs_admin_base + "/context-surfaces", _body)  # the pane keeps this masked copy, never _body
-            crs_set_surface({**_made, **_access, "imports": _imports, "expiring": _expiring, "create_request": _shown})
-            _counts = ", ".join(f"{n} {entity.lower()}s" for entity, n in _imports.items())
-            _note = f"Created surface `{_made['id']}` and imported {_counts}. {_expiring} of {len(crs_record_keys)} keys now expire in an hour."
+            _surface, _note = crs_create_surface(), ""
+            crs_set_surface(_surface)
     if crs_cleanup_button.value:
-        _current = crs_surface()
-        _deleted = crs_delete_surfaces(_current["id"] if _current else None)
-        _unlinked = crs_unlink_records()
-        _dropped = crs_drop_indexes()
-        crs_set_surface(None)
-        crs_set_calls([])
-        _plural = "" if len(_deleted) == 1 else "s"
-        _index_word = "index" if len(_dropped) == 1 else "indexes"
-        _statuses = ", ".join(str(status) for status in _deleted.values()) or "none found"
-        _note = f"Deleted {len(_deleted)} surface{_plural} named `{crs_surface_name}` ({_statuses}), unlinked {_unlinked} of {len(crs_record_keys)} keys, and dropped {len(_dropped)} {_index_word} the delete had left."
+        _note, _surface = crs_cleanup(), None
 
-    mo.md(_note) if _note else None
+    _view = [mo.md(_note)] if _note else []
+    if _surface:
+        _shown, _tools = crs_shown(_surface), crs_list_tools(_surface)
+        _signatures = [f"{t['name']}({', '.join(a + '*' * (a in t['inputSchema'].get('required', [])) for a in t['inputSchema'].get('properties', {}))})" for t in _tools]
+        _view += [
+            mo.md(f"- Surface `{_shown['id']}`. Imported {', '.join(f'{n} {name.lower()}s' for name, n in _surface['imports'].items())}.\n- Agent key `{_shown['agent_key']}`, expires {_shown['key_expires_at']}. Its `mcp_url` is `{_shown['mcp_url']}`.\n- `tools/list` returned {len(_tools)} tools, {len(json.dumps(_tools)):,} characters of JSON. Required arguments are starred.\n\n```text\n" + "\n".join(_signatures) + "\n```"),
+            mo.md(f"`JSON.GET {crs_record_keys[0]}`\n\n```json\n{json.dumps(REDIS_CLIENT.json().get(crs_record_keys[0]), indent=2)}\n```"),
+        ]
+    mo.vstack(_view, gap=0.75)
     return
 
 
-@app.cell(hide_code=True)
-def cr_surface(
-    crs_document,
-    crs_get_surface,
-    crs_indexes,
-    crs_list_tools,
-    crs_read_surface,
+@app.cell
+def cr_connect(
+    CAIRN_SCOPE,
+    REDIS_CLIENT,
+    Reply,
+    SHOP_RECORDS,
+    crs_data_model,
+    crs_models,
     crs_record_keys,
-    crs_refresh_button,
-    json,
-    mo,
+    json_request,
+    json_session,
+    os,
+    redis,
 ):
-    # What the surface holds, on both sides. Left, the service: the create reply, the agent key's expiry, and tools/list.
-    # Right, your database: JSON.GET of the first key and the indexes the service built. Reruns on Create, Clean up, and Refresh.
-    _surface = crs_get_surface()
-    _ = crs_refresh_button.value
-
-    if _surface is None:
-        crs_tools = []
-        _service = [mo.md("**The service**\n\n_No surface in this kernel. Select Create, or Clean up to delete one a restarted kernel left behind._")]
-    else:
-        try:
-            crs_tools = crs_list_tools(_surface)
-            _problem = ""
-        except Exception as _error:  # the agent key's hour is up, the service refused, or the reply was not JSON: say why, and keep the console and the call log
-            crs_tools = []
-            _problem = str(_error) if isinstance(_error, RuntimeError) else f"tools/list stopped with {type(_error).__name__}: {_error}"
-        _names = [tool["name"] for tool in crs_tools]
-        _searches = ", ".join(f"`{name}`" for name in sorted(_names) if name.startswith("search_"))
-        _missing = " There is no `search_order_by_text`, because Order has no `text` field." if "search_order_by_text" not in _names else ""
-        _imports = ", ".join(f"{n} {entity.lower()}s" for entity, n in _surface["imports"].items())
-        _rows = ["| tool | arguments, required starred |", "|---|---|"]
-        for _tool in crs_tools:
-            _schema = _tool.get("inputSchema", {})
-            _required = set(_schema.get("required", []))
-            _arguments = ", ".join(f"`{p}`" + ("*" if p in _required else "") for p in _schema.get("properties", {}))
-            _rows.append(f"| `{_tool['name']}` | {_arguments or '-'} |")
-        _listing = (
-            [mo.md(f"The tool list is empty, and the console keeps its presets. {_problem}")]
-            if _problem
-            else [
-                mo.md(f"`tools/list` returned {len(_names)} tools. The text searches are {_searches}, one per entity with a `text` field.{_missing}"),
-                mo.md("\n".join(_rows)),
-            ]
-        )
-        _service = [
-            mo.md(
-                f"**The service**\n\n`POST /context-surfaces` answered {_surface['http']} with id `{_surface['id']}`, status `{crs_read_surface(_surface['id'])['status']}` now. "
-                f"Imported {_imports}. Agent key `****{_surface['agent_key'][-4:]}` expires at {_surface['key_expires_at']}, and its `mcp_url` is `{_surface['mcp_url']}`."
-            ),
-            *_listing,
-            mo.accordion({"The create request as sent, password and admin key masked": mo.md(f"```json\n{json.dumps(_surface['create_request'], indent=2)}\n```")}),
-        ]
-
-    _indexes = crs_indexes()  # FT._LIST, then FT.INFO per index, keeping the ones that carry the entity prefixes
-    _document = crs_document(crs_record_keys[0])
-    _database = [
-        mo.md(f"**Your database**\n\n`JSON.GET {crs_record_keys[0]}`"),
-        mo.md(f"```json\n{json.dumps(_document, indent=2)}\n```" if _document else "_No document at that key. The service writes it on import, and Clean up or the one-hour TTL removes it._"),
-    ]
-    if _indexes:
-        _index_rows = ["| index, from FT._LIST | prefix | num_docs |", "|---|---|---|"]
-        _index_rows += [f"| `{i['name']}` | `{', '.join(i['prefixes'])}` | {i['num_docs']} |" for i in _indexes]
-        _database += [mo.md("One index per entity, built by the service. `FT.INFO` gives each one's prefix and document count."), mo.md("\n".join(_index_rows))]
-    else:
-        _database.append(mo.md("_No index carries this run's entity prefixes. The service builds three on Create and drops them on delete._"))
-
-    mo.hstack([mo.vstack(_service), mo.vstack(_database)], widths="equal", align="start", gap=1.5)
-    return (crs_tools,)
-
-
-@app.cell(hide_code=True)
-def cr_controls(crs_tools, mo, textwrap):
-    # The pick, upstream of the console form so a new pick rebuilds the form with its tool and arguments. Examples come from
-    # each tool's inputSchema, with a few named overrides. Three presets step outside the model.
-    crs_examples = {
-        "get_customer_by_id": {"id": "C001"},
-        "get_product_by_id": {"id": "P100"},
-        "get_order_by_id": {"id": "O1001"},
-        "search_customer_by_text": {"query": "Ada"},
-        "search_product_by_text": {"query": "tent"},
-        "filter_customer": {"tag_conditions": [{"field": "tier", "value": "gold"}]},
-        "filter_order": {"numeric_conditions": [{"field": "total", "min_value": 100}]},
-        "list_customer": {"limit": 3, "sort_by": "lifetime_value", "sort_order": "desc"},
-        "count_order": {"function": "count", "group_by": "status"},
-        "summarize_customer": {"field": "lifetime_value", "function": "sum", "group_by": "tier"},
-    }
-    crs_presets = {
-        "filter_customer, no condition": ("filter_customer", {"limit": 5, "offset": 0}),
-        "filter_customer, a tag condition on a numeric field": ("filter_customer", {"tag_conditions": [{"field": "lifetime_value", "value": "4200"}]}),
-        "run_query, a tool the surface does not list": ("run_query", {"query": "FT.SEARCH idx *"}),
-    }
-
-
-    def crs_example(tool: dict) -> dict:
-        """Arguments to start from: the named example, or each required property filled from its schema."""
-        if tool["name"] in crs_examples:
-            return crs_examples[tool["name"]]
-        schema = tool.get("inputSchema", {})
-        starters = {"string": "", "integer": 1, "number": 1, "boolean": False, "array": [], "object": {}}
-        example = {}
-        for name in schema.get("required", []):
-            prop = schema.get("properties", {}).get(name, {})
-            example[name] = prop["enum"][0] if prop.get("enum") else starters.get(prop.get("type"), "")
-        return example
-
-
-    _options = {tool["name"]: (tool["name"], crs_example(tool)) for tool in crs_tools} | crs_presets
-    crs_pick = mo.ui.dropdown(
-        options=_options,
-        value="get_customer_by_id" if "get_customer_by_id" in _options else next(iter(_options)),
-        label="Tool or preset",
-        searchable=True,
-    )  # displayed in the workbench, upstream of the form so a new pick prefills it
-
-    mo.vstack(
-        [
-            mo.md(
-                textwrap.dedent(
-                    """
-                    ### 3. Call the tools with an agent key
-                    """
-                ).strip()
-            ),
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        The console sends `tools/call` to the agent key's `mcp_url`. The admin key never appears in a tool call. An agent has to tell three replies apart: data (`result.content[0].text`), a tool error (HTTP 200, `isError` true), and a JSON-RPC error (top-level `error`, code -32602 when the arguments break the schema).
-                        """
-                    ).strip()
-                ),
-                kind="info",
-                title="Key idea",
-            ),
-            mo.callout(
-                mo.md(
-                    textwrap.dedent(
-                        """
-                        - Pick `get_customer_by_id` and select Send. The reply is Ada Lovelace's record with a `_retrieval` stamp. Change `C001` to `C999` and send again to see an id the surface does not hold.
-                        - Pick `search_customer_by_text` with `Ada`. Order has no text field, so there is no `search_order_by_text`. Pick `filter_customer`, then the preset "filter_customer, no condition". The first returns gold customers as data. The second comes back with `isError` and the reason in the text.
-                        - The preset "filter_customer, a tag condition on a numeric field" should be a JSON-RPC error, code -32602. The preset "run_query, a tool the surface does not list" should also be a JSON-RPC error. Compare the `X-API-Key` in the request below, `****` plus the agent key's last four characters, with the `****` in the create request above.
-                        """
-                    ).strip()
-                ),
-                kind="success",
-                title="Try it",
-            ),
-        ],
-        gap=0.75,
-    )
-    return (crs_pick,)
-
-
-@app.cell(hide_code=True)
-def cr_workbench(
-    crs_args_field,
-    crs_get_calls,
-    crs_get_surface,
-    crs_pick,
-    crs_request,
-    crs_send_button,
-    crs_shown,
-    crs_tool_field,
-    json,
-    mo,
-):
-    # Left, the console: the pick, the form, and Send. Right, the data behind the last call: the log, the reply text, and the
-    # request crs_request builds from the form as it stands, with the agent key masked.
-    _surface = crs_get_surface()
-    _calls = crs_get_calls()
-    _tail = _surface["agent_key"][-4:] if _surface else ""
-    _url = _surface["mcp_url"] if _surface else "<mcp_url, after Create>"
-
-    try:
-        _arguments = json.loads(crs_args_field.value or "{}")
-        _request = mo.md(f"```json\n{json.dumps(crs_shown('POST', _url, crs_request(crs_tool_field.value.strip(), _arguments), _tail), indent=2)}\n```")
-    except ValueError as _error:
-        _request = mo.md(f"The arguments are not valid JSON, so Send has nothing to post. {_error}")
-
-    _data = [mo.md("**Calls**, newest first" if _calls else "**Calls**, none yet. Send posts one read-only `tools/call` and adds a row here.")]
-    if _calls:
-        _rows = ["| at (UTC) | tool | arguments | HTTP | kind |", "|---|---|---|---|---|"]
-        for _call in _calls:
-            _shown = _call["arguments"] if isinstance(_call["arguments"], str) else json.dumps(_call["arguments"])
-            _shown = (_shown[:80] + "...") if len(_shown) > 80 else _shown
-            _rows.append(f"| {_call['at']} | `{_call['tool']}` | `{_shown.replace('|', '&#124;')}` | {_call['http']} | {_call['kind']} |")
-        _data += [
-            mo.md("\n".join(_rows)),
-            mo.md("---"),
-            mo.md(f"**Reply**, {_calls[0]['kind']}. Data is `result.content[0].text` parsed, a tool error is that text with `isError` true, and a JSON-RPC error is the top-level `error`."),
-            mo.md(f"```json\n{_calls[0]['text'][:3000]}\n```"),
-        ]
-    _data += [
-        mo.md("---"),
-        mo.md("Editing the form redraws the request below without sending it."),
-        mo.md("**Request**, from `crs_request` for the form as it stands, with the agent key masked"),
-        _request,
-    ]
-
-    mo.hstack(
-        [
-            mo.vstack([crs_pick, crs_tool_field, crs_args_field, crs_send_button]),
-            mo.vstack(_data),
-        ],
-        widths=[5, 6],
-        gap=1.5,
-        align="start",
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def cr_build_md(mo):
-    mo.md(r"""
-    ## The Context Retriever code
-
-    Client, surface, and database are collapsed. The open cell is `crs_call`, which sorts each Send into data, a tool error, or a JSON-RPC error. Expand a cell in `marimo edit`, or pick **Show code** from the app menu in `marimo run`.
-    Every `crs_admin` call carries the admin key, every `crs_mcp` call carries the agent key, and `REDIS_CLIENT` reads your database directly.
-    Create and Clean up call the surface and database functions, and each Send calls `crs_call`.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def cr_connect(Reply, json_request, json_session, os, redis):
-    # Client. The admin session with the admin key from .env, the MCP session for the agent key, and the connection_config the surface gets.
-    from cairn_support.types import Surface, ToolCall
-
-
-    crs_admin_base = os.environ.get("CTX_API_URL", "https://cloud.redis.io/context-surfaces") + "/api/v1"
-    crs_mcp_default = os.environ.get("CTX_MCP_URL", "https://gcp-us-east4.context-surfaces.redis.io/mcp")  # used only if the agent-key listing carries no mcp_url
-    crs_admin_session = json_session(crs_admin_base, {"X-API-Key": os.environ["CTX_ADMIN_KEY"]}, timeout=(5, 60))  # never retried: a replayed create would make a second surface holding the password
-    crs_mcp_session = json_session(timeout=(5, 60))  # no key on the session: each call carries the agent key of its surface
+    # Admin side. Every call here carries the admin key from .env: it makes the surface, the agent key, and the records. An agent never sees it.
+    crs_surface_name = f"cairn-{CAIRN_SCOPE}"
+    crs_admin_session = json_session(os.environ.get("CTX_API_URL", "https://cloud.redis.io/context-surfaces") + "/api/v1", {"X-API-Key": os.environ["CTX_ADMIN_KEY"]}, timeout=(5, 60))
 
 
     def crs_admin(method: str, path: str, body: dict | None = None, ok: tuple = (200, 201)) -> Reply:
-        """One admin request under /api/v1 with the admin key (principle 3): the HTTP status, the reply as a dict, and the milliseconds it took.
-        A status outside `ok` raises with the reply's detail and never the request, since one request carries the database password."""
+        """One admin request. A status outside `ok` raises with the reply's detail and never the request, which can hold the database password."""
         reply = json_request(crs_admin_session, method, path, body)
         if reply.status not in ok:
             error = reply.payload if isinstance(reply.payload, dict) else {}
-            # a bad key answers {"error": "Invalid API key"} (probed 2026-10-08), other failures "detail" or "message", and a reply that is not JSON has only "type", its reason
-            detail = error.get("detail") or error.get("message") or error.get("error") or error.get("type") or ""
-            raise RuntimeError(f"{method} {path} answered {reply.status}. {detail}".strip())
+            raise RuntimeError(f"{method} {path} answered {reply.status}. {error.get('detail') or error.get('message') or error.get('error') or error.get('type') or ''}".strip())
         return reply
 
 
-    def crs_mcp(surface: Surface, body: dict):
-        """One JSON-RPC POST to the surface's mcp_url with the agent key alone: no admin key, no initialize handshake (principle 3).
-        Returns the HTTP response as it came, so crs_call can show a reply that is not JSON."""
-        return crs_mcp_session.post(surface["mcp_url"], json=body, headers={"X-API-Key": surface["agent_key"]})
-
-
     def crs_connection_config(url: str) -> dict:
-        """The database the surface reads and writes, from the same REDIS_URL the Search column uses (principle 2).
-        redis-py's parse_url reads the URL the way REDIS_CLIENT does, with the password unquoted. pool_size 2 and min_idle_conns 0 fit a 30-connection database."""
+        """The database the surface reads and writes, parsed from the same REDIS_URL as REDIS_CLIENT. The pool sizes fit a 30-connection database."""
         parts = redis.connection.parse_url(url)
         return {
             "addr": f"{parts['host']}:{parts.get('port', 6379)}",
@@ -2441,696 +1220,339 @@ def cr_connect(Reply, json_request, json_session, os, redis):
             "password": parts.get("password", ""),
             "db": parts.get("db", 0),
             "tls_enabled": parts.get("connection_class") is redis.SSLConnection,  # rediss://
-            "pool_size": 2,
-            "min_idle_conns": 0,
+            "pool_size": 2, "min_idle_conns": 0,
         }
 
 
-    return (
-        Surface,
-        ToolCall,
-        crs_admin,
-        crs_admin_base,
-        crs_admin_session,
-        crs_connection_config,
-        crs_mcp,
-        crs_mcp_default,
-    )
-
-
-@app.cell(hide_code=True)
-def cr_admin_fns(
-    CAIRN_SCOPE,
-    SHOP_RECORDS,
-    crs_admin,
-    crs_connection_config,
-    crs_data_model,
-    crs_mcp_default,
-    crs_models,
-    dt,
-    os,
-):
-    # Surface. The admin calls: the create request, create the surface, make an agent key and find its mcp_url, import the records, read, list by name, and delete.
-    crs_surface_name = "cairn-" + CAIRN_SCOPE
-
-
     def crs_create_body() -> dict:
-        """The create request: the data_model (principle 1) and a data_source whose connection_config comes from REDIS_URL (principle 2).
-        It holds the database password, so crs_create_surface sends it once and the pane shows only a masked copy."""
+        """The create request: the data model, and the database it reads. It holds the password, so only crs_create_surface sends it."""
         return {
             "name": crs_surface_name,
-            "description": "Made by the Redis Iris basics notebook. Safe to delete.",
-            "metadata": {"created_by": "iris-basics-notebook", "scope": CAIRN_SCOPE},
             "data_model": crs_data_model,
             "data_source": {"type": "redis", "connection_config": crs_connection_config(os.environ["REDIS_URL"])},
         }
 
 
-    def crs_create_surface(body: dict) -> dict:
-        """POST /context-surfaces with the create request. The password crosses the wire here and nowhere else.
-        Returns the id, name, status, and HTTP status. Never retried: a replay would make a second surface holding the password."""
-        status, reply, _ = crs_admin("POST", "/context-surfaces", body)
-        return {"id": reply["id"], "name": reply["name"], "status": reply["status"], "http": status}
+    def crs_create_surface() -> dict:
+        """Create the surface, make an agent key, and import the records. Returns the surface, agent key included.
+        The create POST is never retried: a replay would make a second surface holding the password."""
+        try:
+            made = crs_admin("POST", "/context-surfaces", crs_create_body()).payload
+        except OSError as error:  # a timeout or a dropped connection: the service may have made the surface before the reply was lost
+            raise RuntimeError(f"Create got no reply ({type(error).__name__}), so a surface may exist anyway. Press Clean up to delete every surface named {crs_surface_name}.") from error
+        path, imports = f"/context-surfaces/{made['id']}", {}
+        try:
+            key = crs_admin("POST", path + "/agent-keys", {"name": crs_surface_name + "-agent"}).payload  # no expires_at: the service ignores it and picks 90 days
+            mcp_url = key.get("mcp_url") or ""  # the key's reply says where an agent sends its calls
+            if not mcp_url:
+                raise RuntimeError("the agent key reply holds no mcp_url")
+            for model in crs_models:  # Model(**row).model_dump(): a field the class doesn't declare never reaches the wire
+                records = [model(**row).model_dump() for row in SHOP_RECORDS[model.__name__]]
+                body = {"entity": model.__name__, "records": records, "options": {"on_conflict": "overwrite", "on_error": "fail_fast"}}
+                imports[model.__name__] = crs_admin("POST", path + "/data", body).payload.get("imported", len(records))
+        except Exception as error:
+            raise RuntimeError(f"{str(error).rstrip('.')}. Press Clean up to remove the surface this left.") from error
+        finally:
+            for record_key in crs_record_keys:  # the service sets no TTL, so the notebook does, even when a call above raised
+                REDIS_CLIENT.expire(record_key, 3600)
+        return {
+            "id": made["id"], "name": made["name"], "status": made["status"], "agent_key": key["key"],
+            "key_expires_at": key.get("expires_at", "(not in the reply)"), "mcp_url": mcp_url, "imports": imports,
+        }
 
-
-    def crs_create_agent_key(surface_id: str) -> dict:
-        """POST .../agent-keys with expires_at an hour out, then GET .../agent-keys for that key's mcp_url (principle 3).
-        The key itself is in the POST reply only, so keep it and show at most its last four characters."""
-        expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3600)).isoformat(timespec="seconds")
-        made = crs_admin("POST", f"/context-surfaces/{surface_id}/agent-keys", {"name": crs_surface_name + "-agent", "expires_at": expires_at}).payload
-        listed = crs_admin("GET", f"/context-surfaces/{surface_id}/agent-keys?page_size=50").payload
-        mine = next((key for key in listed.get("agent_keys", []) if key.get("id") == made["id"]), {})
-        return {"agent_key": made["key"], "key_expires_at": made.get("expires_at", expires_at), "mcp_url": mine.get("mcp_url") or crs_mcp_default}
-
-
-    def crs_import_records(surface_id: str) -> dict[str, int]:
-        """POST .../data once per entity. Each record is Model(**row).model_dump(), so a field the class does not declare never reaches the wire.
-        The service writes one JSON document per record at the key template and indexes it (principle 2). Returns the imported count per entity."""
-        counts = {}
-        for model in crs_models:
-            records = [model(**row).model_dump() for row in SHOP_RECORDS[model.__name__]]
-            body = {"entity": model.__name__, "records": records, "options": {"on_conflict": "overwrite", "on_error": "fail_fast"}}
-            reply = crs_admin("POST", f"/context-surfaces/{surface_id}/data", body).payload
-            counts[model.__name__] = reply.get("imported", len(records))
-        return counts
-
-
-    def crs_read_surface(surface_id: str) -> dict:
-        """GET .../{id}: the surface with its current status, or a 404 marker once it is deleted."""
-        status, reply, _ = crs_admin("GET", f"/context-surfaces/{surface_id}", ok=(200, 404))
-        return reply if status == 200 else {"id": surface_id, "status": "deleted (404)"}
-
-
-    def crs_surfaces_named(name: str) -> list[str]:
-        """The ids of every surface on the account with this name, from the paged listing. Clean up uses it, so a surface a restarted kernel forgot is still found."""
-        found, page = [], 1
-        while page <= 40:
-            reply = crs_admin("GET", f"/context-surfaces?page={page}&page_size=50").payload
-            found += [surface["id"] for surface in reply.get("context_surfaces", []) if surface.get("name") == name]
-            if not reply.get("pagination", {}).get("has_next"):
-                break
-            page += 1
-        return found
-
-
-    def crs_delete_surfaces(known_id: str | None = None) -> dict[str, int]:
-        """DELETE .../{id} for every surface named cairn-<run>, plus the one this kernel holds. 200 or 204 deleted, 404 already gone.
-        The agent keys die with the surface and the service drops the indexes it built, but the documents stay in your database."""
-        statuses = {}
-        for surface_id in dict.fromkeys(([known_id] if known_id else []) + crs_surfaces_named(crs_surface_name)):
-            statuses[surface_id] = crs_admin("DELETE", f"/context-surfaces/{surface_id}", ok=(200, 204, 404)).status
-        return statuses
-
-
-    return (
-        crs_create_agent_key,
-        crs_create_body,
-        crs_create_surface,
-        crs_delete_surfaces,
-        crs_import_records,
-        crs_read_surface,
-        crs_surface_name,
-    )
+    return crs_admin, crs_create_surface, crs_surface_name
 
 
 @app.cell(hide_code=True)
-def cr_redis_fns(REDIS_CLIENT, crs_entity_prefixes, crs_record_keys, redis):
-    # Database. The notebook's own reads of what the service wrote, and the part of Clean up the service leaves to you.
-    def crs_indexes() -> list[dict]:
-        """The indexes the service built for this run: every index whose prefixes are among the three entity prefixes.
-        FT._LIST names them, and FT.INFO gives each one's prefixes and num_docs."""
-        found = []
+def cr_lifecycle(
+    REDIS_CLIENT,
+    crs_admin,
+    crs_entity_prefixes,
+    crs_record_keys,
+    crs_surface_name,
+    mo,
+    redis,
+):
+    # The surface, kept for the other cells. The notebook's one mo.state, under private names: a cell that references a getter reruns
+    # on every set, which would redefine the turn functions and reset the Chapter 4 chat. Other cells call crs_surface() instead.
+    _get_surface, _set_surface = mo.state(None)
+    crs_set_surface = _set_surface
+
+
+    def crs_surface() -> dict | None:
+        """The surface this kernel created: id, status, agent key, expiry, mcp_url, and import counts. None before Create and after Clean up."""
+        return _get_surface()
+
+
+    def crs_cleanup() -> str:
+        """Delete every surface named cairn-<scope>, unlink the record keys by name, and drop any entity index left behind, without DD. Returns one sentence."""
+        ids = []
+        for page in range(1, 41):  # the account lists its surfaces 50 a page, so this also finds one a restarted kernel forgot
+            reply = crs_admin("GET", f"/context-surfaces?page={page}&page_size=50").payload
+            ids += [item["id"] for item in reply.get("context_surfaces", []) if item.get("name") == crs_surface_name]
+            if not reply.get("pagination", {}).get("has_next"):
+                break
+        for surface_id in ids:
+            crs_admin("DELETE", f"/context-surfaces/{surface_id}", ok=(200, 204, 404))
+        unlinked, dropped = REDIS_CLIENT.unlink(*crs_record_keys), []  # the service drops its indexes on DELETE but leaves the documents
         for name in REDIS_CLIENT.execute_command("FT._LIST"):
             try:
-                info = REDIS_CLIENT.ft(name).info()
+                definition = REDIS_CLIENT.ft(name).info().get("index_definition", {})
+                prefixes = (definition if isinstance(definition, dict) else dict(zip(definition[::2], definition[1::2]))).get("prefixes", [])  # RESP3 or RESP2
+                if prefixes and all(prefix in crs_entity_prefixes for prefix in prefixes):
+                    REDIS_CLIENT.ft(name).dropindex(delete_documents=False)
+                    dropped.append(name)
             except redis.ResponseError:  # dropped between the two commands
                 continue
-            definition = info.get("index_definition", [])
-            if isinstance(definition, list):  # legacy flat key-value list from older wire shapes
-                definition = dict(zip(definition[::2], definition[1::2]))
-            prefixes = list(definition.get("prefixes", []))
-            if prefixes and all(prefix in crs_entity_prefixes for prefix in prefixes):
-                found.append({"name": name, "prefixes": prefixes, "num_docs": int(info.get("num_docs", 0))})
-        return found
+        _set_surface(None)
+        return f"Surfaces deleted: {len(ids)}; record keys unlinked: {unlinked} of {len(crs_record_keys)}; leftover indexes dropped: {len(dropped)}."
 
 
-    def crs_document(key: str) -> dict | None:
-        """JSON.GET of one key the service wrote, or None once it is gone. The agent never sends this command: it calls a tool, and the service reads here."""
-        return REDIS_CLIENT.json().get(key)
+    def crs_shown(surface: dict) -> dict:
+        """The surface for display: the agent key becomes **** plus its last four characters."""
+        return {**surface, "agent_key": "****" + surface["agent_key"][-4:]}
 
-
-    def crs_expire_records() -> int:
-        """EXPIRE 3600 on each of the 20 keys. The service sets no TTL, so this is the notebook's backstop. Returns how many keys existed."""
-        return sum(1 for key in crs_record_keys if REDIS_CLIENT.expire(key, 3600))
-
-
-    def crs_unlink_records() -> int:
-        """UNLINK the 20 keys by name. DELETE on the surface leaves the documents, so this is the notebook's job. Returns how many existed."""
-        return REDIS_CLIENT.unlink(*crs_record_keys)
-
-
-    def crs_drop_indexes() -> list[str]:
-        """FT.DROPINDEX, without DD, on any index still carrying the entity prefixes after the surface is gone. The service drops its own on DELETE, so this usually finds nothing."""
-        dropped = []
-        for index in crs_indexes():
-            try:
-                REDIS_CLIENT.ft(index["name"]).dropindex(delete_documents=False)
-            except redis.ResponseError:  # already gone
-                continue
-            dropped.append(index["name"])
-        return dropped
-
-    return (
-        crs_document,
-        crs_drop_indexes,
-        crs_expire_records,
-        crs_indexes,
-        crs_unlink_records,
-    )
+    return crs_cleanup, crs_set_surface, crs_shown, crs_surface
 
 
 @app.cell
-def cr_call_fn(Surface, ToolCall, crs_mcp, json):
-    # Call. tools/list after Create and on Refresh, and one read-only tools/call per Send, sorted into the three reply shapes an agent must tell apart.
-    def crs_request(name: str, arguments: dict) -> dict:
-        """The JSON-RPC body of one tool call. The agent sends this and the agent key, nothing else: no query, no key name, no index name (principle 3)."""
-        return {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+def cr_answer_fn(
+    AI_MODEL,
+    CAST,
+    ChatMessage,
+    ChatTurn,
+    answer_with_tools,
+    crs_surface,
+    json,
+    json_request,
+    json_session,
+    lcs_system,
+    rss_search,
+):
+    # Agent side. Every call here carries the agent key and nothing else: no admin key, no database password.
+    _sessions = {}  # one session per agent key, so every call after the first reuses its connection
 
 
-    def crs_list_tools(surface: Surface) -> list[dict]:
-        """tools/list: every tool the data model generated, each with a name, a description, and an inputSchema (principle 1).
-        A non-200 answer, or a 200 that carries a JSON-RPC error, raises a RuntimeError that says why."""
-        response = crs_mcp(surface, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-        if response.status_code != 200:
-            raise RuntimeError(f"tools/list answered {response.status_code}. The agent key expires an hour after Create: Clean up, then Create again.")
-        reply = response.json()
-        error = reply.get("error")
-        if error:  # HTTP 200 can still carry a top-level JSON-RPC error
-            code, message = (error.get("code"), error.get("message")) if isinstance(error, dict) else (None, error)
-            raise RuntimeError(f"tools/list returned JSON-RPC error {code}. {message}")
-        return reply["result"]["tools"]
+    def _mcp(surface: dict, method: str, params: dict):
+        """One JSON-RPC POST to the surface's mcp_url, with the agent key. json_request lets recording() see it."""
+        key = surface["agent_key"]
+        if key not in _sessions:
+            _sessions[key] = json_session(headers={"X-API-Key": key}, timeout=(5, 60))  # no base URL: mcp_url is absolute
+        return json_request(_sessions[key], "POST", surface["mcp_url"], {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 
 
-    def crs_call(surface: Surface, name: str, arguments: dict) -> ToolCall:
-        """One tools/call, and the reply sorted three ways. Data: result.content[0].text is a JSON string, so it is parsed.
-        Tool error: HTTP 200 with result.isError true and the reason in that text. JSON-RPC error: a top-level error with a code, -32602 when the arguments break the schema.
-        A rejected or expired agent key is none of these: HTTP 401 with a plain error string, shown as the HTTP status."""
-        response = crs_mcp(surface, crs_request(name, arguments))
-        try:
-            reply = response.json()
-        except ValueError:
-            reply = None
+    def crs_list_tools(surface: dict) -> list[dict]:
+        """tools/list with the agent key: every tool the data model generated, each with a name, a description, and an inputSchema."""
+        reply = _mcp(surface, "tools/list", {})
+        if reply.status != 200 or "error" in reply.payload:
+            raise RuntimeError(f"tools/list answered {reply.status}. If the agent key has expired, press Clean up, then Create.")
+        return reply.payload["result"]["tools"]
 
-        if not isinstance(reply, dict):  # None or a top-level array: not a JSON-RPC reply
-            kind, text = "not JSON", response.text[:400]
-        elif isinstance(reply.get("error"), dict):
-            kind, text = f"JSON-RPC error {reply['error'].get('code')}", json.dumps(reply["error"], indent=2)
-        elif "error" in reply:  # a rejected or expired agent key answers HTTP 401 with {"error": "Invalid API key"}, probed 2026-10-08
-            kind, text = f"HTTP {response.status_code}", str(reply["error"])
-        else:
-            result = reply.get("result", {})
-            content = result.get("content") or [{}]
-            text = content[0].get("text", json.dumps(result, indent=2))
-            kind = "tool error" if result.get("isError") else "data"
-            if kind == "data":
-                try:
-                    text = json.dumps(json.loads(text), indent=2)
-                except ValueError:
-                    pass
-        return {"tool": name, "arguments": arguments, "http": response.status_code, "kind": kind, "text": text}
 
-    return crs_call, crs_list_tools, crs_request
+    def crs_call(surface: dict, name: str, arguments: dict) -> str:
+        """tools/call with the agent key: the text to hand back to the model. A tool error is text too, so the model can read a failure and try again."""
+        payload = _mcp(surface, "tools/call", {"name": name, "arguments": arguments}).payload or {}
+        if "result" in payload:
+            return (payload["result"].get("content") or [{}])[0].get("text", "")
+        return json.dumps(payload.get("error", payload))
+
+
+    def crs_build_system(customer_id: str, articles: list[dict], extra: str = "") -> str:
+        """Chapter 2's prompt, plus who is asking, plus `extra` (Chapter 4 adds what she told us before)."""
+        who = next(name for name, cid in CAST.items() if cid == customer_id)
+        system = lcs_system(articles) + f"\n\nYou are talking to {who}, customer id {customer_id}. Look up their orders and products with the tools. Never look up another customer's records."
+        return system + "\n\n" + extra if extra else system
+
+
+    async def crs_answer(customer_id: str, messages: list[ChatMessage], extra: str = "") -> ChatTurn:
+        """The app decides what the model sees (identity, articles, `extra`). The model decides which tools to call."""
+        surface = crs_surface()  # None before Create: the assistant then answers from the help center alone
+        tools = crs_list_tools(surface) if surface else []
+        question = str(messages[-1].content)
+        system = crs_build_system(customer_id, rss_search(question), extra)
+        async for text in answer_with_tools(system, messages, AI_MODEL, tools, lambda name, arguments: crs_call(surface, name, arguments)):
+            yield text
+
+    return crs_answer, crs_build_system, crs_list_tools
 
 
 @app.cell(hide_code=True)
-def cr_machinery_md(mo):
-    mo.md(r"""
-    ## Notebook plumbing: surface state, console form, Send
+def cr_ask_md(CAST, mo):
+    # Ask is a button, not a form: a form ignores a second press when its values haven't changed. A typed question wins over the picked one.
+    # Tom's question is worded so rss_search finds returns-refund first. "Has the refund for my trail shoes gone through?" doesn't retrieve it.
+    _questions = ["Where's my tent? I leave for Maine on June 12.", "When will the refund for my trail shoes reach my card?", "Which sleeping bag should I get for the trip?"]
+    crs_ask = mo.md("{customer}\n\n{pick}\n\n{text}").batch(
+        customer=mo.ui.dropdown(options=CAST, value="Priya", label="Ask as"),
+        pick=mo.ui.dropdown(options=_questions, value=_questions[0], label="Question", full_width=True),
+        text=mo.ui.text(label="Or type your own", placeholder="Overrides the question above when filled", full_width=True),
+    )
+    crs_go = mo.ui.run_button(label="Ask")
 
-    Three hidden cells follow: the surface and call-log state with the request masker, the console form prefilled from the pick, and the Send handler.
-    Read `cr_settings`, `cr_console`, and `cr_send` in `iris_basics.py`, or expand them in `marimo edit`.
+    _step = mo.md("""
+    ## Step 3. Ask as a customer
+
+    Each question goes through `crs_answer`. The app puts who is asking and Chapter 1's articles in the system prompt, and hands over the tool list. The model decides which tools to call. When it picks one, `crs_call` sends a request like this and gives the reply text back to the model, which can call another tool or write the answer:
+
+    ```text
+    POST <mcp_url>
+    X-API-Key: <the agent key>
+
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+     "params": {"name": "filter_order", "arguments": {"tag_conditions": [{"field": "customer_id", "value": "C001"}]}}}
+    ```
+
+    Reading it piece by piece:
+
+    - `X-API-Key` is the agent key, the only key a tool call carries. MCP messages are JSON-RPC: `jsonrpc` and `id` are the envelope, and `method` says what to do. `"tools/call"` runs one tool, and `"tools/list"` returns the menu of tools, which `crs_answer` hands to the model.
+    - `name` and `arguments` are the model's choice, written against the tool's `inputSchema`, a JSON Schema for its arguments.
+    - A tag condition on `customer_id` is Chapter 1's filter before ranking again: the rule decides which records may come back, as `@year` did, so only Priya's orders do.
+    - The reply is `result.content[0].text`, JSON text: a filter returns `count` and `results`, a `get_` the bare record. A tool error is not an exception but HTTP 200 with `isError` true and the reason in the text, which the model reads and can retry.
     """)
+
+    _scope = mo.callout(mo.md("An agent key can carry access tags, which filter what the key can see, but this data model declares no ACL mapping. The identity line in the prompt is the only scope the demo shows."), kind="warn", title="Watch out: identity is a line in the prompt")
+
+    _try_it = mo.callout(mo.md("""
+    - Ask as Priya, with the tent question. Read the prompt: the articles are general ones, such as tent care and delivery, and none knows where her order is, so that must have come from a tool. Then read the tool calls: did the arguments carry `C001`? In the data her tent order, O1001, is `shipped`.
+    - Ask as Tom, with the refund question. Compare its tools and arguments with Priya's. The refund article joins the prompt. In the data his trail shoes, O1004, are `returned`.
+    - Ask Priya's tent question as Tom. Look at the id in the arguments, and at what the assistant says about a tent Tom never ordered.
+    """), kind="success", title="Try it")
+
+    mo.vstack([_step, _scope, _try_it, crs_ask, crs_go], gap=0.75)
+    return crs_ask, crs_go
+
+
+@app.cell(hide_code=True)
+async def cr_ask(
+    crs_answer,
+    crs_ask,
+    crs_build_system,
+    crs_go,
+    crs_surface,
+    json,
+    mo,
+    recording,
+    redis,
+    rss_search,
+    rss_text,
+):
+    # Ask. crs_answer runs inside recording(), so its tools/call requests are read back from the exchanges. The prompt is rebuilt with the turn's own functions.
+    mo.stop(not crs_go.value, mo.md("Pick a customer and a question, then press **Ask**."))
+    mo.stop(crs_surface() is None, mo.md("Press **Create** in step 2 first, then press **Ask** again: until a surface exists, the assistant has no tools."))
+    _customer = crs_ask.value["customer"]
+    _question = crs_ask.value["text"].strip() or crs_ask.value["pick"]
+    try:
+        _articles = rss_search(_question)  # the prompt below is rebuilt from these, the same articles the turn retrieves
+    except redis.ResponseError:  # the index doesn't exist
+        _articles = []
+    mo.stop(not _articles, mo.md("Chapter 1's help center has no articles. Press **Create** there: the articles expire an hour after each press."))
+
+    with recording() as _exchanges:
+        try:
+            _answer = "".join([text async for text in crs_answer(_customer, [mo.ai.ChatMessage(role="user", content=_question)])])
+        except Exception as _error:  # the model call failed, the service refused the agent key, or the tool list didn't load
+            _answer = f"The turn failed. `{type(_error).__name__}`: {str(_error)[:300]}"
+
+    _calls = []
+    for _exchange in (x for x in _exchanges if (x.body or {}).get("method") == "tools/call"):
+        _params, _payload = _exchange.body["params"], _exchange.payload or {}
+        _text = (_payload.get("result", {}).get("content") or [{}])[0].get("text") or json.dumps(_payload)
+        _calls.append(
+            f"**{len(_calls) + 1}. `{_params['name']}`** with `{json.dumps(_params['arguments'])}`, {_exchange.ms} ms\n\n"
+            f"```json\n{_text[:700]}{'...' if len(_text) > 700 else ''}\n```"
+        )
+
+    _saw = mo.vstack([mo.md(f"**What the model saw**: this system prompt for `{_customer}`, your question as the user message, and the tools from **Create**:"), rss_text(crs_build_system(_customer, _articles))])
+    _asked = mo.md("**What it asked for**\n\n" + ("\n\n".join(_calls) or "_No tool calls were made._"))
+    mo.vstack([_saw, _asked, mo.md("**Answer**\n\n" + _answer.replace("$", r"\$"))], gap=0.75)  # a bare $ would start a math span
     return
 
 
 @app.cell(hide_code=True)
-def cr_settings(json, mo):
-    # Surface and call-log state, and the mask for a request on display. cr_create sets the surface after Create and clears it
-    # after Clean up, and cr_send appends to the log after each Send. A cell that references a getter reruns on every setter call,
-    # so the display cells read the getters and the action cells read the surface through crs_surface() instead. The agent key
-    # lives inside the surface dict, which no cell renders: the summary shows its last four characters only. crs_shown masks the
-    # password and the keys of a request, so the create request kept in the surface is the masked copy.
-    crs_get_surface, crs_set_surface = mo.state(None)
-    crs_get_calls, crs_set_calls = mo.state([])
+def cr_ends(mo):
+    _docs = mo.md("""
+    - [Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/). It does not support Redis Flex or Active-Active databases.
+    - [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+    - Function calling: [OpenAI](https://developers.openai.com/api/docs/guides/function-calling), [Anthropic](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [Gemini](https://ai.google.dev/gemini-api/docs/function-calling)
+    """)
 
-
-    def crs_surface() -> dict | None:
-        """The surface this kernel created, read at call time: id, status, mcp_url, agent key, expiry, import counts, and the masked create request. None before Create and after Clean up."""
-        return crs_get_surface()
-
-
-    def crs_shown(method: str, url: str, body: dict, key_tail: str = "") -> dict:
-        """A request for display. X-API-Key shows **** alone for the admin key or **** plus the agent key's last four characters, and a connection_config password shows ****."""
-        shown = json.loads(json.dumps(body))
-        config = shown.get("data_source", {}).get("connection_config")
-        if config:
-            config["password"] = "****"
-        return {"method": method, "url": url, "headers": {"X-API-Key": "****" + key_tail, "Content-Type": "application/json"}, "json": shown}
-
-    return (
-        crs_get_calls,
-        crs_get_surface,
-        crs_set_calls,
-        crs_set_surface,
-        crs_shown,
-        crs_surface,
-    )
-
-
-@app.cell(hide_code=True)
-def cr_console(crs_pick, json, mo):
-    # The console form, rebuilt from the pick. Each field starts from the pick's tool and arguments and stays editable. Send is
-    # a run_button, True only for the run its press triggers. cr_send reads the three values, since a cell cannot read the value
-    # of an element it defines.
-    _name, _arguments = crs_pick.value
-    crs_tool_field = mo.ui.text(value=_name, label="Tool", full_width=True)
-    crs_args_field = mo.ui.text_area(value=json.dumps(_arguments, indent=2), label="Arguments (JSON)", rows=7, full_width=True)
-    crs_send_button = mo.ui.run_button(label="Send tools/call")
-    return crs_args_field, crs_send_button, crs_tool_field
-
-
-@app.cell(hide_code=True)
-def cr_send(
-    crs_args_field,
-    crs_call,
-    crs_send_button,
-    crs_set_calls,
-    crs_surface,
-    crs_tool_field,
-    dt,
-    json,
-):
-    # Send. One tools/call per press, appended to the log through the setter. Nothing is sent when the arguments are not JSON
-    # or when no surface exists, and the row says so.
-    if crs_send_button.value:
-        _surface = crs_surface()
-        _name = crs_tool_field.value.strip()
-        try:
-            _arguments = json.loads(crs_args_field.value or "{}")
-        except ValueError as _error:
-            _row = {"tool": _name, "arguments": crs_args_field.value, "http": "", "kind": "not sent, arguments are not JSON", "text": str(_error)}
-        else:
-            if _surface:
-                try:
-                    _row = crs_call(_surface, _name, _arguments)
-                except OSError as _error:  # a timeout or a dropped connection: the row says so, and the console stays
-                    _row = {"tool": _name, "arguments": _arguments, "http": "", "kind": f"no reply, {type(_error).__name__}", "text": str(_error)[:400]}
-            else:
-                _row = {"tool": _name, "arguments": _arguments, "http": "", "kind": "not sent, no surface in this kernel", "text": ""}
-        _row["at"] = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S")
-        crs_set_calls(lambda calls: [_row, *calls])
+    mo.vstack([mo.md("**Where this stops.** A week later, in a new chat, Priya asks, \"Which sleeping bag should I get for the trip?\" You can ask it as Priya in step 3. Her orders and the help articles say nothing about her being allergic to down or paddling in Maine in June, so look at what the answer has to go on. She told the assistant last week, and it forgot. Chapter 4 gives the assistant a memory."), mo.accordion({"Docs for this chapter": _docs})], gap=0.75)
     return
 
 
 @app.cell(column=4, hide_code=True)
-def am_title(mo):
-    mo.md(r"""
-    # Redis Agent Memory
+def am_title(ams_client, mo):
+    _ = ams_client  # the buttons wait for the settings check, so a press never runs ahead of it
+    ams_seed_button = mo.ui.run_button(label="Seed")
+    ams_refresh_button = mo.ui.run_button(label="Refresh")
 
-    As Cairn Outfitters, you store what you know about a customer as long-term memories, mapped like..
+    _story = mo.md(r"""
+    # Chapter 4. Agent memory: remember her
 
-      `{ id, text, ownerId }`
+    A week later, Priya opens a new chat and asks, "Which sleeping bag should I get for the trip?" Her orders don't say she's allergic to down feathers or that she's paddling in Maine in June. She told the assistant last week, and every chat starts empty, so it forgot.
+
+    **Redis Agent Memory** keeps what customers say as **long-term memories**, one set per customer. Each turn writes the customer's message to **session memory**, recalls that customer's memories by meaning, and adds them to the context Chapter 3 built.
+
+    ## You'll learn how to
+
+    1. Keep each customer's memories apart with an `ownerId` filter that runs before ranking, the way Chapter 1's `@year` filter did.
+    2. Recall a memory by meaning, even when it shares no words with the question.
+    3. Tell session memory, which holds one chat, from long-term memory, which the service extracts from sessions in the background.
+    4. Run the complete turn: memory, help articles, tools, and the model.
+
+    ## Step 1. Store each customer's memories
+
+    Agent Memory stores each memory as one record. This is the first of Priya's:
 
     ```json
     {
-      "id": "priya-seed-2",
-      "text": "I'm allergic to peanuts and tree nuts",
-      "ownerId": "Priya"
+      "id": "c001-seed-1",
+      "text": "I'm allergic to down feathers",
+      "ownerId": "C001"
     }
     ```
 
-    [**Redis Agent Memory**](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/) keeps each conversation in session memory and durable facts in long-term memory. A search matches a question to those facts by meaning.
+    Reading it piece by piece:
 
-    The app puts what it recalls into the prompt it sends the model.
+    - `id` is the app's choice, not the service's, so a second **Seed** rewrites the same record instead of adding a copy.
+    - `text` is the fact, in the customer's words.
+    - `ownerId` is the customer's id, the same `C001` that keys her record in Chapter 3. Recall filters on it.
+    - **Seed** sends no `memoryType`, so the store files each memory as `semantic`, a durable fact. A memory the service extracts from a conversation can be `episodic`, a snapshot of one session. The **type** column in the tables shows which.
 
-    ---
-
-    ## We'll learn how to..
-
-    1. Store a long-term memory for one customer.
-    2. Search that customer's memories by meaning.
-    3. Put the memories you recall into the system prompt.
+    **Seed** writes four memories for Priya and three for Tom with `POST /long-term-memory`. **Refresh** lists them again, including any the service extracted in the background after a chat turn.
     """)
-    return
 
+    _try_it = mo.callout(mo.md("Press **Seed**. The tables under the buttons list Priya's four memories and Tom's three. Press it again and the counts stay the same, because a second **Seed** rewrites the same ids."), kind="success", title="Try it")
 
-@app.cell(hide_code=True)
-def am_store_button(ams_client, mo, textwrap):
-    _ = ams_client  # the buttons appear once the client exists, so a press never runs ahead of the settings check
-    ams_seed_button = mo.ui.run_button(label="Seed")
-    ams_refresh_button = mo.ui.run_button(label="Refresh")
-    ams_cleanup_button = mo.ui.run_button(label="Clean up", kind="danger")
-
-    _heading = mo.md(
-        textwrap.dedent(
-            """
-            ### 1. Store a long-term memory for one customer
-
-            Seed writes three memories for Tom and three for Priya. The tables below list what the store holds for each customer.
-            """
-        ).strip()
-    )
-
-    _key_idea = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                The app chooses each memory's `id`, so a second Seed rewrites the same six records and creates nothing new. Every memory is tagged with an `ownerId`: Tom or Priya.
-                """
-            ).strip()
-        ),
-        kind="info",
-        title="Key idea",
-    )
-
-    _request = mo.md(
-        textwrap.dedent(
-            """
-            One of the six memories Seed writes:
-
-            ```json
-            {
-              "id": "priya-seed-2",
-              "text": "I'm allergic to peanuts and tree nuts",
-              "ownerId": "Priya"
-            }
-            ```
-
-            Reading it piece by piece:
-
-            - `id` is the app's. This fact is `priya-seed-2`, so a later Seed updates that same record.
-            - `text` is the fact, in the customer's words.
-            - `ownerId` is the customer. Tom's memories and Priya's never share one.
-            - Seed sends no `memoryType`, so the store files these as `semantic`. A memory extracted from a conversation can be `episodic`.
-            """
-        ).strip()
-    )
-
-    _buttons_note = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                **Seed** sends the six memories with `POST /long-term-memory`. **Refresh** lists them again, including anything extracted from a session a few minutes after a turn. **Clean up** deletes every session and every long-term memory tagged Tom or Priya.
-                """
-            ).strip()
-        ),
-        kind="success",
-        title="What the buttons do",
-    )
-
-    _hops = mo.md(
-        textwrap.dedent(
-            """
-            Each line reads source, target, and what passes between them:
-
-            ```text
-            App        -> long-term   POST /long-term-memory, the Seed memories, each with an ownerId
-            App        -> session     POST /session-memory/events, the user's message, every turn
-            App        -> long-term   POST /long-term-memory/search: text, similarityThreshold, ownerId
-            long-term  -> App         the memories at or above the threshold, best first, no score
-            App        -> LLM         the system prompt with the recalled memories, and the history
-            session    -> long-term   extraction in the background, a few minutes after a turn
-            ```
-
-            Agent Memory embeds inside the service. It stores each long-term memory with a vector embedding and searches those vectors, so the app sends text and never a vector. The service's own AI model settings, which cover embedding, extraction, and summarization, are chosen in the console when you create it: Redis-managed keys by default, or your own provider key and models. The embedding model is fixed after creation, and `LLM_API_KEY` is only the chat's key.
-
-            Settings: `MEMORY_API_BASE_URL`, `MEMORY_STORE_ID`, and `MEMORY_API_KEY`, plus `LLM_API_KEY` for the chat.
-
-            Docs: [Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/),
-            [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/), and
-            [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
-            """
-        ).strip()
-    )
-
-    mo.vstack(
-        [
-            _heading,
-            _key_idea,
-            _request,
-            _buttons_note,
-            mo.hstack([ams_seed_button, ams_refresh_button, ams_cleanup_button], justify="start"),
-            mo.accordion({"How a turn reaches the model": _hops}),
-        ],
-        gap=0.75,
-    )
-    return ams_cleanup_button, ams_refresh_button, ams_seed_button
+    mo.vstack([_story, _try_it, mo.hstack([ams_seed_button, ams_refresh_button], justify="start")], gap=0.75)
+    return ams_refresh_button, ams_seed_button
 
 
 @app.cell(hide_code=True)
 async def am_store(
-    ams_chatbot,
-    ams_cleanup_button,
-    ams_forget,
+    CAST,
     ams_memories,
-    ams_memory_table,
     ams_refresh_button,
     ams_seed,
     ams_seed_button,
-    ams_seeds,
     mo,
 ):
-    _note = ""
-    if ams_seed_button.value:
-        _ids = await ams_seed()
-        _note = f"Wrote {len(_ids)} new memories to long-term memory." if _ids else "Every seed memory is already in long-term memory."
-    if ams_cleanup_button.value:
-        _sessions, _memories = 0, 0
-        for _owner in ams_seeds:
-            _deleted_sessions, _deleted_memories = await ams_forget(_owner)
-            _sessions += len(_deleted_sessions)
-            _memories += len(_deleted_memories)
-        _note = f"Deleted {_memories} memories and {_sessions} sessions for {' and '.join(ams_seeds)}."
-    _ = ams_refresh_button.value  # Refresh lists again, for memories extracted in the background
-    _ = ams_chatbot.value  # and so does each chat turn, so the tables agree with the bars
+    # Seed writes the memories. Every run, for any reason, then lists what the store holds for each customer.
+    _note = f"**Seed** sent {len(await ams_seed())} memories." if ams_seed_button.value else ""
+    _ = ams_refresh_button.value  # a Refresh press reruns this cell, to list memories extracted in the background
 
-    ams_store = {}
-    for _owner in ams_seeds:
-        ams_store[_owner] = await ams_memories(_owner)
+    _tables = []
+    for _name, _owner in CAST.items():
+        _found = await ams_memories(_owner)
+        _rows = [f"| {_m.text.replace('|', '&#124;')} | {_m.memory_type} |" for _m in _found]
+        _tables.append(mo.md("\n".join([f"**{_name}**, `ownerId` {_owner} ({len(_found)})", "", "| memory | type |", "|:--|:--|", *_rows])))
 
-    mo.vstack(
-        ([mo.md(_note)] if _note else [])
-        + [
-            mo.hstack(
-                [ams_memory_table(_owner, _found) for _owner, _found in ams_store.items()],
-                widths="equal",
-                align="start",
-            )
-        ]
-    )
-    return (ams_store,)
-
-
-@app.cell(hide_code=True)
-def am_owner(ams_seeds, mo, textwrap):
-    ams_owner = mo.ui.dropdown(options=list(ams_seeds), value=next(iter(ams_seeds)), label="Chat as")  # displayed in the workbench, upstream of the chat so a switch starts a new session
-
-    _search_heading = mo.md("### 2. Search that customer's memories by meaning")
-
-    _search_key = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Long-term search is a vector search. `similarityThreshold` is the cosine similarity floor, the same name the LangCache column tunes. The request also sends `ownerId`, so Tom's agent does not see Priya's allergy.
-
-                "Which foods should I avoid?" shares no words with "I'm allergic to peanuts and tree nuts", and the search still returns it for Priya.
-                """
-            ).strip()
-        ),
-        kind="info",
-        title="Key idea",
-    )
-
-    _search_request = mo.md(
-        textwrap.dedent(
-            """
-            ```json
-            {
-              "text": "Which foods should I avoid?",
-              "similarityThreshold": 0.30,
-              "filter": {"ownerId": {"eq": "Priya"}},
-              "limit": 10
-            }
-            ```
-
-            Reading it piece by piece:
-
-            - `text` is the question, or the last N user messages joined together.
-            - `similarityThreshold` is the floor. The slider starts at 0.30.
-            - `filter.ownerId` is the customer chosen in **Chat as**.
-            - `limit` is 10.
-            - The reply lists memories and does not include a score.
-            """
-        ).strip()
-    )
-
-    _search_try = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Type `/` in the chat box to pick a starter message.
-
-                - Send the first one as Tom. The agent has nothing on food, and the Priya bars show the allergy the filter kept out.
-                - Send the next two as Tom. His dogs and his Dolomites trip appear in the system prompt.
-                - Switch to Priya, which starts a new conversation, and send the same three. The foods question now recalls the allergy, with no keyword shared.
-                """
-            ).strip()
-        ),
-        kind="success",
-        title="Try it",
-    )
-
-    _prompt_heading = mo.md("### 3. Put the memories you recall into the system prompt")
-
-    _prompt_key = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Each turn writes the user's message to session memory, searches long-term memory, and the app puts what it recalls into the system prompt. Agent Memory does not build that prompt.
-                """
-            ).strip()
-        ),
-        kind="info",
-        title="Key idea",
-    )
-
-    _prompt_try = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                - Move `similarityThreshold` and watch memories enter and leave the system prompt. Dark bars at or above the slider are the ones that go in.
-                - Send the packing question next. Alone it is a weak match, so set N to 2 and the trip question rides along in the search text.
-                - The last message tells the agent something new. A few minutes later, **Refresh** can list a memory the store extracted from it.
-                """
-            ).strip()
-        ),
-        kind="success",
-        title="Try it",
-    )
-
-    _watch = mo.callout(
-        mo.md(
-            textwrap.dedent(
-                """
-                Extraction runs in the background, a few minutes after a turn. The prompt for this turn never reads the message you just sent.
-                """
-            ).strip()
-        ),
-        kind="warn",
-        title="Watch out",
-    )
-
-    mo.vstack(
-        [
-            _search_heading,
-            _search_key,
-            _search_request,
-            _search_try,
-            _prompt_heading,
-            _prompt_key,
-            _prompt_try,
-            _watch,
-        ],
-        gap=0.75,
-    )
-    return (ams_owner,)
-
-
-@app.cell(hide_code=True)
-def am_workbench(
-    ams_bars,
-    ams_build_system,
-    ams_chatbot,
-    ams_get_threshold,
-    ams_get_turns,
-    ams_owner,
-    ams_request,
-    ams_session_id,
-    ams_threshold,
-    ams_turn_bands,
-    ams_turn_events,
-    ams_turn_live,
-    ams_turn_query,
-    ams_turns,
-    json,
-    mo,
-):
-    _t = round(ams_get_threshold(), 2)
-    _n = ams_get_turns()
-    _owner = ams_owner.value
-    _shown = min(_n, sum(m.role == "user" for m in ams_chatbot.value))
-    _recalled = [text for text, band in ams_turn_bands[_owner].items() if round(band, 2) >= _t]
-
-    _data = [
-        ams_turns,
-        mo.md(
-            ("**Search text**, the last user message:" if _shown == 1 else f"**Search text**, the last {_shown} user messages, oldest first:")
-            if ams_turn_live
-            else "**Search text**, the first starter message until you send one:"
-        ),
-        mo.md(f"```text\n{ams_turn_query}\n```"),
-        mo.md(
-            "Each bar is the highest `similarityThreshold` that returns the memory, found by running this search at 21 thresholds. "
-            "The API returns no score. Dark bars are at or above the slider's line, and those memories go into the system prompt."
-        ),
-        ams_threshold,
-        mo.md(f"**ownerId {_owner}**, what the `filter` returns"),
-        ams_bars(ams_turn_bands[_owner], _t),
-    ]
-    for _other in (o for o in ams_turn_bands if o != _owner):
-        _data += [mo.md(f"**ownerId {_other}**, the same search for comparison. The agent never sends it."), ams_bars(ams_turn_bands[_other], _t)]
-    _data += [
-        mo.md("---"),
-        mo.md("Moving a slider redraws this pane without a new turn."),
-        mo.md("**Search request**, from `ams_request`"),
-        mo.md(f"```json\n{json.dumps(ams_request(ams_turn_query, _owner, _t), indent=2)}\n```"),
-        mo.md("**System prompt**, from `ams_build_system`"),
-        mo.md(f"```text\n{ams_build_system(_owner, _recalled)}\n```"),
-        mo.md(
-            f"**Session `{ams_session_id}`**, the user messages the app wrote ({len(ams_turn_events)})"
-            if ams_turn_events
-            else f"**Session `{ams_session_id}`**, no messages written yet"
-        ),
-    ]
-    if ams_turn_events:
-        _data.append(mo.md("\n".join(f"- {text}" for text in ams_turn_events)))
-
-    mo.hstack(
-        [
-            mo.vstack([ams_owner, ams_chatbot]),
-            mo.vstack(_data),
-        ],
-        widths=[5, 6],
-        gap=1.5,
-        align="start",
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def am_build_md(mo):
-    mo.md(r"""
-    ## The Agent Memory code: client, store, prompt, turn
-
-    One cell per step, with the code visible in `marimo edit`. In `marimo run`, pick **Show code** from the app menu.
-    Every call on `ams_client` goes to Agent Memory, and the rest is the app. Seed and Clean up call the store functions, and each chat turn calls `ams_turn`.
-    """)
+    mo.vstack([mo.md(_note), mo.hstack(_tables, widths="equal", align="start")])
     return
 
 
 @app.cell
 def am_connect(os):
-    # Client. Three settings from .env, and one object for every Agent Memory call below.
+    # Client. Three settings from .env, and one object for every Agent Memory call in this chapter. The steps name the HTTP request behind each call, and this SDK sends it for you.
     from redis_agent_memory import AgentMemory, models
 
 
@@ -3143,45 +1565,39 @@ def am_connect(os):
 
 
 @app.cell
-def am_store_fns(ams_client, asyncio, models):
-    # Store. Seed, list, and delete the long-term memories of two customers.
-    ams_seeds = {
-        "Tom": [
-            "I've got two dogs, Max and Cece",
+def am_store_fns(CAST, ams_client, asyncio, models):
+    # Store. Seed, list, and delete the long-term memories of the two customers.
+    ams_seeds: dict[str, list[str]] = {
+        CAST["Priya"]: [
+            "I'm allergic to down feathers",
+            "I'm planning a canoe trip in Maine in June",
+            "I always sleep cold",
+            "I have a cat named Miso",
+        ],
+        CAST["Tom"]: [
             "I wear size 11 trail shoes",
             "I'm planning a hiking trip in the Dolomites in August",
-        ],
-        "Priya": [
-            "I have a cat named Miso",
-            "I'm allergic to peanuts and tree nuts",
-            "I'm planning a canoe trip in Maine in June",
+            "I've got two dogs, Max and Cece",
         ],
     }
 
 
     async def ams_memories(owner: str) -> list[models.MemoryRecord]:
         """Every long-term memory whose `ownerId` is `owner`, up to 100. With no `text`, the search endpoint lists by filter alone."""
-        r = await ams_client.search_long_term_memory_async(
-            request={"filter": {"ownerId": {"eq": owner}}, "limit": 100}
-        )
+        r = await ams_client.search_long_term_memory_async(request={"filter": {"ownerId": {"eq": owner}}, "limit": 100})
         return r.items
 
 
     async def ams_seed() -> list[str]:
-        """Write memories straight to long-term memory, each tagged with the `ownerId` the app chooses (the write side of principle 2).
-        The ids are the app's too, so a retry or a second Seed rewrites the same records and creates nothing new."""
-        created: list[str] = []
-
-        for owner, texts in ams_seeds.items():
-            before = {m.id for m in await ams_memories(owner)}
-            memories = [
-                {"id": f"{owner.lower()}-seed-{i}", "text": text, "ownerId": owner}  # no memoryType, so the store files it as "semantic"
-                for i, text in enumerate(texts, 1)
-            ]
-            await ams_client.bulk_create_long_term_memories_async(memories=memories)
-            created += [m["id"] for m in memories if m["id"] not in before]
-
-        return created
+        """Write every seed memory, each tagged with its customer's `ownerId`. The ids are the app's, so a second Seed rewrites
+        the same records. Returns the ids written."""
+        memories = [
+            {"id": f"{owner.lower()}-seed-{i}", "text": text, "ownerId": owner}  # no memoryType, so the store files it as "semantic"
+            for owner, texts in ams_seeds.items()
+            for i, text in enumerate(texts, 1)
+        ]
+        await ams_client.bulk_create_long_term_memories_async(memories=memories)
+        return [m["id"] for m in memories]
 
 
     async def ams_forget(owner: str) -> tuple[list[str], list[str]]:
@@ -3195,264 +1611,284 @@ def am_store_fns(ams_client, asyncio, models):
 
         return sessions.items, memory_ids
 
-    return ams_forget, ams_memories, ams_seed, ams_seeds
+    return ams_forget, ams_memories, ams_seed
 
 
-@app.cell
-def am_prompt_fns(ChatMessage):
-    # Prompt. The search text, the search request, and the system prompt the app builds.
-    def ams_query(messages: list[ChatMessage], n: int) -> str:
-        """The text to search with: the last `n` user messages, in order."""
-        user_messages = [str(m.content) for m in messages if m.role == "user"]
-        return "\n".join(user_messages[-n:])
+@app.cell(hide_code=True)
+def am_chat_md(CAST, mo):
+    ams_owner = mo.ui.dropdown(options=CAST, value="Priya", label="Chat as")  # shown beside the chat, and read by am_turn_fn, so a switch starts a new session
 
+    _step = mo.md(r"""
+    ## Step 2. Recall them by meaning
 
-    def ams_request(query: str, owner: str, threshold: float) -> dict:
-        """The search request. `text` and `similarityThreshold` match by meaning (principle 1), `filter` scopes recall to one `ownerId` (principle 2), and `limit` caps the results at ten."""
-        return {
-            "text": query,
-            "similarityThreshold": threshold,
-            "filter": {"ownerId": {"eq": owner}},
-            "limit": 10,
-        }
+    Each turn asks Agent Memory (`POST /long-term-memory/search`) for the customer's memories closest in meaning to what they just said. For Priya's sleeping bag question:
 
+    ```json
+    {
+      "text": "Which sleeping bag should I get for the trip?",
+      "similarityThreshold": 0.15,
+      "filter": {"ownerId": {"eq": "C001"}},
+      "limit": 10
+    }
+    ```
 
-    def ams_build_system(owner: str, facts: list[str]) -> str:
-        """The system prompt. The app, not Agent Memory, decides what the model sees (principle 3)."""
-        system = "You are the Cairn Outfitters support agent. Answer the customer in two or three sentences."
+    Reading it piece by piece:
 
-        if facts:
-            system += f"\n\nWhat you remember about {owner}:\n" + "\n".join(f"- {fact}" for fact in facts)
+    - `text` is the last user message. The match is by meaning, so "Which sleeping bag should I get for the trip?" can find "I'm allergic to down feathers" with no word in common.
+    - `similarityThreshold` is the same floor as in Chapters 1 and 2, fixed at 0.15. Each service scores on its own scale. The floor is low on purpose: a memory the model doesn't need costs a few tokens, but one it never sees can cost the answer. The reply has no score, so you only see which memories cleared it.
+    - `filter.ownerId` is Chapter 1's filter before ranking: only C001's memories are ranked, so Tom's never come back for Priya.
+    - `limit` caps the reply at ten memories.
 
-        return system
+    `ams_turn` is the whole recipe. It writes the message to session memory, recalls with this request, and hands the memories to Chapter 3's `crs_answer`, which adds them to the prompt. The app decides what the model sees, and now that includes what she told it before.
+    """)
 
-    return ams_build_system, ams_query, ams_request
+    _extraction = mo.callout(mo.md("Session memory holds the messages of one chat. The service extracts long-term memories from it in the background, within about five minutes of a turn, so a turn never recalls the message it just wrote. The customer's id travels as each event's `actorId`, and the extracted memories carry it as their `ownerId`."), kind="warn", title="Watch out: extraction is slow")
+
+    mo.vstack([_step, _extraction], gap=0.75)
+    return (ams_owner,)
 
 
 @app.cell
 def am_turn_fn(
-    AI_MODEL,
     ChatMessage,
     ChatTurn,
-    ams_build_system,
     ams_client,
     ams_owner,
-    ams_query,
-    ams_request,
-    ams_settings,
+    crs_answer,
     dt,
     models,
-    stream_llm,
     uuid,
 ):
-    # Turn. One chat turn: the session write, the long-term search, and the prompt.
+    # Turn. One chat turn: the session write, the long-term recall, and Chapter 3's answer with the memories added.
     ams_session_id = f"{ams_owner.value.lower()}-{uuid.uuid4().hex[:12]}"  # a new session each time the customer changes
 
 
-    async def ams_turn(messages: list[ChatMessage]) -> ChatTurn:
-        """One agent turn: write the message to session memory, search long-term memory, and put what it recalls in the system prompt."""
-        owner = ams_owner.value  # the customer from the dropdown
-        threshold, turns = ams_settings()  # the two sliders, read when you send
+    def ams_request(text: str, owner: str) -> dict:
+        """The recall request: `text` matched by meaning, clearing a similarity floor, among `owner`'s memories only."""
+        return {
+            "text": text,
+            "similarityThreshold": 0.15,  # the same floor as Chapters 1 and 2, fixed here
+            "filter": {"ownerId": {"eq": owner}},  # Chapter 1's filter before ranking
+            "limit": 10,
+        }
 
-        # Session memory: the user's message, as an event in this session.
-        # The first event's actorId becomes the session's ownerId, and the memories the store extracts from the session carry it.
-        # Extraction runs a few minutes later. The prompt below never reads these events.
+
+    def ams_memory_block(owner: str, memories: list[str]) -> str:
+        """What the app adds to the system prompt: the customer's memories, or nothing when there are none."""
+        lines = "\n".join(f"- {text}" for text in memories)
+        return f"What customer {owner} told you in earlier chats. Use it when it matters to the question:\n{lines}" if memories else ""
+
+
+    async def ams_turn(messages: list[ChatMessage]) -> ChatTurn:
+        """One assistant turn: write the message to session memory, recall memories, and answer as Chapter 3 does."""
+        owner, question = ams_owner.value, str(messages[-1].content)  # the customer id from the dropdown
+
+        # Session memory: the message, as an event in this chat's session. Its actorId is the customer's id.
         await ams_client.add_session_event_async(
-            session_id=ams_session_id,
-            actor_id=owner,
-            role=models.MessageRole.USER,
-            content=[{"text": str(messages[-1].content)}],
-            created_at=dt.datetime.now(dt.timezone.utc),
+            session_id=ams_session_id, actor_id=owner, role=models.MessageRole.USER,
+            content=[{"text": question}], created_at=dt.datetime.now(dt.timezone.utc),
         )
 
-        # Long-term memory: this owner's memories, by meaning, searched with the last N user messages.
-        found = await ams_client.search_long_term_memory_async(request=ams_request(ams_query(messages, turns), owner, threshold))
+        # Long-term memory: this customer's memories closest in meaning to the question.
+        found = await ams_client.search_long_term_memory_async(request=ams_request(question, owner))
 
-        # The prompt: the app puts the recalled memories in front of the model.
-        system = ams_build_system(owner, [m.text for m in found.items])
-        async for text in stream_llm(system, messages, AI_MODEL):
+        # The answer: Chapter 3's, with the memories added to what the model sees.
+        async for text in crs_answer(owner, messages, extra=ams_memory_block(owner, [m.text for m in found.items])):
             yield text
 
-    return ams_session_id, ams_turn
+    return ams_memory_block, ams_request, ams_session_id, ams_turn
 
 
 @app.cell(hide_code=True)
-def am_machinery_md(mo):
-    mo.md(r"""
-    ## Notebook plumbing: slider state, chat object, threshold sweep, renderers
+def am_chat(ams_owner, ams_turn, mo, recording, redis):
+    ams_log = []  # one record per turn, for the pane beside the chat
 
-    Four hidden cells follow: slider state, chat object, the threshold sweep behind the bars, and the renderers for bars and tables.
-    Read `am_settings`, `am_chat`, `am_turn_sweep`, and `am_render` in `iris_basics.py`, or expand them in `marimo edit`.
-    """)
+
+    async def _turn(messages):
+        """ams_turn inside recording(), noted in ams_log. A failed turn ends with a line of text, because mo.ui.chat keeps a turn only then."""
+        with recording() as exchanges:
+            record = {"question": str(messages[-1].content), "owner": ams_owner.value, "exchanges": exchanges, "error": ""}
+            ams_log.append(record)
+            try:
+                async for text in ams_turn(messages):
+                    yield text
+            except redis.ResponseError:  # rss_search found no index: Chapter 1's Create never ran, or Clean up everything dropped it
+                record["error"] = "ResponseError"
+                yield "Chapter 1's index is missing: press **Create** there, then ask again."
+            except Exception as error:
+                record["error"] = type(error).__name__
+                yield f"\n\n*The turn stopped with {record['error']}. The pane beside the chat shows what the search and the session hold.*"
+
+
+    ams_chatbot = mo.ui.chat(
+        _turn,
+        prompts=[
+            "Which sleeping bag should I get for the trip?",
+            "How do I wash my sleeping bag after the trip?",
+            "Where's my tent?",
+            "I'm bringing my dog Juniper on the trip.",
+        ],
+        max_height=520,
+    )
+    return ams_chatbot, ams_log
+
+
+@app.cell(hide_code=True)
+async def am_pane(
+    CAST,
+    ams_chatbot,
+    ams_client,
+    ams_log,
+    ams_memory_block,
+    ams_owner,
+    ams_request,
+    ams_session_id,
+    asyncio,
+    crs_build_system,
+    json,
+    mo,
+    rss_search,
+    rss_text,
+):
+    _names = {customer_id: name for name, customer_id in CAST.items()}
+
+
+    def _lines(items: list[str], empty: str = "none") -> str:
+        return "\n".join(f"- {item}" for item in items) or f"- {empty}"
+
+
+    _try_it = mo.callout(mo.md("""
+    After **Seed**, chat as Priya. Type `/` to open the starter prompts (the menu lists them alphabetically) and send them in the order below. The pane beside the chat shows each turn's recall, prompt, tool calls, and session. The assistant answers from Chapter 1's articles, so press **Create** there first, or again if the articles have expired.
+
+    1. "Which sleeping bag should I get for the trip?" Look for an answer that weighs her memories, the temperature-rating article, and the catalog, where the down bag is the warmer one.
+    2. "How do I wash my sleeping bag after the trip?" Chapter 2's cache served Priya the down answer for her synthetic bag. Here, look for care steps for a synthetic bag, because her allergy is in the prompt.
+    3. "Where's my tent?" Look for a tool call in the pane. It needs Chapter 3's surface.
+    4. "I'm bringing my dog Juniper on the trip." This is a new fact. Wait up to five minutes, then press **Refresh** in step 1 to see whether the service extracted it.
+
+    Then switch **Chat as** to Tom, which starts a new session, and send the first prompt again. Only his memories can come back, and the pane shows what the same search finds for Priya, which the assistant never sends.
+    """), kind="success", title="Try it")
+
+    if not ams_log:
+        _data = mo.md("Send a message to fill this pane.")
+    else:
+        _last = ams_log[-1]
+        _owner = _last["owner"]
+        _other = next(customer_id for customer_id in CAST.values() if customer_id != _owner)
+        try:
+            # Three service calls, for display only: this turn's recall again, the same search for the other customer, and the session.
+            _mine, _theirs, _session = await asyncio.gather(
+                ams_client.search_long_term_memory_async(request=ams_request(_last["question"], _owner)),
+                ams_client.search_long_term_memory_async(request=ams_request(_last["question"], _other)),
+                ams_client.get_session_memory_async(session_id=ams_session_id),
+            )
+            _recalled = [m.text for m in _mine.items]
+            _said = [event.content[0].text for event in _session.events]
+            _system = crs_build_system(_owner, rss_search(_last["question"]), ams_memory_block(_owner, _recalled))
+            _calls = [
+                f"`{e.body['params']['name']}` `{json.dumps(e.body['params']['arguments'])}`, HTTP {e.status}, {e.ms} ms"
+                for e in _last["exchanges"] if e.body and e.body.get("method") == "tools/call"
+            ]
+            _data = mo.vstack(
+                [
+                    mo.md(f"**Recalled for {_names[_owner]}** ({_owner}), the search `ams_request` builds\n\n" + _lines(_recalled, "nothing cleared the floor")),
+                    mo.md(f"**The same search for {_names[_other]}** ({_other}). The assistant never sends it, and the `ownerId` filter keeps it out of the prompt\n\n" + _lines([m.text for m in _theirs.items], "nothing cleared the floor")),
+                    mo.vstack([mo.md("**System prompt**, from `crs_build_system`"), rss_text(_system)]),
+                    mo.md("**Tool calls**, from the recorded requests\n\n" + _lines(_calls, "none before the turn stopped" if _last["error"] else "none this turn")),
+                    mo.md(f"**Session `{ams_session_id}`**, the user messages the app wrote ({len(_said)})\n\n" + _lines(_said)),
+                ]
+            )
+        except Exception as _error:  # the chat is part of this output, so an error here must not replace it
+            _data = mo.md("Chapter 1's index is missing, so the turn stopped before the answer. Press **Create** there." if type(_error).__name__ == "ResponseError" else f"The pane couldn't read the turn back: {type(_error).__name__}.")
+
+    # The page keeps a chat's messages when its cell reruns, so Tom's chat sits one level deeper than Priya's: a switch mounts a new chat.
+    _chat = mo.vstack([ams_owner, ams_chatbot])
+    for _ in range(list(CAST.values()).index(ams_owner.value)):
+        _chat = mo.vstack([_chat])
+
+    mo.vstack([mo.md("## Step 3. Run the whole turn"), _try_it, mo.hstack([_chat, _data], widths=[5, 6], gap=1.5, align="start")], gap=0.75)
     return
 
 
 @app.cell(hide_code=True)
-def am_settings(mo):
-    # Slider state. The sliders live in am_chat, so a turn cannot read their .value from inside the chat cell.
-    # A cell that references these getters reruns on every move, so the turn reads them through ams_settings() instead.
-    # am_chat reads the getters for the sliders' start values, and marimo exempts the cell that owns a control.
-    ams_get_threshold, ams_set_threshold = mo.state(0.3)
-    ams_get_turns, ams_set_turns = mo.state(1)
+def am_epilogue(ams_client, mo):
+    _ = ams_client  # the button waits for the settings check, like Seed and Refresh
+    am_cleanup_button = mo.ui.run_button(label="Clean up everything", kind="danger")
 
+    _docs = mo.md("""
+    - [Overview](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/overview/)
+    - [Python SDK quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/python-sdk-quickstart/)
+    - [Developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/)
+    """)
 
-    def ams_settings() -> tuple[float, int]:
-        """The sliders' current values, read at call time. A cell that calls this does not rerun when a slider moves."""
-        return round(ams_get_threshold(), 2), ams_get_turns()
+    _epilogue = mo.md(r"""
+    ## Epilogue. One turn, four layers
 
-    return (
-        ams_get_threshold,
-        ams_get_turns,
-        ams_set_threshold,
-        ams_set_turns,
-        ams_settings,
-    )
+    Here is what Priya's question, "Which sleeping bag should I get for the trip?", used, layer by layer:
+
+    1. **Agent Memory** wrote her message to session memory and recalled her long-term memories.
+    2. **Redis Search** found the help articles closest in meaning to her question.
+    3. **Context Retriever** answered the tool calls the model made for her orders and products.
+    4. **The model** got the system prompt the app assembled, the chat, and the tool results, and wrote the answer.
+
+    **LangCache** sits in front of questions whose answer is the same for everyone. It isn't in this turn, because the right answer here is about her.
+
+    Four ideas came back along the way:
+
+    - **The schema decides what you can search.** Chapter 1 declared field types in `FT.CREATE`. In Chapter 3, the data model decides the tools.
+    - **A similarity floor.** `VECTOR_RANGE` in Chapter 1, then the same floor, called `similarityThreshold`, in Chapters 2 and 4.
+    - **Filter before ranking.** `@year` in Chapter 1, the filter tools in Chapter 3, `ownerId` in Chapter 4.
+    - **The app decides what the model sees.** The articles in Chapter 2, her identity and the tool results in Chapter 3, her memories in Chapter 4.
+    """)
+
+    _cleanup = mo.md(r"""
+    ### Clean up everything
+
+    This removes what the chapters created, by name or id and nothing else: Chapter 1's index and article keys, Chapter 2's cache entries, Chapter 3's surface (which ends its agent key), record keys, and indexes, and the memories and sessions of Priya and Tom. Redis keys and cache entries expire on their own, and memories last a year. The surface doesn't expire. It holds your database password and stays until it's deleted, so press **Clean up everything** when you're done.
+    """)
+
+    mo.vstack([_epilogue, mo.accordion({"Docs for this chapter": _docs}), _cleanup, am_cleanup_button], gap=0.75)
+    return (am_cleanup_button,)
 
 
 @app.cell(hide_code=True)
-def am_chat(
-    ams_get_threshold,
-    ams_get_turns,
-    ams_set_threshold,
-    ams_set_turns,
-    ams_turn,
+async def am_cleanup(
+    CAST,
+    HELP_ARTICLES,
+    REDIS_CLIENT,
+    RS_IDX_NAME,
+    RS_KEY_PREFIX,
+    am_cleanup_button,
+    ams_forget,
+    crs_cleanup,
+    lcs_forget,
     mo,
+    redis,
 ):
-    # debounce=True: the setter fires when the slider is released, not on every step.
-    ams_threshold = mo.ui.slider(
-        start=0.0, stop=1.0, step=0.05, value=ams_get_threshold(), show_value=True, debounce=True,
-        label="similarityThreshold", on_change=ams_set_threshold,
-    )
-    ams_turns = mo.ui.slider(
-        start=1, stop=10, step=1, value=ams_get_turns(), show_value=True, debounce=True,
-        label="Search with the last N user messages", on_change=ams_set_turns,
-    )
-    ams_prompts = [
-        "Which foods should I avoid?",
-        "What pets do I have?",
-        "Where am I headed this summer?",
-        "Any packing tips?",
-        "I'm training for a marathon in October.",
-    ]
+    mo.stop(not am_cleanup_button.value)
 
+    # Context Retriever first: the surface holds the database password and never expires on its own.
+    _surface = crs_cleanup()
 
-    async def _turn(messages):
-        """ams_turn, with an error turned into the last line of the reply. mo.ui.chat keeps a turn, and the pane redraws, only when it ends with text."""
-        try:
-            async for text in ams_turn(messages):
-                yield text
-        except Exception as error:
-            yield f"\n\n*The turn stopped with {type(error).__name__}. The pane beside the chat shows what the session and the search hold.*"
+    # Redis Search: drop the index without DD, then unlink each article key by name.
+    try:
+        REDIS_CLIENT.execute_command("FT.DROPINDEX", RS_IDX_NAME)
+    except redis.ResponseError:  # Chapter 1 never created it, or it is already gone
+        pass
+    _keys = REDIS_CLIENT.unlink(*(f"{RS_KEY_PREFIX}:{_article['id']}" for _article in HELP_ARTICLES))
 
-    # Displayed beside the data in am_workbench. ams_turn is the Iris turn above.
-    ams_chatbot = mo.ui.chat(_turn, prompts=ams_prompts, max_height=520)
-    return ams_chatbot, ams_prompts, ams_threshold, ams_turns
+    # LangCache and Agent Memory clean up with their own functions.
+    _deleted, _gone = lcs_forget()
+    _forgot = [await ams_forget(_owner) for _owner in CAST.values()]
 
+    mo.md(f"""
+    - **Redis Search:** the index is gone, and {_keys} article keys unlinked.
+    - **LangCache:** deleted {_deleted} entries, {_gone} had already expired.
+    - **Context Retriever:** {_surface}
+    - **Agent Memory:** deleted {sum(len(_m) for _, _m in _forgot)} memories and {sum(len(_s) for _s, _ in _forgot)} sessions for {' and '.join(CAST)}.
 
-@app.cell(hide_code=True)
-async def am_turn_sweep(
-    ams_chatbot,
-    ams_client,
-    ams_get_turns,
-    ams_prompts,
-    ams_query,
-    ams_request,
-    ams_session_id,
-    ams_store,
-    asyncio,
-    models,
-):
-    from redis_agent_memory import errors  # NotFoundErrorResponseContent, for a session Clean up deleted
-
-
-    async def ams_sweep(query: str, store: dict[str, list[models.MemoryRecord]]) -> dict[str, dict[str, float]]:
-        """For each owner in `store`, the highest threshold that returns each memory. The API returns no score."""
-        grid = [round(0.05 * i, 2) for i in range(21)]  # 0.00 to 1.00
-        pairs = [(owner, t) for owner in store for t in grid]
-        gate = asyncio.Semaphore(12)  # 42 searches per sweep; keep a dozen in flight
-
-        async def recall(owner: str, t: float) -> list[models.MemoryRecord]:
-            async with gate:
-                r = await ams_client.search_long_term_memory_async(request={**ams_request(query, owner, t), "limit": 100})
-                return r.items
-
-        hits = await asyncio.gather(*(recall(owner, t) for owner, t in pairs))
-
-        bands = {owner: {m.text: 0.0 for m in records} for owner, records in store.items()}
-        for (owner, t), found in zip(pairs, hits):
-            for m in found:
-                bands[owner][m.text] = max(bands[owner].get(m.text, 0.0), t)
-
-        return bands
-
-
-    async def ams_session_texts(session_id: str) -> list[str]:
-        """The user messages the app wrote to this session, or none when the session is gone (Clean up deletes it)."""
-        try:
-            session = await ams_client.get_session_memory_async(session_id=session_id)
-        except errors.NotFoundErrorResponseContent:
-            return []
-        return [e.content[0].text for e in session.events]
-
-
-    # The search text behind the last turn (the first starter prompt before any chat), how high a threshold each
-    # memory clears for it, for every customer, and the session so far. Depends on the chat, N, and the store, not on the threshold.
-    ams_turn_live = any(m.role == "user" for m in ams_chatbot.value)
-    ams_turn_query = ams_query(ams_chatbot.value, ams_get_turns()) if ams_turn_live else ams_prompts[0]
-    ams_turn_bands = await ams_sweep(ams_turn_query, ams_store)
-    ams_turn_events = await ams_session_texts(ams_session_id) if ams_turn_live else []
-    return ams_turn_bands, ams_turn_events, ams_turn_live, ams_turn_query
-
-
-@app.cell(hide_code=True)
-def am_render(mo, models):
-    import html  # escapes each memory's text inside the bars
-
-
-    def ams_bars(bands: dict[str, float], threshold: float) -> mo.Html:
-        """One row per memory, in store order."""
-        threshold = round(threshold, 2)
-        rows = []
-        for text, band in bands.items():
-            state = "ams-bar" if round(band, 2) >= threshold else "ams-bar ams-bar-below"
-            rows.append(
-                '<div class="ams-row">'
-                f'<div class="ams-label" title="{html.escape(text)}">{html.escape(text)}</div>'
-                '<div class="ams-track">'
-                f'<div class="{state}" style="width:{band * 100:.0f}%"></div>'
-                f'<div class="ams-line" style="left:{threshold * 100:.0f}%"></div>'
-                "</div>"
-                f'<div class="ams-value">{band:.2f}</div>'
-                "</div>"
-            )
-        ticks = '<div class="ams-row"><div></div><div class="ams-ticks"><span>0</span><span>0.5</span><span>1</span></div><div></div></div>'
-        body = "".join(rows) + ticks if rows else '<div class="ams-empty">No memories yet. Select Seed to write them.</div>'
-        css = """
-    <style>
-    .ams-bars { font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; color: #52514e; }
-    .ams-row { display: grid; grid-template-columns: minmax(0, 2fr) 3fr 3.2em; gap: 0 8px; align-items: center; margin: 6px 0; }
-    .ams-label { overflow-wrap: anywhere; }
-    .ams-track { position: relative; min-width: 0; height: 12px; background: #e1e0d9; border-radius: 0 4px 4px 0; }
-    .ams-bar { position: absolute; left: 0; top: 0; height: 100%; background: #2a78d6; border-radius: 0 4px 4px 0; }
-    .ams-bar-below { background: #9ec5f4; }
-    .ams-line { position: absolute; top: -4px; height: 20px; width: 2px; background: #0b0b0b; }
-    .ams-value { color: #0b0b0b; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-    .ams-ticks { display: flex; justify-content: space-between; color: #898781; font-size: 11px; border-top: 1px solid #c3c2b7; padding-top: 2px; }
-    .ams-empty { color: #898781; }
-    </style>
-    """
-        return mo.Html('<div class="ams-bars">' + body + "</div>" + css)
-
-
-    def ams_memory_table(owner: str, found: list[models.MemoryRecord]) -> mo.Html:
-        """One owner's long-term memories as a markdown table, headed with the `ownerId`."""
-        head = f"**ownerId {owner}** ({len(found)})"
-        if not found:
-            return mo.md(head + "\n\n_No memories yet._")
-        rows = [f"| {m.text.replace('|', '&#124;')} | {m.memory_type} |" for m in found]
-        return mo.md("\n".join([head, "", "| memory | type |", "|---|---|", *rows]))
-
-    return ams_bars, ams_memory_table
+    The results above still show the last run. To run the chapters again, press **Create** in Chapter 1 and in Chapter 3, then **Seed** in Chapter 4. **Refresh** updates the memory tables.
+    """)
+    return
 
 
 if __name__ == "__main__":

@@ -6,14 +6,14 @@ Work one iteration at a time. Each iteration ends with the notebook running. At 
 
 ## Status
 
-- [ ] Iteration 0. Baseline and branch
-- [ ] Iteration 1. De-risk Context Retriever and tool calling (no notebook changes)
-- [ ] Iteration 2. One shared world: the data
-- [ ] Iteration 3. Prologue and Chapter 1, Search
-- [ ] Iteration 4. Chapter 2, Semantic caching
-- [ ] Iteration 5. Chapter 3, Context engineering and retrieval
-- [ ] Iteration 6. Chapter 4, Agent memory, and the epilogue
-- [ ] Iteration 7. Teaching pass, README, final counts
+- [x] Iteration 0. Baseline and branch
+- [ ] Iteration 1. De-risk Context Retriever and tool calling (no notebook changes). Done except the live model round trip: the `.env` OpenAI key is revoked (see the progress log).
+- [x] Iteration 2. One shared world: the data
+- [x] Iteration 3. Prologue and Chapter 1, Search
+- [x] Iteration 4. Chapter 2, Semantic caching (the model's own answers are unseen until a working key is in `.env`)
+- [x] Iteration 5. Chapter 3, Context engineering and retrieval (the model's own tool choices and answers are unseen until a working key is in `.env`)
+- [x] Iteration 6. Chapter 4, Agent memory, and the epilogue (the payoff answers themselves are unseen until a working key is in `.env`)
+- [x] Iteration 7. Teaching pass, README, final counts
 
 ## Goals
 
@@ -114,7 +114,7 @@ These replace the old plan's rulings.
 3. **What's shown.** Show the building blocks the story composes: the clients, the model classes, the seeds, and one function per chapter (`rss_search`, `lcs_answer`, `crs_answer`, `ams_turn`) with the few functions they call. A reader can follow the code's own arc from one to the next. Each command or request appears once in the prose with its "reading it" bullets, so cells that only execute it are hidden, as are rendering, wiring, and lifecycle code. A short delete-by-id function may stay beside its client when it teaches something (LangCache entries can't be listed, so the app keeps their ids).
 4. **Redis-forward in Chapter 1.** Every Search command is text written the way `redis-cli` takes it, split by `shlex` into one `REDIS_CLIENT.execute_command`.
 5. **Show what the model saw.** Chapters 2 to 4 display the system prompt and any tool calls behind each answer.
-6. **One chat.** Only Chapter 4 uses `mo.ui.chat`. Chapters 2 and 3 use `mo.ui.form`, so a request is sent only on submit.
+6. **One chat.** Only Chapter 4 uses `mo.ui.chat`. Chapters 2 and 3 batch their inputs (`mo.md(...).batch(...)`) and send on an **Ask** `run_button`, so a request is sent only on a press. (Changed in Iteration 4: in a browser, a `mo.ui.form` submitted again with unchanged values doesn't rerun anything, so asking the same question twice silently did nothing.)
 7. **No sweeps.** Displays use the service's own reply (LangCache's `similarity`) plus at most three extra calls per turn.
 8. **Prose budget.** One markdown cell per step: a story line, the command or request, three to five "reading it" bullets, at most one callout, and a short "Try it". Doc links go in one accordion per chapter.
 9. **Kept from the old plan, because they still serve the goals:**
@@ -344,15 +344,15 @@ Notebook changes go through the live kernel with `marimo._code_mode`. The packag
 
 ## Metrics
 
-| Metric | Baseline 2026-10-16 | Target |
-|---|---|---|
-| Cells | 67 | about 39 |
-| Hidden cells | 51 | about 26 |
-| Cells with code shown | 16 | about 13 |
-| Non-blank lines in the notebook | 2,919 | at most 1,500 |
-| `mo.state` pairs | 7 | 1 |
-| `mo.ui.chat` | 2 | 1 |
-| Extra service calls per turn, for display only | 7 (LangCache), 42 (Agent Memory) | at most 3 |
+| Metric | Baseline 2026-10-16 | Target | Result, end of Iteration 7 |
+|---|---|---|---|
+| Cells | 67 | about 39 | 42 (the three hidden `*_ends` cells) |
+| Hidden cells | 51 | about 26 | 29 (same three) |
+| Cells with code shown | 16 | about 13 | 13 |
+| Non-blank lines in the notebook | 2,919 | at most 1,500 | 1,500 (no slack) |
+| `mo.state` pairs | 7 | 1 | 1 |
+| `mo.ui.chat` | 2 | 1 | 1 |
+| Extra service calls per turn, for display only | 7 (LangCache), 42 (Agent Memory) | at most 3 | Chapter 2: 1 (the nearest-prompt probe). Chapter 3: 0. Chapter 4: 3 (two recall searches and the session read), plus one `rss_search` on Redis to rebuild the prompt |
 
 Measure with the script in the appendix after each iteration.
 
@@ -374,6 +374,8 @@ Measured before 2026-10-16. Re-measure anything the data changes touch.
 - The server copies `.env` when it starts, and marimo's loader never overrides a variable that's already set, so a changed `.env` needs a server restart, not a kernel restart.
 - `[tool.marimo.runtime] auto_reload = "lazy"` picks up edits under `src/` on the next run of a cell that imports them.
 - Redis Cloud 8.6.2, Search 8.6.10, redis-py 8.1.0. The free tier allows about 100 operations a second.
+- 2026-10-16, about 16:00: the `.env` `LLM_API_KEY` (OpenAI, last four `ffMA`) is dead. OpenAI answered 401 three ways on three probes: `expired_secret_key`, `invalid_api_key` (models.list), and `token_invalidated` ("Your API key has been invalidated"). Every model call in Chapters 2 to 4 fails until it's replaced and the server restarted.
+- Installed: google-genai 2.30.1, anthropic 1.11.0, openai 3.25.0. The anthropic and openai 3.x SDKs use `httpx2`, not `httpx`, so offline mock transports import `httpx2`.
 
 **marimo 0.24.2**
 
@@ -385,29 +387,54 @@ Measured before 2026-10-16. Re-measure anything the data changes touch.
 
 **Search**
 
-- "trail shoes feel cramped": `size-boots` first at 0.5394. "waterproofng": `care-waterproof` first at 0.5219. "Trailhead": `warranty-resole` third under KNN.
-- "Where is my parcel?": top three at 0.4841, 0.5593, and 0.5831. At year floor 2025 the post-filter keeps 3 of 5, and the pre-filter returns 5.
-- The range query needs `$EPSILON: 0.5`. With the default 0.01, a floor of 0.40 misses `size-boots` at about 0.54.
+Re-measured 2026-10-16 with the 37 articles (Iteration 2), every KNN cross-checked against a numpy brute force:
+
+- KNN 3: "trail shoes feel cramped" gives `size-boots` 0.5394, `size-bags` 0.7251, `care-tent` 0.7453. "my trail shoes feel cramped" gives `size-boots` 0.5326, `size-bags` 0.7250, `care-tent` 0.7351. "waterproofng" gives `care-waterproof` 0.5219, `care-boots` 0.6361, `care-tent` 0.7378. "Trailhead" gives `ship-address` 0.8549, `size-boots` 0.8621, `warranty-resole` 0.8677 (third).
+- `VECTOR_RANGE` with `$EPSILON: 0.5`: at floor 0.40, both cramped phrasings return `size-boots` alone and "waterproofng" returns `care-waterproof` alone; at floor 0.50 all three are empty. "Trailhead" is empty at 0.40 and at 0.30.
+- `$EPSILON` depends on the index's history. On a fresh index right after its first load, the default (0.01) at floor 0.40 misses `size-boots` for both cramped phrasings, while 0.5 finds it. After a second load into the same index, or on an index with earlier loads, the default finds it too. So the prose may say a range search "can" stop early and miss, not that it does.
+- "Where is my parcel?", KNN 5: `ship-international` 0.4841 (2025), `returns-refund` 0.5593 (2024), `ship-address` 0.5831 (2023), `ship-times` 0.6281 (2025), `ship-overdue` 0.6364 (2026). Post-filter kept of 5 at year floors 2022 to 2026: 5, 5, 4, 3, 1. The pre-filter always returns 5: at 2025 it adds `ship-free` and `order-backorder`; at 2026 it is `ship-overdue`, `ship-free`, `returns-damaged`, `order-gift`, and `size-packs` (a weak fifth at 0.8864). `care-synthetic` (2023) never appears.
+- The articles later chapters put into prompts, KNN 3: "How do I wash my down sleeping bag?" `care-down` 0.3618, `care-pack` 0.4549, `care-synthetic` 0.4555. The goose-down rewording `care-down` 0.6848, `size-bags`, `care-pack`. "How do I wash my synthetic sleeping bag?" `care-synthetic` 0.3431, `care-down` 0.4514, `care-waterproof`. "Where's my tent?" `care-tent` 0.5638, `warranty-tent`, `ship-free` (no shipping article first; "Where is my parcel?" is the shipping question). "Has the refund for my trail shoes gone through?" `ship-overdue` 0.5769, `size-boots`, `order-cancel`; `returns-refund` is not in the three ("When will my refund reach my card?" puts it first at 0.3675). "Which sleeping bag should I get for the trip?" `size-bags` 0.5717, `ship-express`, `care-down`. "How do I wash my sleeping bag after the trip?" `care-down` 0.4739, `care-pack`, `care-synthetic` 0.5314 (both bag articles, so memory must steer). "I'm bringing my dog Juniper on the trip." nothing closer than 0.76.
+- After a load: `num_docs` 37, `hash_indexing_failures` 0.
+- Through the rebuilt notebook (Iteration 3, about 16:40) every number above came out the same. `num_docs` is 37 right after the pipeline, even on a fresh index. `num_records` grows with each reload (1041, 2082, 3123) while `num_docs` stays 37: stale records waiting for garbage collection. `FT.INFO` comes back as a dict under redis-py 8.1.0's default protocol (RESP3), not a flat list.
+- `HSET` never removes a field. Keys written by an older loader keep its `id` field until they're unlinked or expire, so Create writes only `title`, `body`, `category`, `year`, `embedding`, and the `HSTRLEN` of `embedding` is 1024 (256 x 4).
+- The `$EPSILON` miss reproduced on a throwaway index with the same schema: right after its first load, the default at floor 0.40 returns nothing for "my trail shoes feel cramped", while 0.5 finds `size-boots`. The notebook's own index always exists already, so a reader won't see the miss there; the prose says "can".
+- potion-base-8M's WordPiece tokenizer splits "waterproofng" into `water`, `##proof`, `##ng`, and "Trailhead" into `trail`, `##head`. `FT.SEARCH <index> "Trailhead"` (full text) returns `warranty-resole` alone.
 - A wrong-length embedding, or a non-numeric `year`, leaves the hash out of the index silently, counted in `hash_indexing_failures`.
 
 **LangCache**
 
+- Re-measured through the rebuilt Chapter 2 (Iteration 4): the goose-down rewording 0.904587, the synthetic question 0.95018625, and "Where's my tent?" 0.618 against "How do I wash my down sleeping bag?". With the other entries stored, the goose-down question scores 0.8838 against the synthetic entry, and "Where's my tent?" scores 0.6158 and 0.607 against the others. At 0.96 all three miss. Storing the same prompt again gives the same `entryId`.
+- A search with no `maxResults` returns only the best entry. `similarityThreshold` 0 is accepted. Each entry carries `id`, `prompt`, `response`, `similarity`, `attributes`, and `searchStrategy`.
+- Observed once, not investigated: a prompt containing a digit ("How do I wash my 20F down sleeping bag?", "Where's my tent? I leave for Maine on June 12.") came back with `data: []` even at threshold 0 with near matches stored.
+- Timings: a hit takes 63 to 137 ms end to end; a store (`POST /entries`, 201) takes 67 to 179 ms. No real model answer was timed (key revoked).
 - Against the stored prompt "How do I wash my down sleeping bag?": the goose-down rewording scores 0.905 and the synthetic question 0.950. At 0.96 both miss.
 - A miss is HTTP 200 with `data: []`. A new cache never expires entries unless `ttlMillis` is sent, and expiry lands about a second after it.
 - The `entryId` is derived from the prompt, so storing the same prompt again replaces the entry. Entries can't be listed, hence the ledger.
 - `DELETE` on an expired id answers 404 with type `/errors/resource-not-found`. A bad key answers 403 with an HTML page. A search takes 68 to 294 ms, about 440 ms cold. `maxResults` is honored, though missing from the published `api.yaml`.
 
-**Context Retriever** (from the 2026-09-30 notebook)
+**Context Retriever** (live, 2026-10-16, Iteration 1, with the old data; data values change with the new records)
 
-- Three entities produced 21 tools. `get_customer_by_id` returned the record plus a `_retrieval` stamp. `filter_customer` with no condition answered `isError` with "at least one condition is required".
-- A bad key answers 401 `{"error": "Invalid API key"}` from both the admin API and the MCP endpoint.
-- Unverified: a schema-breaking argument returning JSON-RPC -32602, the HTTP status that comes with a JSON-RPC error, and how long `provisioning_indices` lasts.
+- Create through the notebook's button took about 4 s: `POST /context-surfaces` 201 with status `provisioning_indices`, which was already `active` at the first read about 4 s later. The service built one index per entity (`idx:<surface id>:<8 hex>:<entity>`) and 20 JSON keys, which the notebook expired at 3600 s. `GET /context-surfaces/{id}` carries `mcp_url` itself. The surface dict kept in the kernel never refreshes its `status`.
+- `tools/list` (87 ms): 21 tools. Per entity `count_`, `filter_`, `get_..._by_id`, `list_`, `summarize_` (15), plus `search_customer_by_text` and `search_product_by_text`, plus four set tools: `except_results`, `expand_results`, `intersect_results`, `union_results`. About 33,000 characters of JSON, about 8,000 tokens, sent with every model request; the `inputSchema`s are most of it. Descriptions carry the data model's own text and enums (for example `filter_order` lists tag fields `customer_id`, `sku`, `region`, `status`).
+- `tools/call` took 61 to 175 ms. A data reply is `result.content[0].text`, JSON: `get_*_by_id` gives the bare record plus `_retrieval` and no `id`; `filter_*` and `search_*` give `{count, has_more, limit, offset, results, total_count}` with each result's `id` the full Redis key. `get_*_by_id` wants the bare id: the full key gives "document not found" with the template doubled.
+- Errors: a tool error is HTTP 200 with `isError` (no condition: "at least one condition is required"; unknown id: "get by ID failed: document not found: <key>"). A schema break (wrong type, enum miss, missing required field) and an unlisted tool both give HTTP 200 with JSON-RPC `-32602`, told apart only by the message. No key gives 401 `{"error": "API key required"}`, a made-up key 401 `{"error": "unauthorized: invalid agent token: ..."}` (a string, not a dict).
+- Agent key: `cs_agent_` plus 43 characters, opaque. The service ignores `expires_at`: with `+00:00`, with `Z`, and with 2 hours, 1 day, 30 days, 200 days, or none, every key got created_at + 90 days (Iteration 5). The notebook no longer sends it. Deleting the surface ends its keys: the old key then answers `tools/list` with 401. The agent-key POST reply carries `mcp_url`, `expires_at`, `masked_key`, and the key itself, so no GET is needed for the `mcp_url`.
+- Scoping a key to one customer: unverified. The SDK has `access_tags` on `CreateAgentKeyRequest` and `__acl_field_mappings__` on `ContextModel` (shape undocumented), and the docs say access tags filter what a key can see. Until it's tested, Chapter 3 says the key can carry access tags, but this data model declares no ACL mapping, so the identity line in the prompt is the only scope the demo shows.
+- `json_request` on `json_session(headers={"X-API-Key": agent_key})`, which has no base URL, works with the absolute `mcp_url` (200, gzip JSON over HTTP/2). `recording()` captures MCP calls made inside `answer_with_tools` in order; `Exchange.path` is the full URL and holds no headers, so the agent key never lands in the record.
+- The account holds 826 surfaces, so cleanup by name walks 17 listing pages. Delete plus the walk took 4.3 s. The service drops its indexes on `DELETE` but leaves the 20 documents.
+- With the new data (Iteration 5): Create imports Customer 6, Product 8, Order 8 (region `amer` accepted) in about 1.8 s (the create POST 473 ms). `tools/list` is 21 tools and 34,684 characters. Priya's document is `{"customer_id": "C001", "lifetime_value": 4200.0, "name": "Priya Shah", "region": "amer", "tier": "gold"}`. `filter_order` on `customer_id` C001 returns O1001 (P102, shipped, 399) and O1002 (P104, delivered, 89); C002 returns O1003 (P101, delivered, 249) and O1004 (P100, returned, 129). Results carry only the `sku`, so naming a product takes `get_product_by_id`. `tools/call` took 206 to 360 ms with a new session per call (89 to 118 ms with a reused session).
+- Tom's question is "When will the refund for my trail shoes reach my card?": `returns-refund` comes first (0.4639) on every index state tried. The plan's "Has the refund for my trail shoes gone through?" retrieves no refund article.
+- KNN is approximate, and the index's history matters. After unlinking and reloading the articles into the same index, "Where's my tent? I leave for Maine on June 12." returned `care-tent`, `ship-express`, and `order-cancel`, losing `warranty-tent` (a brute force agrees with the fresh index). Chapter 1's stated numbers have matched on every check so far.
 
 **Agent Memory**
 
 - The SDK client has a 5-second timeout and no retries. A session's `ownerId` comes from its first event's `actorId`. A memory created without `memoryType` is filed as `semantic`, and creating an existing id replaces its text.
 - Search returns no score, and one search takes about 300 ms. Extraction shows up two to five minutes after a turn. Session memory lives an hour, long-term memory 365 days.
 - `get_session_memory_async` on a deleted session raises `errors.NotFoundErrorResponseContent`. `list_sessions_async(filter_owner_id=...).items` is a list of id strings.
+- Recall threshold, measured through the notebook's `ams_request` (Iteration 6). At 0.3, Priya's "Which sleeping bag should I get for the trip?" recalls only "I always sleep cold", and "How do I wash my sleeping bag after the trip?" recalls nothing. The allergy appears for the first question below about 0.22 to 0.24 and for the second below about 0.21 to 0.22. The fixed value is now **0.15**, so both payoff questions recall cold, canoe, and the allergy, and the cat never comes back for either. Tom's memories never come back for Priya at any value tried. Agent Memory scores on its own scale, so 0.15 here isn't comparable to Chapter 1's 0.40 or Chapter 2's 0.85.
+- Extraction runs on a five-minute tick (memories created at :x0:02 and :x5:02), so a fact appears anywhere from seconds to about five minutes after a turn. "I'm bringing my dog Juniper on the trip." became the episodic memory "User is bringing their dog Juniper on the canoe trip to Maine in June." It uses the seeded context and doesn't need the chat's model key.
+- Timings: a session event write takes 247 ms, a recall search 294 to 329 ms, and a session read 82 ms. A turn spends about 0.8 s before the model call, and the pane adds about 0.4 s after it (two recall searches, one session read, one `rss_search`).
+- marimo keeps a `mo.ui.chat`'s messages in the page when the cell that shows it reruns, even for a new chat object. So after a customer switch the old transcript stayed on screen and was sent as history. `am_pane` nests the chat one `mo.vstack` deeper per customer, which makes a switch mount a new chat. The `/` menu lists a chat's prompts alphabetically, not in the order given.
 
 ## How to work on the live kernel (this machine)
 
@@ -419,6 +446,7 @@ Measured before 2026-10-16. Re-measure anything the data changes touch.
   ```
 
   After that, write each script to `%LOCALAPPDATA%\Temp` and pass its Git Bash path (for example `/c/Users/Nick/AppData/Local/Temp/edit.py`) as the last argument instead of `-c "..."`.
+- On Nick's machine (`C:\Users\NickCooper`, checked 2026-10-16) the paths above differ: the skill is vendored at `.agents/skills/marimo-pair/` with LF endings, Git Bash is the Bash tool's `bash`, and jq is at `$(cygpath "$LOCALAPPDATA")/Microsoft/WinGet/Packages/jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe`. The user config sets `auto_instantiate = false`, so a new session leaves every cell `stale` until something runs them. Helper scripts in `%LOCALAPPDATA%\Temp\iris-story\` wrap all of it: `nb_cycle.sh` (stop, start the server with `--headless`, hold one headless Edge tab open with Playwright, `help(cm)`, run every cell, print statuses), `kx.sh` (execute-code with jq on `PATH`), `status.py`, and `nbtext.py` (cell outputs as plain text). Launch PowerShell scripts from Git Bash with `-ExecutionPolicy Bypass`, use the absolute `uv.exe` path there, and send their output to a file, or the server inherits the caller's pipe and the call never returns.
 - Never edit `iris_basics.py` on disk while a session runs. `--watch` and the kernel's saves overwrite it.
 - Read a cell's code inside the same `cm.get_context()` before editing it, and keep edits that move a name between cells in one context. An exception inside the context discards every queued edit.
 - `ctx.cells[name].code` is the cell body without its `def` wrapper, so match edits against that, not the file.
@@ -427,6 +455,36 @@ Measured before 2026-10-16. Re-measure anything the data changes touch.
 ## Progress log
 
 - **2026-10-16.** Evaluated the notebook against the goals (baseline above) and proposed the story. Nick approved it with the four decisions above. Plan written; no notebook changes yet.
+- **2026-10-16, Iteration 0.** Branch `story-arc` from `3ccf7f7`. Server started on Nick's machine with a headless Edge tab; after a run-all (the user config has `auto_instantiate = false`), all 67 cells reached `idle`. Store baseline at 15:30: `DBSIZE` 34, every key `memory:*` (the Agent Memory service's own); no keys under `cairn:20261021:`; no surfaces named `cairn-20261021`; no memories or sessions for owners `Tom`, `Priya`, `C001`, or `C002`; the LangCache ledger empty (entries can't be listed). `FT._LIST` also holds two empty hash indexes, `idx:cairn:20261021:help` and a leftover `idx:cairn:8ef77075:help` from an older run tag, plus the `langcache:*` and `memory:*` service indexes. Clean up everything should return to this, minus `idx:cairn:20261021:help`, which it drops.
+
+- **2026-10-16, Iterations 1 and 2.** Done by a workflow of Sonnet agents (implementers, then one reviewer per checkpoint, a fixer, and a re-review), all PASS WITH NOTES. `answer_with_tools` is in `cairn_support/llm.py` with the three providers' loops; `tests/test_llm_tools.py` covers tool conversion and each loop against fake clients, and `uv run pytest -q` gives 40 passed. Gemini's request was checked offline at the wire; Anthropic and OpenAI over mocked transports. Context Retriever ran live through the notebook's own Create (facts above), then was cleaned up: no surface named `cairn-20261021`, no record keys, no entity indexes. The live model-chosen round trip did NOT run, because the `.env` OpenAI key is revoked. With a scripted stand-in model, `answer_with_tools` drove real tool calls against the live MCP endpoint and `recording()` captured them. The data now matches "Data changes", with three exceptions. `GEAR_CARE_ANSWERS`, `THRESHOLD_PROBES`, and `CACHE_ASIDE_SCRIPT` stay until Iteration 4, because the old LangCache column imports them and every iteration ends with the notebook running. The bags are "Down Sleeping Bag 20F" ($289) and "Synthetic Sleeping Bag 30F" ($189), so "I always sleep cold" pulls toward the down bag and only the allergy rules it out. `care-synthetic` is dated 2023, which keeps it out of the year-floor example. After a server restart, all 67 cells are `idle` on the new data. For later iterations: add `amer` to the region values on `Customer` and `Order`. Stop saying the agent key expires in an hour. Give Chapter 1's `$EPSILON` claim "can". Note that "Has the refund for my trail shoes gone through?" doesn't retrieve `returns-refund`.
+
+- **2026-10-16, Iteration 3.** Four Sonnet drafters wrote every chapter offline as fragments, against a contract that fixes the cross-chapter names, signatures, prompt text, and rerun rules. A Sonnet integrator then applied column 0 and Chapter 1 with the server stopped, restarted it, and checked the done-when live: Create, the three presets, both sliders, a second Create, and the guards before Create. Every number matched. A Sonnet reviewer gave PASS WITH NOTES, all minor: start the year slider where the two sides differ, move the inline doc links into the chapter's accordion, keep "floor" for similarity only, say "embedding model" in Chapter 1, fix one code comment, and show a hint when the articles have expired. They are applied with Iteration 4. Deviations from the plan's table: column 1 has 11 cells, because `rs_ends` holds the Ends on and the docs accordion after the last table. `rs_create` sits above `rs_search_fn`, so the status line is under the button. `rs_search_fn` also exports `ft_search_rows`, and `rs_render` exports `ft_search_markdown_table`. The old `lc_chat` lost its `recording` import, which the imports cell now owns. Metrics: 64 cells, 49 hidden, 15 shown, 2,440 non-blank lines, 7 `mo.state`, 2 chats. Column 0 is 131 lines and column 1 is 382. The drafts put Chapter 2 at 258, Chapter 3 at 435, and Chapter 4 at 346, which totals 1,552. So Chapter 3 has to lose about 50 lines and Chapter 4 about 10 to reach 1,500.
+
+- **2026-10-16, Iteration 4.** A Sonnet polisher applied the seven Iteration 3 notes to Chapter 1. A Sonnet integrator applied Chapter 2 and removed `GEAR_CARE_ANSWERS`, `THRESHOLD_PROBES`, and `CACHE_ASIDE_SCRIPT` from `sample_data.py`. With the key still revoked, it verified the cache with the real LangCache and Search and with a stand-in model. That run gave: question 1 misses and is stored; question 2 hits at 0.905 with no model call; question 3 is served the down answer at 0.950; at 0.96 both miss, each showing its nearest stored prompt; "Where's my tent?" misses at about 0.62 and is stored; Clear deletes every ledger id (204). The first review FAILED with three majors. (1) Asking the same question twice did nothing in a browser: an unchanged `mo.ui.form` resubmit doesn't rerun. (2) The answer rendered about 2,400 px below the button. (3) A miss on a digit prompt said "the cache has nothing stored yet" when entries were stored. A Sonnet fixer applied these changes. The inputs are now a `.batch` with an Ask `run_button` beside Clear. The cells run `lc_title`, `lc_ask`, `lc_connect`, `lc_answer_fn`, `lc_ends`, so the result sits under the buttons and the Ends on follows it. The miss line says only what is known. The fixer verified the whole sequence with real clicks through the headless tab. The re-review gave PASS WITH NOTES (minor: say "note the total time" before switching questions; a gentler first-miss line; a line when no articles came back; Chapter 1's floor and filter cells also need the expired-articles hint). `lcs_answer` also refuses to call the model when `rss_search` returns nothing, so an expired help center can't put an article-less answer in the shared cache. Metrics: 54 cells, 2,096 non-blank lines, 4 `mo.state`, 1 chat. Column 1 is 385 lines and column 2 is 258 in 5 cells. Chapter 3 may have 390 and Chapter 4 335.
+
+- **2026-10-16, Iteration 5.** A Sonnet polisher applied the three Chapter 2 re-review notes. A Sonnet preparer moved Chapter 3 to the run-button pattern, with the cells `cr_title`, `cr_model_fns`, `cr_model`, `cr_create`, `cr_connect`, `cr_lifecycle`, `cr_answer_fn`, `cr_ask_md`, `cr_ask`, and a new `cr_ends`. It cut the chapter from 435 to 381 lines, and checked it with an offline harness of 69 checks against fake services. A Sonnet integrator applied both and verified Chapter 3 live. Create works on the new data. The system prompt shows on screen. With the key revoked, a scripted stand-in model drove `filter_order` calls against the live surface and `cr_ask` showed them. The Ask button reruns on real clicks, twice in a row too. Every stop line fires: no surface, no index, expired articles, a second Create. Clean up leaves no surface, record key, or entity index. Rerun safety was checked by identity: `crs_answer` and `crs_list_tools` are the same objects after Create and Clean up, so Chapter 4's chat won't reset. The Sonnet review gave PASS WITH NOTES, all minor; they go to Iteration 6's prep. Also: the expiry prose no longer promises an hour, Tom's question changed (facts above), and `$` in model answers is escaped. Metrics: 47 cells, 33 hidden, 14 shown, 1,738 non-blank lines, 3 `mo.state` (one is Chapter 3's, two are the old column 4's), 1 chat. Column 3 is 379 lines in 10 cells; columns 0 to 3 total 1,153, which leaves Chapter 4 at most 347.
+
+- **2026-10-16, Iteration 6.** A Sonnet polisher applied the ten Chapter 3 notes, and Chapter 3 now reuses one MCP session per agent key. A Sonnet preparer reordered Chapter 4 so each result sits under its button and cut it to 309 lines. The epilogue's Clean up text now says the surface never expires and holds the password. A Sonnet integrator applied every remaining column, which retired the last old column. Nothing in column 0 could be pruned, because every import is still used. It verified live: Seed (4 and 3 memories, idempotent); a real typed chat turn as Priya, which writes the session event, recalls, and ends with the one-line error on the dead key; the pane's five blocks; the customer switch (new session id, empty chat, Tom recalls only Tom); background extraction; and Clean up everything back to the baseline (DBSIZE 34; only `idx:cairn:20261021:help` is gone, as intended). It changed the recall threshold to 0.15 and fixed the stale chat transcript after a switch (facts above). With a stand-in model, both payoff questions reached the model with the allergy in the prompt, and `recording()` captured the tool calls across the chat's yields. Rerun safety was checked by identity across every button in the notebook. The Sonnet review gave PASS WITH NOTES, all minor; Iteration 7 applies them. Metrics: **42 cells, 29 hidden, 13 shown, 1,471 non-blank lines, 1 `mo.state`, 1 `mo.ui.chat`**. Display calls per turn: two Agent Memory searches and a session read, plus one `rss_search` to rebuild the prompt (Redis, not a service call).
+
+- **2026-10-16, Iteration 7.** It ran as a single workflow.
+  - **Polish.** A Sonnet polisher applied the Iteration 6 notes:
+    - Extraction timing reads "within about five minutes".
+    - The three Chapter 1 searches and the Chapter 4 chat say "press **Create**" when the index is missing, instead of raising.
+    - Every step heading is now "## Step N.", "the assistant" is used throughout, and `textwrap` is gone from the imports.
+    - Dead package code is deleted: `formatting.py`, the `Surface` and `ToolCall` types, and four unused `redis_search_replies` helpers with their tests.
+  - **Teaching pass.** Three Sonnet cold readers each used one lens: the story (19 findings), consistency (11), and the screen through the headless tab (9). One Sonnet fixer merged and applied them:
+    - Redis commands are introduced as Redis commands.
+    - The prologue says how to run the chapters, starting with **Create**.
+    - Chapter 1 says "embedding model", so "the model" means the chat model everywhere else.
+    - Chapter 3's picker adds the sleeping-bag question, so its closing gap is seen, not told.
+    - The Try it notes that the `/` menu sorts the starter prompts alphabetically.
+    - A new `iris_basics.css`, wired through `[tool.marimo.display] custom_css` in `pyproject.toml`, lifts marimo's 610 px output cap and wraps long command lines.
+    - A small `rss_text` helper renders prompts without stray blank lines.
+  - **README.** A Sonnet writer rewrote `README.md` for the story: 109 lines on the chapters, setup, what the notebook writes and how it cleans up, and troubleshooting.
+  - **Final review.** A Sonnet whole-branch review gave PASS WITH NOTES. The coordinator applied the cheap ones: the README's model-key and Restart sentences, the `.env.example` LLM header, the `pyproject.toml` description, one docstring, and a pane line naming the missing index (checked live).
+  - **End state.** `marimo check --strict` exits 0 and `uv run pytest -q` gives 38 passed. The stores are at the baseline after Clean up everything: DBSIZE 34, no `cairn:20261021:` keys, no surface, no memories or sessions for the cast, and an empty ledger. The final metrics are in the table above.
+  - **Still open.** No real model answer has been seen in Chapters 2 to 4, and Iteration 1's live round trip hasn't run, because the `.env` OpenAI key is revoked. Before publishing, put a working key in `.env`, restart the server, and run each chapter's Try it once. That also checks that OpenAI accepts the 21 tool schemas; they carry top-level `if`/`then`/`else`. Also open: Chapter 4's prose never shows the session-event request, which appears only in the shown `ams_turn` code; the notebook has no line to spare for it.
 
 ## Appendix: measuring the notebook
 

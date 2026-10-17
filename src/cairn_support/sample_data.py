@@ -1,21 +1,29 @@
 """Cairn Outfitters sample content, as Python literals.
 
-Cairn Outfitters is a made-up outdoor gear shop. The notebook loads, caches, and indexes from
-this module, so nothing here is Redis or Iris protocol: no command, no request body, no key
-template. Those stay in the notebook cells where a reader can see them.
+Cairn Outfitters is a made-up outdoor gear shop. The notebook loads and indexes from this module,
+so nothing here is Redis or Iris protocol: no command, no request body, no key template. Those
+stay in the notebook cells where a reader can see them.
 
 The examples rely on a few constraints in this data:
 
 - no help article says "cramped" or "shoes", exactly one says "Trailhead", and none says
   "waterproofng", so the three search examples each show a different kind of match;
 - every shop id matches ^[A-Za-z]+[0-9]+$, so a TAG query never meets a hyphen;
-- every THRESHOLD_PROBES target is a GEAR_CARE_ANSWERS key or None.
+- neither sleeping bag is in any order, so only a memory can tell the assistant that Priya (CAST)
+  avoids down, and the down bag is the warmer one, so "I always sleep cold" pulls the other way.
 """
+
+# ---- The cast ----
+
+# The two customers every chapter follows. Their ids are the record keys in Context Retriever
+# and the ownerId in Agent Memory.
+CAST: dict[str, str] = {"Priya": "C001", "Tom": "C002"}
 
 # ---- Redis Search: the help centre ----
 
-# 36 short articles, six in each of six categories (shipping, returns, care, sizing, orders,
-# warranty). The boot guide answers "trail shoes feel cramped" without using any of those words.
+# 37 short articles: six in each of five categories (shipping, returns, sizing, orders,
+# warranty) and seven in care, because washing a synthetic sleeping bag has its own article.
+# The boot guide answers "trail shoes feel cramped" without using any of those words.
 HELP_ARTICLES: list[dict] = [
     {
         "id": "ship-times",
@@ -153,6 +161,16 @@ HELP_ARTICLES: list[dict] = [
         "body": (
             "Use a front-loading machine with a down-specific soap, then dry on low heat with "
             "clean tennis balls to break up the clumps."
+        ),
+        "category": "care",
+        "year": 2023,
+    },
+    {
+        "id": "care-synthetic",
+        "title": "Washing a synthetic sleeping bag",
+        "body": (
+            "Wash on a gentle cycle with mild detergent and no fabric softener, then tumble dry "
+            "on low until completely dry. Synthetic fill does not clump, so skip the tennis balls."
         ),
         "category": "care",
         "year": 2023,
@@ -379,114 +397,14 @@ HELP_ARTICLES: list[dict] = [
     },
 ]
 
-# ---- LangCache: gear-care answers ----
-
-# The five answers the cache stores. Nothing here is close to another app's questions.
-GEAR_CARE_ANSWERS: list[dict] = [
-    {
-        "key": "boots",
-        "prompt": "How do I clean my Trailhead boots after a muddy hike?",
-        "response": (
-            "Brush off the dry mud, rinse them with lukewarm water and let them dry at room "
-            "temperature. Never put leather next to a heater or a campfire."
-        ),
-    },
-    {
-        "key": "bag",
-        "prompt": "How do I wash my down sleeping bag?",
-        "response": (
-            "Use a front-loading machine and a down-specific soap, then dry it on low heat with "
-            "clean tennis balls to break up the clumps."
-        ),
-    },
-    {
-        "key": "tent",
-        "prompt": "How should I store my tent between trips?",
-        "response": (
-            "Pitch it once at home until it is completely dry, then keep it loosely packed in a "
-            "cool cupboard. Damp fabric grows mildew within days."
-        ),
-    },
-    {
-        "key": "shell",
-        "prompt": "How do I restore the waterproofing on my 3-layer rain shell?",
-        "response": (
-            "Wash the shell, then apply a spray-on or wash-in treatment. A short tumble in the "
-            "dryer sets it."
-        ),
-    },
-    {
-        "key": "stove",
-        "prompt": "How do I clean my camp stove?",
-        "response": (
-            "Clear the jet with the pricking wire, wipe the burner and check the fuel hose for "
-            "cracks before every season."
-        ),
-    },
-]
-
-# The threshold example's questions. target is the GEAR_CARE_ANSWERS key a correct hit returns,
-# or None when the cached answer would be wrong for the question, which makes a hit a false hit.
-THRESHOLD_PROBES: list[dict] = [
-    {
-        "text": "What's the right way to launder a goose-down sleeping bag?",
-        "kind": "paraphrase",
-        "target": "bag",
-    },
-    {
-        "text": "how should i put my tent away after a trip",
-        "kind": "paraphrase",
-        "target": "tent",
-    },
-    {
-        "text": "Best way to get the mud off my Trailhead boots?",
-        "kind": "paraphrase",
-        "target": "boots",
-    },
-    {
-        "text": "HOW DO I WASH MY DOWN SLEEPING BAG?",
-        "kind": "same words, capitals",
-        "target": "bag",
-    },
-    {
-        "text": "How do I wash my synthetic sleeping bag?",
-        "kind": "swapped item",
-        "target": None,
-    },
-    {
-        "text": "How do I avoid washing my down sleeping bag?",
-        "kind": "negation",
-        "target": None,
-    },
-    {
-        "text": "What is the capital of Australia?",
-        "kind": "unrelated",
-        "target": None,
-    },
-]
-
-# The cache-aside example: a question the cache misses, the answer to store, and a paraphrase.
-# prefix goes in front of the stored prompt and of both searches. It keeps the stored entry close
-# only to questions that name the shop, so on a shared cache it is never served for another
-# app's generic question.
-CACHE_ASIDE_SCRIPT: dict = {
-    "prefix": "At Cairn Outfitters: ",
-    "ask": "How do I fix a snapped tent pole?",
-    "answer": (
-        "Splint the break with the repair sleeve from your tent's kit and tape it tight. A "
-        "snapped pole is replaced free within five years of purchase."
-    ),
-    "again": "What should I do about a broken tent pole?",
-}
-
 # ---- Context Retriever: the shop ----
 
-# 6 customers, 6 products and 8 orders, by entity name. Every id is letters plus digits with no
-# hyphen. EMEA and APAC each have 3 customers and 4 orders.
+# 6 customers, 8 products and 8 orders, by entity name. Every id is letters plus digits with no
+# hyphen. Each of AMER, EMEA and APAC has 2 customers; AMER has 4 orders and the others 2 each.
 SHOP_RECORDS: dict[str, list[dict]] = {
     "Customer": [
-        {"customer_id": "C001", "name": "Ada Lovelace", "tier": "gold", "region": "emea", "lifetime_value": 4200.0},
-        {"customer_id": "C002", "name": "Grace Hopper", "tier": "gold", "region": "apac", "lifetime_value": 3900.0},
+        {"customer_id": "C001", "name": "Priya Shah", "tier": "gold", "region": "amer", "lifetime_value": 4200.0},
+        {"customer_id": "C002", "name": "Tom Becker", "tier": "gold", "region": "amer", "lifetime_value": 3900.0},
         {"customer_id": "C003", "name": "Alan Turing", "tier": "silver", "region": "emea", "lifetime_value": 1500.0},
         {"customer_id": "C004", "name": "Katherine Johnson", "tier": "silver", "region": "apac", "lifetime_value": 1750.0},
         {"customer_id": "C005", "name": "Linus Torvalds", "tier": "bronze", "region": "emea", "lifetime_value": 300.0},
@@ -499,12 +417,14 @@ SHOP_RECORDS: dict[str, list[dict]] = {
         {"sku": "P103", "title": "Insulated Water Bottle", "category": "accessories", "price": 35.0},
         {"sku": "P104", "title": "Merino Base Layer", "category": "apparel", "price": 89.0},
         {"sku": "P105", "title": "Headlamp Pro", "category": "camping", "price": 59.0},
+        {"sku": "P106", "title": "Down Sleeping Bag 20F", "category": "camping", "price": 289.0},
+        {"sku": "P107", "title": "Synthetic Sleeping Bag 30F", "category": "camping", "price": 189.0},
     ],
     "Order": [
-        {"order_id": "O1001", "customer_id": "C001", "sku": "P102", "region": "emea", "status": "delivered", "total": 399.0},
-        {"order_id": "O1002", "customer_id": "C001", "sku": "P104", "region": "emea", "status": "shipped", "total": 89.0},
-        {"order_id": "O1003", "customer_id": "C002", "sku": "P101", "region": "apac", "status": "delivered", "total": 249.0},
-        {"order_id": "O1004", "customer_id": "C002", "sku": "P100", "region": "apac", "status": "returned", "total": 129.0},
+        {"order_id": "O1001", "customer_id": "C001", "sku": "P102", "region": "amer", "status": "shipped", "total": 399.0},
+        {"order_id": "O1002", "customer_id": "C001", "sku": "P104", "region": "amer", "status": "delivered", "total": 89.0},
+        {"order_id": "O1003", "customer_id": "C002", "sku": "P101", "region": "amer", "status": "delivered", "total": 249.0},
+        {"order_id": "O1004", "customer_id": "C002", "sku": "P100", "region": "amer", "status": "returned", "total": 129.0},
         {"order_id": "O1005", "customer_id": "C003", "sku": "P105", "region": "emea", "status": "placed", "total": 59.0},
         {"order_id": "O1006", "customer_id": "C004", "sku": "P103", "region": "apac", "status": "delivered", "total": 35.0},
         {"order_id": "O1007", "customer_id": "C005", "sku": "P100", "region": "emea", "status": "placed", "total": 129.0},

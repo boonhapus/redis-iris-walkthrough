@@ -1,11 +1,14 @@
 """The type names in the notebook's signatures, so a signature says what goes in and what comes out.
 
+ChatTurn and ChatMessage describe a chat turn; Reply and Exchange describe one HTTP request, which
+sessions.json_request returns and sessions.recording collects.
+
 Nothing here is checked at run time. ChatMessage is a Protocol, so marimo's chat messages fit it and
 so do your own agent's: a turn copied out of the notebook does not bring marimo with it.
 """
 
 from collections.abc import AsyncIterator
-from typing import NamedTuple, NotRequired, Protocol, TypedDict
+from typing import NamedTuple, Protocol
 
 # What a chat turn returns: the reply, streamed a piece of text at a time.
 ChatTurn = AsyncIterator[str]
@@ -35,29 +38,3 @@ class Exchange(NamedTuple):
     status: int
     payload: dict | None
     ms: int
-
-
-class Surface(TypedDict):
-    """The context surface the Context Retriever column created, as it keeps it after Create."""
-
-    id: str
-    name: str
-    status: str  # the status in the create reply
-    http: int  # the HTTP status of the create POST
-    agent_key: str  # the key an agent sends to mcp_url. Show at most its last four characters.
-    key_expires_at: str
-    mcp_url: str
-    imports: dict[str, int]  # the records imported, per entity
-    expiring: int  # how many of the keys the service wrote now expire in an hour
-    create_request: dict  # the create request as sent, with the password and the admin key masked
-
-
-class ToolCall(TypedDict):
-    """One tools/call and its reply, sorted into data, a tool error, or a JSON-RPC error."""
-
-    tool: str
-    arguments: dict | str  # a str when the form held no valid JSON, so nothing was sent
-    http: int | str  # the HTTP status, or "" when nothing was sent or no reply came
-    kind: str  # "data", "tool error", "JSON-RPC error <code>", "HTTP <status>", "not JSON", or the console's "not sent, ..." and "no reply, <error name>"
-    text: str  # the reply text, JSON indented when it parses
-    at: NotRequired[str]  # the time of the Send, added by the console

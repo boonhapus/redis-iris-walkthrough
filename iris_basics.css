@@ -1,0 +1,6 @@
+/* marimo edit shows every output in a 610px scrolling box. Here the buttons and sliders sit below long text, so show each output in full. */
+.marimo-cell.interactive .output-area,
+.marimo-cell.interactive .console-output-area { max-height: none !important; }
+
+/* Wrap long lines in prompts, replies, and commands instead of scrolling them sideways. */
+.marimo-cell .output-area pre { white-space: pre-wrap !important; overflow-wrap: anywhere !important; }

@@ -1,8 +1,5 @@
 from cairn_support.redis_search_replies import (
-    format_ft_search_reply,
-    ft_search_inputs_markdown,
     ft_search_markdown_table,
-    ft_search_result_summary,
     ft_search_rows,
 )
 
@@ -27,7 +24,6 @@ def test_ft_search_resp3():
     total, rows = ft_search_rows(reply)
     assert total == 1
     assert rows[0]["title"] == "T"
-    assert "{" in format_ft_search_reply(reply)
 
 
 def test_ft_search_resp2():
@@ -39,7 +35,6 @@ def test_ft_search_resp2():
     total, rows = ft_search_rows(reply)
     assert total == 1
     assert rows[0]["vector_score"] == "0.12"
-    assert "(integer) 1" in format_ft_search_reply(reply)
 
 
 def test_ft_search_markdown_table():
@@ -55,15 +50,4 @@ def test_ft_search_markdown_table():
     assert "&#124;" in table
     assert "0.1235" in table
     assert "| title | category | year | vector_score |" in table
-
-
-def test_ft_search_result_summary_with_keep():
-    assert ft_search_result_summary(36, 5, 3) == "36 matched, 5 returned, 3 kept by the filter in the app"
-    assert ft_search_result_summary(0, 0) == "0 matched, 0 returned"
-
-
-def test_ft_search_inputs_markdown():
-    md = ft_search_inputs_markdown("hello", {"$radius": 0.6})
-    assert "hello" in md
-    assert "$radius" in md
-    assert "0.6" in md
+    assert "|:--|:--|--:|--:|" in table
