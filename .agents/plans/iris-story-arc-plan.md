@@ -1,19 +1,75 @@
 # Plan: rebuild `iris_basics.py` as one story in four chapters
 
-Created 2026-10-16. This plan supersedes `iris-basics-plan.md`, which stays for history only: its rulings no longer apply, and the facts still worth having are copied into "Facts carried forward" below. Read this file first in a new session. While a marimo session runs, the live kernel is the source of truth; otherwise the saved `iris_basics.py` is.
+Created 2026-10-16. This plan supersedes `iris-basics-plan.md`, deleted on 2026-10-18 at Nick's request (it's in git history through `d208bea`): its rulings no longer apply, and the facts still worth having are copied into "Facts carried forward" below. Read this file first in a new session. While a marimo session runs, the live kernel is the source of truth; otherwise the saved `iris_basics.py` is.
 
 Work one iteration at a time. Each iteration ends with the notebook running. At the end of each, tick its box, add a line to the progress log, and record any number you measured under "Facts carried forward".
 
 ## Status
 
 - [x] Iteration 0. Baseline and branch
-- [ ] Iteration 1. De-risk Context Retriever and tool calling (no notebook changes). Done except the live model round trip: the `.env` OpenAI key is revoked (see the progress log).
+- [x] Iteration 1. De-risk Context Retriever and tool calling (no notebook changes). The live model round trip ran on 2026-10-18 with the new key.
 - [x] Iteration 2. One shared world: the data
 - [x] Iteration 3. Prologue and Chapter 1, Search
-- [x] Iteration 4. Chapter 2, Semantic caching (the model's own answers are unseen until a working key is in `.env`)
-- [x] Iteration 5. Chapter 3, Context engineering and retrieval (the model's own tool choices and answers are unseen until a working key is in `.env`)
-- [x] Iteration 6. Chapter 4, Agent memory, and the epilogue (the payoff answers themselves are unseen until a working key is in `.env`)
+- [x] Iteration 4. Chapter 2, Semantic caching (re-tested with the live model on 2026-10-18: every Try it step holds)
+- [x] Iteration 5. Chapter 3, Context engineering and retrieval (re-tested with the live model on 2026-10-18: the mechanics hold; the tent answer is unreliable, see Open decisions)
+- [x] Iteration 6. Chapter 4, Agent memory, and the epilogue (re-tested with the live model on 2026-10-18: the wash payoff holds; the catalog never joins the bag answer, see Open decisions)
 - [x] Iteration 7. Teaching pass, README, final counts
+
+## Open decisions (2026-10-18, after the live-model re-test)
+
+Nick's calls. Each one changes what the model sees, so re-measure it with the live model before keeping it.
+
+1. **Chapter 3's tent answer is unreliable with gpt-4o-mini.** *Resolved 2026-10-20: Nick ruled that the small model's mistake is a teaching benefit, and approved building the fix. Chapter 3's Step 3 Try it expects the mistake, and a new "Step 4. Fix the interface, not the model" updates the same surface's data model with the `item` TAG (see the progress log).* "Where's my tent? I leave for Maine on June 12." asked as Priya calls `filter_order` with `C001` every time. But in about 9 of 13 runs the model also guessed a condition: `sku` "tent" (an order holds only a sku) or `status` "placed". That returns `count` 0, and the model tells her she has no tent order; it was right in 3 or 4 of 13. Asked as Tom, it says "your tent has been delivered" about O1003, a jacket, in about half the runs. Options:
+   - (a) one sentence in `crs_build_system`: filter orders by `customer_id` alone, then look up each order's product before naming it;
+   - (b) a product title on each order record;
+   - (c) a stronger `AI_MODEL`.
+   Recommended: (a), measured over about ten runs each for Priya and for Tom.
+2. **Chapter 4's sleeping-bag answer never uses the catalog.** In 9 of 9 runs it weighed her memories (allergy, sleeps cold, Maine in June) and recommended a synthetic bag. But it made no product call, so it never named Down Sleeping Bag 20F or Synthetic Sleeping Bag 30F. The plan's payoff ("her memories, the temperature-rating article, and the catalog") doesn't happen. The Try it now asks whether the pane shows a product lookup. Options: one prompt sentence telling the assistant to recommend from the catalog with the product tools, or drop "the catalog" from the payoff.
+3. **Extracted memories are paraphrases, and sometimes more.** The service wrote "User is bringing their dog Juniper on the canoe trip in Maine in June". It also wrote a claim nobody typed: "the assistant recommended a synthetic sleeping bag with a 20F comfort rating", from user messages alone. `ams_memory_block` heads them "What customer C001 told you in earlier chats", and they take recall slots (`limit` 10). Option: head the block "What you remember about ..." instead.
+4. **Tom's question.** "When will the refund for my trail shoes reach my card?" puts `returns-refund` first in the prompt, so in 5 of 8 runs the model answered from the article and called no tool. That weakens "the same assistant picks different tools". The plan's "Has the refund for my trail shoes gone through?" retrieves no refund article. It hasn't been measured for tool calls.
+5. **Clean up everything leaves the Chapter 4 chat transcript on screen.** The next message carries the old history and recreates the deleted session id. Option: say "switch **Chat as** to start fresh" in the closing line.
+6. **Three wording notes from the 2026-10-18 re-review, held until 1 and 2 are decided.** Chapter 3 Try it bullet 1: what a guessed `sku` or `status` leads to, and press **Ask** again to compare. Chapter 4 Try it item 1: say "a product lookup, such as `filter_product`", since "catalog" appears nowhere else. The extraction callout's title: "Watch out: extraction is slow and paraphrases".
+
+**Measured 2026-10-19 (decisions 1 and 2): interface versus model.** A standalone harness reproduced the notebook's turn, on its own surfaces and key prefix, for 640 trials. An independent auditor re-graded every trial and agreed on 632. Priya's and Tom's tent questions had 30 runs per variant; the bag and refund questions had 10.
+
+| Variant | Priya's tent right (of 30) | Tom told his jacket is a tent (of 30) | Bag answer clean (of 10) | Refund answer honest (of 10) |
+|:--|:-:|:-:|:-:|:-:|
+| Now (gpt-4o-mini) | 9 | 10 | 9 | 10 |
+| Clearer data-model descriptions | 19 | 15 | 10 | 10 |
+| Product title on each order (adds `search_order_by_text`) | 10 | 0 | 10 | 6 |
+| The prompt sentence in option (a) | 20 | 4 | 1 | 8 |
+| gpt-4o | 21 | 11 | 10 | 3 |
+| gpt-4.1-mini | 9 | 1 | 10 | 2 |
+| Title on each order plus the order sentence | 22 | 1 | 0 | 5 |
+
+- **One cause in both chapters.** The model guesses filter values that don't exist (`sku` "tent", `status` "placed", `category` "sleeping bag"). The exact-match filter returns `count` 0, and the model takes the empty reply as the answer. Every one of today's 21 Priya failures shows this in the tool calls, so a reader can see it.
+- **No fix is reliable.** The best reach about two in three for Priya, and their 95% intervals overlap. The new `search_order_by_text` was used once in 160 runs: adding a tool doesn't change which tool the model reaches for. The title on each order does stop the model calling Tom's jacket a tent.
+- **Prompt fixes move the failure.** Any sentence that tells the model to look things up sends Chapter 4's bag question to `filter_product` with a guessed category. In 9 of 10 runs it then says the shop has no sleeping bags.
+- **A stronger model isn't better for the right reasons.** gpt-4o often copies `P102` from the descriptions' examples ("such as P102"), and it says Tom's refund was processed in 7 of 10 runs.
+- **Untested, suggested by the data:** `allowed_values` on `sku` and on `category`, so the schema rejects an invented value with JSON-RPC -32602 and the model has to retry; and descriptions whose examples don't name real records.
+- **Files.** The raw trials are in `%LOCALAPPDATA%\Temp\iris-story\work\interface-exp\raw.json`, and the audit is in `...\interface-exp\audit\`.
+
+**Measured 2026-10-20: allowed values.** The same harness was run on new surfaces for 590 trials, with a same-day control. The auditor's re-grade matched every grade, but it wasn't blind.
+
+- **The mechanism.** `allowed_values` reaches the tool only as text in the filter tool's description (`sku (values: P100, ..., P107)`); it isn't a JSON Schema enum. The service does check a called value: `sku` "tent" returns a tool error, HTTP 200 with `isError`, whose text lists the valid values. Import doesn't check values. `Product.sku` can't take them, because the service rejects a tag index on a key component.
+
+| Variant (gpt-4o-mini) | Priya's tent right (of 30) | Tom: no tent / hedged / an order called a tent (of 30) | Bag clean (of 10) | "Has the refund for my trail shoes gone through?" honest (of 10) |
+|:--|:-:|:-:|:-:|:-:|
+| A0 now (control) | 8, none of them having seen the title | 16 / 9 / 5 | 9 | 9 |
+| A1 allowed values on `Order.sku` and `Product.category` | 11 | 8 / 9 / 13 | 10 | 10 |
+| A2 A1, and descriptions whose examples name no real record | 23, 17 having seen the title | 11 / 8 / 11 | 8 | 9 |
+| A3 A1, and `Order.item` as a text field | 7 | 14 / 8 / 8 | 9 | 4 |
+| A4 A3, and meaningful categories | 4 | 12 / 6 / 12 | 10 | 5 |
+| **A5 A1, and `Order.item` as a TAG with the eight product titles as allowed values** | **30** | **30 / 0 / 0** | 10 | 4 |
+| A6 A5, and a refund note on `status` | 30 | 30 / 0 / 0 | 10 | 2 honest, 8 hedged, 0 false |
+
+- **A5 is reliable.** In 120 of 120 runs across Priya and Tom, the model's first call filtered `customer_id` plus `item` = "Ultralight Tent 2P". That's count 1 for Priya (O1001, shipped) and count 0 for Tom. It works because the description lists meaningful names: no run guessed, so the reject-and-retry path never fired. Listing opaque codes (A1) doesn't help: the model picks a listed code, most often the first, P100, which is Tom's returned shoes.
+- **Costs of the `item` field.**
+  - It duplicates `Product.title`, so the two have to be kept in step by hand.
+  - It fits a small catalog only: allowed values are capped at 128 values of 256 bytes each.
+  - The plan's refund wording ("Has the refund ... gone through?") over-claims a processed refund in 4 to 6 of 10 runs for every variant with `item`. The notebook's picker asks "When will the refund for my trail shoes reach my card?" instead, which wasn't measured with `item`.
+- **The catalog in Chapter 4.** No data-model change made the bag answer call a product tool unprompted (0 of 70). With the "To recommend gear, search the products." sentence and meaningful categories (A4), 4 of 10 named the Synthetic Sleeping Bag 30F.
+- **Files.** The raw trials are in `%LOCALAPPDATA%\Temp\iris-story\work\allowed-exp\raw.json`.
 
 ## Goals
 
@@ -182,6 +238,8 @@ The Ask form batches a question picker (the four scripted questions in story ord
 | `cr_answer_fn` | shown | `crs_list_tools`, `crs_call`, `crs_build_system`, `crs_answer` | Agent side: the agent key's tool list and calls, the system prompt (Chapter 2's prompt plus identity and `extra`), and the answer. |
 | `cr_ask_md` | hidden | `crs_ask` | "Try it", the Ask form (customer, question picker, free text), and Ends on. |
 | `cr_ask` | hidden | — | On submit: run `crs_answer` inside `recording()`, then show each tool call and reply, the system prompt, and the answer. |
+| `cr_fix_md` | hidden | `crs_fix_button` | Added 2026-10-20: Step 4, fix the interface, not the model. The `PUT /context-surfaces/{id}` request, three Reading it bullets, a Try it, and the Update the data model button. |
+| `cr_fix` | hidden | — | Added 2026-10-20. On Update: `crs_add_item(crs_surface())` (in `cr_connect`, shown), then the `item (values: ...)` line from the new `filter_order` description. |
 
 Scripted questions: Priya's "Where's my tent? I leave for Maine on June 12." and Tom's "Has the refund for my trail shoes gone through?". Asking Priya's question as Tom shows that identity changes the answer.
 
@@ -346,10 +404,10 @@ Notebook changes go through the live kernel with `marimo._code_mode`. The packag
 
 | Metric | Baseline 2026-10-16 | Target | Result, end of Iteration 7 |
 |---|---|---|---|
-| Cells | 67 | about 39 | 42 (the three hidden `*_ends` cells) |
-| Hidden cells | 51 | about 26 | 29 (same three) |
+| Cells | 67 | about 39 | 44 (the three hidden `*_ends` cells, and Step 4's two cells in Chapter 3) |
+| Hidden cells | 51 | about 26 | 31 (same five) |
 | Cells with code shown | 16 | about 13 | 13 |
-| Non-blank lines in the notebook | 2,919 | at most 1,500 | 1,495 (after the 2026-10-17 session-memory step) |
+| Non-blank lines in the notebook | 2,919 | at most 1,500 | 1,525 (2026-10-20, with Chapter 3's Step 4; Nick approved the step knowing it would pass 1,500) |
 | `mo.state` pairs | 7 | 1 | 1 |
 | `mo.ui.chat` | 2 | 1 | 1 |
 | Extra service calls per turn, for display only | 7 (LangCache), 42 (Agent Memory) | at most 3 | Chapter 2: 1 (the nearest-prompt probe). Chapter 3: 0. Chapter 4: 3 (two recall searches and the session read), plus one `rss_search` on Redis to rebuild the prompt |
@@ -426,6 +484,21 @@ Re-measured 2026-10-16 with the 37 articles (Iteration 2), every KNN cross-check
 - Tom's question is "When will the refund for my trail shoes reach my card?": `returns-refund` comes first (0.4639) on every index state tried. The plan's "Has the refund for my trail shoes gone through?" retrieves no refund article.
 - KNN is approximate, and the index's history matters. After unlinking and reloading the articles into the same index, "Where's my tent? I leave for Maine on June 12." returned `care-tent`, `ship-express`, and `order-cancel`, losing `warranty-tent` (a brute force agrees with the fresh index). Chapter 1's stated numbers have matched on every check so far.
 
+**The live model (gpt-4o-mini, re-test of 2026-10-18)**
+
+- OpenAI accepts the 21 Context Retriever tool schemas as sent. A model-only call takes 0.77 to 0.91 s, and the first after a restart about 4.7 s.
+- Chapter 2, three cycles from a cleared cache, each Ask a real click. Question 1's stored answer was clean down care every time, though `care-synthetic` is the third article in its prompt. Priya's question 3 at 0.85 was served the down answer with tennis balls every time. At 0.96 her new answer used the synthetic article every time; one of three said outright to skip the tennis balls. "Where's my tent?" got a generic "I can't track your order" every time, and it was then served at 1.000. A miss takes 0.9 to 1.6 s in total and a hit 61 to 117 ms, about 17 times faster.
+- Chapter 3: "Where is order O1001?" chose `get_order_by_id` with `{"id": "O1001"}` in 3 of 3 runs and answered `shipped`, but it didn't name the product (that needs `get_product_by_id`). Asked as Tom, the same question returns Priya's order, because the identity line is the only scope. The sleeping-bag question in Chapter 3 calls no tool and asks for her height and the expected temperatures, so the closing gap is shown. A turn takes 1.7 to 2.0 s with no tool call, 2.0 to 3.8 s with one, and 5 to 6.5 s with four or five. Tool reliability is under Open decisions 1 and 4.
+- Chapter 4: the wash payoff gave synthetic-bag care in 7 of 7 runs. The tent question called `filter_order` with `C001` 6 of 6 and was right 3 of 6; the others guessed a filter, or said she has two tents. Tom's turns recall only Tom's memories. Extraction landed one to two and a half minutes after a turn. A turn takes 2.5 to 3.6 s with no tool call and 3.9 to 5.8 s with one.
+
+**Chapter 3's Step 4 (2026-10-20, live)**
+
+- `PUT /context-surfaces/{id}` with `{"data_model": ...}` answers 200 with the whole surface, and updates it in place. The id, agent key, and `mcp_url` keep working; tool results' `_retrieval.source_version` goes from 1 to 2. The tools keep their 21 names: `filter_order`, `count_order`, and `summarize_order` gain `item` in their field enum, and `filter_order`'s description lists `item (values: ...)`. The service rebuilt the order index under a new name with `$.item` as a TAG and dropped the old one. The update and the re-import added no database connections.
+- The re-import (`on_conflict: overwrite`) keeps an existing key's TTL. A key that had expired comes back with none, so `crs_add_item` sets `EXPIRE 3600` on every record key, as Create does.
+- `crs_data_model` has keys `title` and `description` (not `name`). A local `class Order(order)` inside a function keeps the entity name "Order". It does replace the SDK's class registry entry, which nothing in the notebook reads.
+- Before the update, Priya's tent question was right 1 of 3 (by a lucky `status` "shipped"). After it: Priya 5 of 5 (`item` = "Ultralight Tent 2P", O1001 shipped), Tom 3 of 3 told he has no tent order, and Tom's refund question 3 of 3 honest (it found O1004 returned by `item` and used the refund article's words).
+- Connection cost of the whole build: about +7 to +10 (from 217 to a peak of 226) for one surface and 16 asks.
+
 **Agent Memory**
 
 - The SDK client has a 5-second timeout and no retries. A session's `ownerId` comes from its first event's `actorId`. A memory created without `memoryType` is filed as `semantic`, and creating an existing id replaces its text.
@@ -487,6 +560,29 @@ Re-measured 2026-10-16 with the 37 articles (Iteration 2), every KNN cross-check
   - **Still open.** No real model answer has been seen in Chapters 2 to 4, and Iteration 1's live round trip hasn't run, because the `.env` OpenAI key is revoked. Before publishing, put a working key in `.env`, restart the server, and run each chapter's Try it once. That also checks that OpenAI accepts the 21 tool schemas; they carry top-level `if`/`then`/`else`. Also open: Chapter 4's prose never shows the session-event request, which appears only in the shown `ams_turn` code; the notebook has no line to spare for it.
 
 - **2026-10-17, the session-memory step.** Nick asked for Chapter 4's session write to be shown like its other requests, making room by simplifying elsewhere if possible. Chapter 4 now has four steps. Step 2, "Write each message to session memory", shows the `POST /session-memory/events` body: `sessionId`, `actorId`, `role` `USER`, `content` `[{"text": ...}]`, and `createdAt` ending in `Z`, with the field names checked against the SDK's own serializer. Four Reading it bullets follow, and the extraction watch-out moved under the step; recall is Step 3 and the chat Step 4. The step costs 18 lines. Four Sonnet scouts proposed measured cuts, and the coordinator took four that lose no teaching point, saving 23 lines. In c1-4, `rs_title` defines `FT.CREATE` once as `rss_create_command` and `rs_create` sends it, so the command shown and the command sent can't drift apart. In c1-5, `rs_filter` names its two tables. In c3-1, `cr_create` ends with one `mo.stop` for the empty state. In c3-4 and c3-5, the surface setter comes straight from `mo.state`. Declined: 32 lines of callout reformatting, dropping type hints from shown code, edits to `env_check` and the imports comments, and comment-only cuts. A Sonnet integrator verified it live. The first Create built a fresh index from the shared command, and the shown and sent commands match character for character. Chapter 3's empty, held, and cleaned states show as before, and the turn functions keep their identity. A real typed chat turn stored an event matching the prose JSON, which also confirmed that a session takes its `ownerId` from its first event, and Clean up everything restored the baseline. The Sonnet review gave PASS WITH NOTES. The coordinator applied three minor notes: the learning list now follows the step order, Step 2's lead-in names Priya's question, and `_step` became `_recall`. Exception to contract rule 2: `rs_create` reads `rss_create_command` from `rs_title`, the cell that already defines its button, so no new rerun trigger is added. Metrics: 42 cells, 29 hidden, 13 shown, **1,495** non-blank lines, 1 `mo.state`, 1 chat; `marimo check --strict` exits 0 and 38 tests pass.
+
+- **2026-10-18, live-model re-test.** Nick replaced the revoked key at 10:29; it's OpenAI, and gpt-4o-mini answers. At his request `.agents/plans/iris-basics-plan.md` is deleted (it's in git history), and this plan's header says so.
+  - **Who ran it.** Three Sonnet testers ran the chapters in order on one kernel, with every Ask and chat message a real click or keystroke through the headless tab. The key questions were asked at least twice, the payoff questions three times or more.
+  - **What holds.** Chapter 1 holds every number. Chapter 2 holds every Try it step (facts above). Chapter 3's mechanics hold: Create, the 21 schemas, identity in the arguments, tool errors shown and sometimes retried. Iteration 1's model-chosen round trip now works live, so its box is ticked. Chapter 4's wash payoff, ownership, extraction, and Clean up everything hold.
+  - **What doesn't.** The model's choices fall short in three places (see Open decisions): the tent question in Chapters 3 and 4, the catalog in Chapter 4's sleeping-bag answer, and Tom's question, which the refund article answers without a tool.
+  - **Prose fixes.** A Sonnet reviewer spot-checked live and gave PASS WITH NOTES. A Sonnet fixer applied its nine prose fixes, each re-checked with the model:
+    - Chapter 3: the three Try it bullets now say what to look for without promising the right answer, and the Reading it bullet on tool errors is corrected.
+    - Chapter 4: Try it items 1 to 3 now ask whether the pane shows a product lookup instead of promising the catalog, and the extraction callout says memories come in the service's own words.
+    - Epilogue item 3 reads "listed its tools and answered any calls".
+  - **Re-review.** PASS WITH NOTES; its three wording notes are Open decision 6.
+  - **End state.** 42 cells, 1,495 non-blank lines, `marimo check --strict` exits 0, 38 tests pass. The stores are at the baseline after Clean up everything, and the server is stopped.
+  - **Not committed.** The working tree mixes these changes with Nick's own edits from the morning: the `env_check` colours `var(--iris-ok)` and `var(--iris-danger)`, a `pyproject.toml` comment, and 118 lines of Redis brand styling in `iris_basics.css`. The fixer kept them: it synced fragment `col0.py` from the notebook and applied only columns 3 and 4.
+
+- **2026-10-20, Chapter 3's lesson and the allowed-values experiment.** Nick asked what the right fix for the model's wrong answers would be. The 2026-10-19 measurement showed no prompt or model fix is reliable, and that the failure is visible and explainable. Nick ruled that a small model getting things wrong at first is a benefit to showing the Redis interface, and asked for both next steps.
+  - **The lesson.** Chapter 3's Try it now expects the mistake. The model often adds a guessed `sku` "tent", or a `status` such as "placed", gets `count` 0, and tells Priya she has no tent order. A new bullet explains why: the data model decides the tools, an order has a `sku` but no title, and a tag condition matches exact labels as Chapter 1's `TAG` fields did, so the empty reply reads as an answer. Readers press **Ask** again and compare. A Sonnet integrator applied only column 3, so Nick's column 0 edits, `iris_basics.css`, and `pyproject.toml` were untouched. It verified with real clicks: 4 of 5 Priya runs showed the guess, and 1 was right through a lucky `status` "shipped"; 3 of 3 Tom runs said he has no tent order. A Sonnet review gave PASS WITH NOTES, and the coordinator applied three wording notes. The notebook is 1,496 non-blank lines.
+  - **The experiment.** The allowed-values run is above. It found a reliable interface fix, the `item` TAG field, which isn't in the notebook. The stores ended at the baseline, and nothing is committed.
+
+- **2026-10-20, Chapter 3's Step 4.** Nick approved building the "fix the interface" step on the measured A5 fix.
+  - **Design.** The coordinator chose to update the same surface in place with `PUT /context-surfaces/{id}`, not to create a second one. Every surface created leaks 3 to 8 database connections the hosted service never closes, and the database was at 218 of 256. The coordinator checked offline that a local `class Order(order)` subclass exports as entity "Order" with the `item` TAG and its eight allowed titles.
+  - **Built.** A Sonnet builder added `crs_add_item` to `cr_connect` (shown): the local subclass, the `PUT`, and the overwrite re-import. It also added `cr_fix_md`, Step 4 (the request, three Reading it bullets, a Try it, and the **Update the data model** button), and `cr_fix`, which shows the new `item (values: ...)` line. Step 3's Try it now points ahead to Step 4, and the chapter's learning item 1 says you change the data model to fix a wrong answer. The builder verified it live on one surface (facts above).
+  - **Review.** A Sonnet review gave PASS WITH NOTES, with one major: a re-imported key that had expired got no TTL. A Sonnet fixer added the `EXPIRE` loop, put the fenced `PUT` request into Step 4, gave `cr_fix`'s `next` a default, and named the three model classes. To stay at the line ceiling it removed four comment and docstring lines in column 3 (the scouts' c3-2, c3-3, c3-6, and c3-11). The fixer checked the TTL change offline against fakes; it hasn't been pressed live.
+  - **End state.** 44 cells, 31 hidden, 13 shown, 1,525 non-blank lines; `marimo check --strict` exits 0 and 38 tests pass. The stores are at the baseline and the server is stopped. Only column 3 changed; Nick's brand edits in column 0, `iris_basics.css`, and `pyproject.toml` are untouched. Nothing is committed.
+  - **Deviation from the contract.** `crs_add_item` imports `ContextField` and `export_data_model` inside the function, though `cr_model_fns` owns them. Passing them in would cost two signature lines at the ceiling.
 
 ## Appendix: measuring the notebook
 
