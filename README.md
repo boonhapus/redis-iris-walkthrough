@@ -50,8 +50,10 @@ You need:
 3. Start the notebook with [uv](https://docs.astral.sh/uv/), which installs Python and the dependencies on the first run. That run also downloads the embedding model, about 30 MB.
 
    ```sh
-   uv run marimo edit iris_basics.py
+   uv run --env-file .env marimo edit --port 2718 --watch notebooks/learn_iris_101.py
    ```
+
+   `--env-file .env` loads your settings into the server, `--port 2718` serves the notebook at `http://localhost:2718`, and `--watch` reloads the notebook when you save it in another editor. marimo opens it in your browser.
 
    No uv? Use pip with Python 3.12 or 3.13 (3.14 is not supported yet). Create a virtual environment, install the project into it, and start marimo from there:
 
@@ -59,7 +61,7 @@ You need:
    python -m venv .venv
    source .venv/bin/activate   # on Windows: .venv\Scripts\activate
    pip install -e .
-   marimo edit iris_basics.py
+   marimo edit notebooks/learn_iris_101.py
    ```
 
 ## Run it
@@ -78,7 +80,7 @@ The settings:
 
 - A panel in column 0 lists the nine settings with a green check or a red cross, and while any is missing it stops every cell below it.
 - Fill in `.env`, then press **Restart kernel**. The button ends the kernel, and marimo then offers to restart it. Accept, and the new kernel reads `.env` again.
-- A changed `.env` needs a server restart if you launched with `uv run --env-file .env marimo edit iris_basics.py`. The server's environment then holds the old values, and marimo never overrides a variable that is already set. A missing value is picked up on a kernel restart. Stop the server and start it again to load a changed one.
+- A changed `.env` needs a server restart when you start with the uv command in step 3. `--env-file .env` puts the values in the server's environment, and marimo never overrides a variable that is already set. A missing value is picked up on a kernel restart. Stop the server and start it again to load a changed one.
 
 ## What it writes, and how it cleans up
 
