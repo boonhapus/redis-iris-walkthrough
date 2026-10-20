@@ -1,6 +1,124 @@
+/* Load the Redis brand faces from Google Fonts: Space Grotesk for text, Space Mono for code. An @import has to come before every other rule. */
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap");
+
 /* marimo edit shows every output in a 610px scrolling box. Here the buttons and sliders sit below long text, so show each output in full. */
 .marimo-cell.interactive .output-area,
 .marimo-cell.interactive .console-output-area { max-height: none !important; }
 
 /* Wrap long lines in prompts, replies, and commands instead of scrolling them sideways. */
 .marimo-cell .output-area pre { white-space: pre-wrap !important; overflow-wrap: anywhere !important; }
+
+/* Redis type for text, headings, and code. marimo's own PT Sans and Fira Mono take over when Google Fonts can't be reached. */
+:root {
+  --marimo-text-font: "Space Grotesk", "PT Sans", "Helvetica Neue", Arial, sans-serif;
+  --marimo-heading-font: "Space Grotesk", "PT Sans", "Helvetica Neue", Arial, sans-serif;
+  --marimo-monospace-font: "Space Mono", "Fira Mono", ui-monospace, Menlo, monospace;
+}
+
+/* Redis colours for marimo's tokens, light value first, dark second. marimo sets these again on .marimo, .light, and .dark, inside every widget too, so this rule names all of them. */
+:root, .marimo, .light, .light-theme, .dark, .dark-theme {
+  --background: light-dark(#FFFFFF, #091A23);
+  --foreground: light-dark(#091A23, #D9D9D9);
+  --muted: light-dark(#F3F3F3, #163341);
+  --muted-foreground: light-dark(#5C707A, #B9C2C6);
+  --card: light-dark(#FCFCFC, #0D212C);
+  --card-foreground: light-dark(#091A23, #D9D9D9);
+  --popover: light-dark(#FFFFFF, #0D212C);
+  --popover-foreground: light-dark(#091A23, #D9D9D9);
+  --border: light-dark(#D9D9D9, #163341);
+  --input: light-dark(#5C707A, #8A99A0);
+  --primary: light-dark(#091A23, #FFFFFF);
+  --primary-foreground: light-dark(#FFFFFF, #091A23);
+  --secondary: light-dark(#F3F3F3, #163341);
+  --secondary-foreground: light-dark(#091A23, #FFFFFF);
+  --accent: light-dark(#F3F3F3, #2D4754);
+  --accent-foreground: light-dark(#091A23, #FFFFFF);
+  --ring: #FF4438;
+  --link: light-dark(#091A23, #FFFFFF);
+  --link-visited: light-dark(#091A23, #FFFFFF);
+  --destructive: light-dark(#D1281E, #FD736A);
+  --destructive-hover: light-dark(#8A221C, #FFACA7);
+  --destructive-border: light-dark(#8A221C, #FD736A);
+  --destructive-foreground: light-dark(#FFFFFF, #091A23);
+  --error: light-dark(#D1281E, #FFACA7);
+  --error-foreground: light-dark(#FFFFFF, #091A23);
+  --cm-background: light-dark(#FFFFFF, #0D212C);
+  --codehilite-bp: light-dark(#5B269A, #C795E3);
+  --iris-brand: #FF4438;
+  --iris-info: light-dark(#0477A5, #80DBFF);
+  --iris-ok: light-dark(#15803D, #DCFF1E);
+  --iris-warn: light-dark(#B45309, #F0B429);
+  --iris-danger: light-dark(#8A221C, #FD736A);
+}
+
+/* Headings, bold text, inline code, and quotes in Midnight, white in dark mode, with Dusk for list numbers and quote rules. */
+.prose {
+  --tw-prose-headings: light-dark(#091A23, #FFFFFF);
+  --tw-prose-bold: light-dark(#091A23, #FFFFFF);
+  --tw-prose-code: light-dark(#091A23, #FFFFFF);
+  --tw-prose-quotes: light-dark(#091A23, #D9D9D9);
+  --tw-prose-counters: light-dark(#5C707A, #B9C2C6);
+  --tw-prose-quote-borders: light-dark(#B9C2C6, #2D4754);
+}
+
+/* Headings in Space Grotesk Medium, the heaviest weight redis.io sets. */
+.markdown :is(h1, h2, h3) { font-weight: 500; }
+
+/* Links in the redis.io docs pattern: the text colour, underlined, red on hover, with a ring for keyboard focus. Red is then left for danger, focus, and the rule under the title. marimo's own links, in error messages and tooltips, get the underline too. */
+.markdown a { text-decoration: underline; text-underline-offset: 0.15em; text-decoration-thickness: 1px; }
+.markdown a:hover { color: light-dark(#D1281E, #FD736A); text-decoration-thickness: 2px; }
+.markdown a:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 2px; }
+:is(.text-link, a.hyperlink, .marimo-error a, .cm-tooltip .documentation a, .docs-documentation a) { text-decoration-line: underline; text-underline-offset: 0.15em; text-decoration-thickness: 1px; }
+
+/* Stripe table rows in redis.io's muted greys instead of marimo's lime. The hover shade keeps a red hover link readable; in light mode it barely differs from the stripe. */
+.markdown table tbody tr:nth-child(odd) { background: light-dark(#F8F8F8, #0D212C); }
+.markdown table tbody tr:nth-child(2n) { background-color: transparent; }
+.markdown table tbody tr:hover { background: light-dark(#F3F3F3, #163341); }
+
+/* Code blocks on Dusk greys, the subtle and card surfaces redis.io uses. */
+.markdown .codehilite { background-color: light-dark(#F3F3F3, #0D212C); }
+
+/* Callout colours. The brand defines no status colours, so these follow Redis's product UI (@redis-ui themesNext, as the Redis Cloud console ships it), using brand Blue, Yellow, and Hyper wherever they pass 4.5:1. */
+.admonition.info { --admonition-heading-color: var(--iris-info); }
+.admonition.success { --admonition-heading-color: var(--iris-ok); }
+.admonition.warning { --admonition-heading-color: var(--iris-warn); }
+.admonition.danger { --admonition-heading-color: var(--iris-danger); }
+
+/* "Try it" set as redis.io sets an eyebrow: Space Mono, upper case, 1.5px apart. The brand keeps eyebrows short, so the longer Key idea and Watch out titles stay in sentence case. */
+.admonition.success .admonition-title { font-family: var(--monospace-font); text-transform: uppercase; letter-spacing: 1.5px; font-weight: 400; font-size: 0.875em; }
+
+/* The notebook's buttons as the brand guide draws a call to action. Create, Ask, Seed, and Refresh are Yellow with Midnight text and a 1px border, and turn Midnight under the pointer, as redis.io's Yellow buttons do. The danger buttons are red outlines, so red still means danger. Colours stay out of a Windows contrast theme, which keeps marimo's system colours. */
+@media not (forced-colors: active) {
+  button[data-testid="marimo-plugin-button"].bg-secondary { background-color: #DCFF1E; color: #091A23; border-color: light-dark(#091A23, #5C707A); }
+  button[data-testid="marimo-plugin-button"].bg-destructive { background-color: var(--background); color: var(--destructive); border-color: var(--destructive); }
+  @media (hover: hover) {
+    button[data-testid="marimo-plugin-button"].bg-secondary:hover { background-color: #091A23; color: #FFFFFF; }
+    button[data-testid="marimo-plugin-button"].bg-destructive:hover { background-color: light-dark(#FFF3F2, #351D22); border-color: light-dark(#8A221C, #FFACA7); }
+  }
+  button[data-testid="marimo-plugin-button"]:active:not(:disabled) { transform: translateY(1px); }
+  button[data-testid="marimo-plugin-button"]:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+}
+
+/* Flat buttons with 5px corners and labels in Space Mono at 14px, the brand's face for button copy. Clearing --tw-shadow rather than box-shadow keeps marimo's focus ring. */
+button[data-testid="marimo-plugin-button"] { --tw-shadow: 0 0 #0000; border-radius: 5px; padding-inline: 12px; }
+button[data-testid="marimo-plugin-button"] > .prose { font-family: var(--monospace-font); font-size: 0.875rem; line-height: 1.5; font-weight: 400; }
+
+/* marimo draws the slider in Tailwind blue in light mode whatever the theme says, so draw it in the primary colour, with a fill and a ring for hover and keyboard focus. */
+[data-testid="range"] { background-color: var(--primary); }
+[data-testid="thumb"] { border-color: var(--primary); background-color: var(--background); }
+[data-testid="thumb"]:is(:hover, :focus, :focus-visible) { background-color: var(--primary); }
+[data-testid="thumb"]:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/* A bar beside the highlighted item in marimo's menus, where the Dusk highlight alone is too faint. A Windows contrast theme draws its own highlight. */
+@media not (forced-colors: active) {
+  :is([role=menuitem], [role=menuitemcheckbox], [role=menuitemradio], [role=option])[data-highlighted], [role=option][aria-selected=true] { box-shadow: inset 3px 0 0 0 var(--primary); }
+}
+
+/* Space Grotesk has no italic, so keep the plain-English gloss under each command upright instead of slanted by the browser. */
+.prose blockquote { font-style: normal; }
+
+/* One hit of Hyper red, a rule under the notebook's title. This is a design choice; the brand guide has no headline rule. */
+[data-cell-name="prologue"] .markdown h1 { padding-bottom: 0.5rem; border-bottom: 2px solid var(--iris-brand); }
+
+/* Selected text in Yellow on Midnight, as redis.io does it. */
+::selection { background-color: #DCFF1E; color: #091A23; }

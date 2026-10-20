@@ -91,9 +91,9 @@ def env_check(mo):
     }
     _missing = [name for name in _settings if not os.environ.get(name)]
 
-    # 2. One table row per setting: a green check or a red cross, the name, and where to find it.
-    _check = '<span style="color: var(--green-9)">&#10003;</span>'
-    _cross = '<span style="color: var(--red-9)">&#10007;</span>'
+    # 2. One table row per setting: a check or a cross in the theme's colours, the name, and where to find it.
+    _check = '<span style="color: var(--iris-ok)">&#10003;</span>'
+    _cross = '<span style="color: var(--iris-danger)">&#10007;</span>'
     _rows = ["| Set | Variable | Where to find it |", "|:-:|:--|:--|"]
     for _name, _where in _settings.items():
         _rows.append(f"| {_cross if _name in _missing else _check} | `{_name}` | {_where} |")

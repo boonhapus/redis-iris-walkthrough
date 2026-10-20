@@ -48,7 +48,7 @@ dotenv = [".env"]
 auto_reload = "lazy"
 
 [tool.marimo.display]
-# marimo edit caps every output at 610px and scrolls long code lines sideways. This file shows each output in full.
+# marimo edit caps every output at 610px and scrolls long code lines sideways. This file shows each output in full and sets Redis brand type and colours.
 custom_css = ["iris_basics.css"]
 
 [tool.marimo.package_management]
