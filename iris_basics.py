@@ -997,7 +997,7 @@ def cr_title(CAIRN_SCOPE, mo):
 
     ## You'll learn how to
 
-    1. Declare a data model, and see that it decides the tools.
+    1. Declare a data model, see that it decides the tools, and change it to fix a wrong answer.
     2. Tell the admin key, which makes the surface, from the agent key, which an agent sends with its tool calls.
     3. Assemble what the model sees: who is asking, which articles, and what the tools return.
     """)
@@ -1068,7 +1068,6 @@ def cr_model_fns(CAIRN_SCOPE):
 
 @app.cell(hide_code=True)
 def cr_model(CAIRN_SCOPE, crs_data_model, crs_record_keys, mo):
-    # The tools the index kinds predict, from crs_data_model. The service's own list comes after Create, in cr_create.
     _rows = ["The index kinds on those classes predict these tools.", "", "| entity | text | tag | numeric | tools the kinds add |", "|:--|:--|:--|:--|:--|"]
     _total = 0
     for _entity in crs_data_model["entities"]:
@@ -1213,8 +1212,7 @@ def cr_connect(
 
 
     def crs_create_surface() -> dict:
-        """Create the surface, make an agent key, and import the records. Returns the surface, agent key included.
-        The create POST is never retried: a replay would make a second surface holding the password."""
+        """Create the surface, make an agent key, and import the records. The create POST is never retried: a replay would make a second surface holding the password."""
         try:
             made = crs_admin("POST", "/context-surfaces", crs_create_body()).payload
         except OSError as error:  # a timeout or a dropped connection: the service may have made the surface before the reply was lost
@@ -1239,7 +1237,27 @@ def cr_connect(
             "key_expires_at": key.get("expires_at", "(not in the reply)"), "mcp_url": mcp_url, "imports": imports,
         }
 
-    return crs_admin, crs_create_surface, crs_surface_name
+
+    def crs_add_item(surface: dict) -> None:
+        """Step 4: add `item` (the product's title, as a TAG) to Order, PUT the new data model to the same surface, and import the orders again."""
+        from context_surfaces import ContextField, export_data_model
+
+        titles = {row["sku"]: row["title"] for row in SHOP_RECORDS["Product"]}
+        customer, product, order = crs_models
+
+        class Order(order):  # the same entity name, so every tool keeps its name
+            """One order: a customer, a product, and a status, such as Priya's tent."""
+
+            item: str = ContextField(description="What was bought: the product's title", index="tag", allowed_values=list(titles.values()))
+
+        model = export_data_model(crs_data_model["title"], crs_data_model["description"], entities=[customer, product, Order])
+        crs_admin("PUT", f"/context-surfaces/{surface['id']}", {"data_model": model})
+        records = [Order(**row, item=titles[row["sku"]]).model_dump() for row in SHOP_RECORDS["Order"]]
+        crs_admin("POST", f"/context-surfaces/{surface['id']}/data", {"entity": "Order", "records": records, "options": {"on_conflict": "overwrite", "on_error": "fail_fast"}})
+        for record_key in crs_record_keys:  # an order key that expired comes back from the import with no TTL
+            REDIS_CLIENT.expire(record_key, 3600)
+
+    return crs_add_item, crs_admin, crs_create_surface, crs_surface_name
 
 
 @app.cell(hide_code=True)
@@ -1252,18 +1270,15 @@ def cr_lifecycle(
     mo,
     redis,
 ):
-    # The surface, kept for the other cells. The notebook's one mo.state, with a private getter: a cell that references a getter reruns
-    # on every set, which would redefine the turn functions and reset the Chapter 4 chat. Other cells call crs_surface() instead.
+    # The surface, kept for the other cells. The notebook's one mo.state, with a private getter: a cell that references a getter reruns on every set, which would redefine the turn functions and reset the Chapter 4 chat. Other cells call crs_surface() instead.
     _get_surface, crs_set_surface = mo.state(None)
 
 
     def crs_surface() -> dict | None:
-        """The surface this kernel created: id, status, agent key, expiry, mcp_url, and import counts. None before Create and after Clean up."""
         return _get_surface()
 
 
     def crs_cleanup() -> str:
-        """Delete every surface named cairn-<scope>, unlink the record keys by name, and drop any entity index left behind, without DD. Returns one sentence."""
         ids = []
         for page in range(1, 41):  # the account lists its surfaces 50 a page, so this also finds one a restarted kernel forgot
             reply = crs_admin("GET", f"/context-surfaces?page={page}&page_size=50").payload
@@ -1384,15 +1399,16 @@ def cr_ask_md(CAST, mo):
     - `X-API-Key` is the agent key, the only key a tool call carries. MCP messages are JSON-RPC: `jsonrpc` and `id` are the envelope, and `method` says what to do. `"tools/call"` runs one tool, and `"tools/list"` returns the menu of tools, which `crs_answer` hands to the model.
     - `name` and `arguments` are the model's choice, written against the tool's `inputSchema`, a JSON Schema for its arguments.
     - A tag condition on `customer_id` is Chapter 1's filter before ranking again: the rule decides which records may come back, as `@year` did, so only Priya's orders do.
-    - The reply is `result.content[0].text`, JSON text: a filter returns `count` and `results`, a `get_` the bare record. A tool error is not an exception but HTTP 200 with `isError` true and the reason in the text, which the model reads and can retry.
+    - The reply is `result.content[0].text`, JSON text: a filter returns `count` and `results`, a `get_` the bare record. A tool error is not an exception but HTTP 200, with the reason as text the model reads and can retry.
     """)
 
     _scope = mo.callout(mo.md("An agent key can carry access tags, which filter what the key can see, but this data model declares no ACL mapping. The identity line in the prompt is the only scope the demo shows."), kind="warn", title="Watch out: identity is a line in the prompt")
 
     _try_it = mo.callout(mo.md("""
-    - Ask as Priya, with the tent question. Read the prompt: the articles are general ones, such as tent care and delivery, and none knows where her order is, so that must have come from a tool. Then read the tool calls: did the arguments carry `C001`? In the data her tent order, O1001, is `shipped`.
-    - Ask as Tom, with the refund question. Compare its tools and arguments with Priya's. The refund article joins the prompt. In the data his trail shoes, O1004, are `returned`.
-    - Ask Priya's tent question as Tom. Look at the id in the arguments, and at what the assistant says about a tent Tom never ordered.
+    - Ask as Priya, with the tent question. The answer is often wrong: the model adds a guessed `sku` "tent", or a `status` such as "placed", to `filter_order`, gets `count` 0, and tells her she has no tent order. Read the tool calls to see which it guessed.
+    - Why it guesses: the data model decides the tools, and an order has a `sku` but no title. A tag condition matches exact labels, as Chapter 1's `TAG` fields did, so a guess that none of her orders match returns `count` 0, and the model reads the empty reply as the answer. Press **Ask** again and compare: the runs that come out right (O1001 is `shipped`) didn't guess a `sku`. Step 4 puts the product's name on each order.
+    - Ask as Tom, with the refund question. The refund article joins the prompt, so the model may call no tool. If it does, compare it with Priya's. His shoes, O1004, are `returned`.
+    - Ask Priya's tent question as Tom. Look at the id in the arguments, and at whether the assistant says Tom has no tent order. It can also call his jacket a tent, because his orders hold only skus too.
     """), kind="success", title="Try it")
 
     mo.vstack([_step, _scope, _try_it, crs_ask, crs_go], gap=0.75)
@@ -1413,7 +1429,6 @@ async def cr_ask(
     rss_search,
     rss_text,
 ):
-    # Ask. crs_answer runs inside recording(), so its tools/call requests are read back from the exchanges. The prompt is rebuilt with the turn's own functions.
     mo.stop(not crs_go.value, mo.md("Pick a customer and a question, then press **Ask**."))
     mo.stop(crs_surface() is None, mo.md("Press **Create** in step 2 first, then press **Ask** again: until a surface exists, the assistant has no tools."))
     _customer = crs_ask.value["customer"]
@@ -1434,14 +1449,45 @@ async def cr_ask(
     for _exchange in (x for x in _exchanges if (x.body or {}).get("method") == "tools/call"):
         _params, _payload = _exchange.body["params"], _exchange.payload or {}
         _text = (_payload.get("result", {}).get("content") or [{}])[0].get("text") or json.dumps(_payload)
-        _calls.append(
-            f"**{len(_calls) + 1}. `{_params['name']}`** with `{json.dumps(_params['arguments'])}`, {_exchange.ms} ms\n\n"
-            f"```json\n{_text[:700]}{'...' if len(_text) > 700 else ''}\n```"
-        )
+        _calls.append(f"**{len(_calls) + 1}. `{_params['name']}`** with `{json.dumps(_params['arguments'])}`, {_exchange.ms} ms\n\n"
+                      f"```json\n{_text[:700]}{'...' if len(_text) > 700 else ''}\n```")
 
     _saw = mo.vstack([mo.md(f"**What the model saw**: this system prompt for `{_customer}`, your question as the user message, and the tools from **Create**:"), rss_text(crs_build_system(_customer, _articles))])
     _asked = mo.md("**What it asked for**\n\n" + ("\n\n".join(_calls) or "_No tool calls were made._"))
     mo.vstack([_saw, _asked, mo.md("**Answer**\n\n" + _answer.replace("$", r"\$"))], gap=0.75)  # a bare $ would start a math span
+    return
+
+
+@app.cell(hide_code=True)
+def cr_fix_md(mo):
+    crs_fix_button = mo.ui.run_button(label="Update the data model")
+
+    _step = mo.md("""
+    ## Step 4. Fix the interface, not the model
+
+    Priya's order holds only a `sku`, and nothing in P102 says tent, so the model guessed. Give each order what was bought, as a field the tools can filter on. `crs_add_item`, above, adds `item` to the Order class and sends the new data model to the same surface, then imports the orders again, each with its `item`. The surface keeps its id, agent key, and `mcp_url`, and the service rebuilds the tools from the new model:
+
+    ```text
+    PUT /context-surfaces/{id}   {"data_model": {...}}
+    ```
+
+    Reading it piece by piece:
+
+    - `index="tag"` makes `item` an exact label, like Chapter 1's `TAG` fields, so `filter_order` can match it.
+    - `allowed_values` puts every title in the tool's description, as `item (values: ...)`, and the service refuses an unlisted value with the valid ones in its error. Titles, not codes: P102 says nothing about tents.
+    - The cost: this suits a short list, because the service caps `allowed_values` at 128 values, and `item` repeats `Product.title`, so the two must change together.
+    """)
+
+    mo.vstack([_step, mo.callout(mo.md("Press **Update the data model**, then ask Priya's tent question again in step 3, as Priya and then as Tom. Look for `item` set to `Ultralight Tent 2P` in the tool call, and compare the answers with the ones you got before."), kind="success", title="Try it"), crs_fix_button], gap=0.75)
+    return (crs_fix_button,)
+
+
+@app.cell(hide_code=True)
+def cr_fix(crs_add_item, crs_fix_button, crs_list_tools, crs_surface, mo):
+    mo.stop(not crs_fix_button.value or crs_surface() is None, mo.md("_Press **Create** in step 2 and ask in step 3, then press **Update the data model**._"))
+    crs_add_item(crs_surface())
+    _item = next((part for tool in crs_list_tools(crs_surface()) if tool["name"] == "filter_order" for part in tool["description"].replace(". ", "; ").split("; ") if part.startswith("item")), "")
+    mo.md(f"Updated surface `{crs_surface()['id']}`. `filter_order` now lists:\n\n```text\n{_item}\n```\n\nAsk again in step 3.")
     return
 
 
@@ -1619,7 +1665,7 @@ def am_chat_md(CAST, mo):
     - `content` holds the message as typed, and `createdAt` says when, by the app's clock.
     """)
 
-    _extraction = mo.callout(mo.md("Session memory holds the messages of one chat. The service extracts long-term memories from it in the background, within about five minutes of a turn, so a turn never recalls the message it just wrote."), kind="warn", title="Watch out: extraction is slow")
+    _extraction = mo.callout(mo.md("Session memory holds one chat. The service extracts long-term memories from it within about five minutes, in its own words. A turn never recalls its own message, and a memory can say more than she did."), kind="warn", title="Watch out: extraction is slow")
 
     _recall = mo.md(r"""
     ## Step 3. Recall them by meaning
@@ -1761,9 +1807,9 @@ async def am_pane(
     _try_it = mo.callout(mo.md("""
     After **Seed**, chat as Priya. Type `/` to open the starter prompts (the menu lists them alphabetically) and send them in the order below. The pane beside the chat shows each turn's recall, prompt, tool calls, and session. The assistant answers from Chapter 1's articles, so press **Create** there first, or again if the articles have expired.
 
-    1. "Which sleeping bag should I get for the trip?" Look for an answer that weighs her memories, the temperature-rating article, and the catalog, where the down bag is the warmer one.
-    2. "How do I wash my sleeping bag after the trip?" Chapter 2's cache served Priya the down answer for her synthetic bag. Here, look for care steps for a synthetic bag, because her allergy is in the prompt.
-    3. "Where's my tent?" Look for a tool call in the pane. It needs Chapter 3's surface.
+    1. "Which sleeping bag should I get for the trip?" Look for an answer that weighs her memories and the temperature-rating article. Does the pane show a catalog lookup?
+    2. "How do I wash my sleeping bag after the trip?" Chapter 2's cache served Priya the down answer for her synthetic bag. Here, look for synthetic care, and for the recalled memory behind it.
+    3. "Where's my tent?" Look for a `filter_order` call for `C001`. It needs Chapter 3's surface. O1001 is `shipped`.
     4. "I'm bringing my dog Juniper on the trip." This is a new fact. Wait up to five minutes, then press **Refresh** in step 1 to see whether the service extracted it.
 
     Then switch **Chat as** to Tom, which starts a new session, and send the first prompt again. Only his memories can come back, and the pane shows what the same search finds for Priya, which the assistant never sends.
@@ -1828,7 +1874,7 @@ def am_epilogue(ams_client, mo):
 
     1. **Agent Memory** wrote her message to session memory and recalled her long-term memories.
     2. **Redis Search** found the help articles closest in meaning to her question.
-    3. **Context Retriever** answered the tool calls the model made for her orders and products.
+    3. **Context Retriever** listed its tools and answered any calls the model made for her orders.
     4. **The model** got the system prompt the app assembled, the chat, and the tool results, and wrote the answer.
 
     **LangCache** sits in front of questions whose answer is the same for everyone. It isn't in this turn, because the right answer here is about her.
