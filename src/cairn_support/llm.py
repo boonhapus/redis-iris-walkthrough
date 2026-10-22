@@ -11,22 +11,34 @@ LLM_API_KEY is read at the first call, not at import, so a missing key fails at 
 turn with the SDK's own error.
 """
 
+from __future__ import annotations
+
 import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from typing import Any, Literal
 
-from cairn_support.types import ChatMessage
+from cairn_support.schema import ChatMessage, ToolSpec
 
 _MAX_TOKENS = 4096  # the reply cap on each model call in a tool loop, stream_llm's default
-_CallTool = Callable[[str, dict], str | Awaitable[str]]  # (tool name, arguments) -> the text for the model
-_clients: dict[tuple[str, str | None], object] = {}  # one client per provider and key, so turns reuse a connection
+_CallTool = Callable[[str, dict[str, Any]], str | Awaitable[str]]  # (tool name, arguments) -> the text for the model
+_clients: dict[tuple[str, str | None], Any] = {}  # one client per provider and key, so turns reuse a connection
 
 
-def _client(model: str):
+def _provider(model: str) -> Literal["anthropic", "gemini", "openai"]:
+    """Which SDK speaks this model name. Anything else is OpenAI."""
+    if model.startswith("claude"):
+        return "anthropic"
+    if model.startswith("gemini"):
+        return "gemini"
+    return "openai"
+
+
+def _client(model: str) -> Any:
     """The SDK client for `model`'s provider: Anthropic, Google, or OpenAI."""
     key = os.environ.get("LLM_API_KEY") or None
-    provider = "anthropic" if model.startswith("claude") else "gemini" if model.startswith("gemini") else "openai"
+    provider = _provider(model)
     if (provider, key) not in _clients:
         if provider == "anthropic":
             from anthropic import AsyncAnthropic
@@ -43,7 +55,7 @@ def _client(model: str):
     return _clients[provider, key]
 
 
-def _history(messages: Iterable[ChatMessage | dict]) -> list[dict[str, str]]:
+def _history(messages: Iterable[ChatMessage | dict[str, Any]]) -> list[dict[str, str]]:
     """The user and assistant messages as {"role", "content"} dicts, oldest first."""
     history = []
     for message in messages:
@@ -53,7 +65,7 @@ def _history(messages: Iterable[ChatMessage | dict]) -> list[dict[str, str]]:
     return history
 
 
-def _gemini_contents(history: list[dict[str, str]]) -> list[dict]:
+def _gemini_contents(history: list[dict[str, str]]) -> list[dict[str, Any]]:
     """`history` as Gemini contents: its assistant role is "model"."""
     return [
         {"role": "model" if message["role"] == "assistant" else "user", "parts": [{"text": message["content"]}]}
@@ -62,7 +74,7 @@ def _gemini_contents(history: list[dict[str, str]]) -> list[dict]:
 
 
 async def stream_llm(
-    system_prompt: str, messages: Iterable[ChatMessage | dict], model: str, max_tokens: int = _MAX_TOKENS
+    system_prompt: str, messages: Iterable[ChatMessage | dict[str, Any]], model: str, max_tokens: int = _MAX_TOKENS
 ) -> AsyncIterator[str]:
     """Stream the model's reply to `messages` under `system_prompt`, a piece of text at a time.
 
@@ -70,13 +82,14 @@ async def stream_llm(
     with those two keys. Only the user and assistant messages are sent.
     """
     history = _history(messages)
-    if model.startswith("claude"):
+    provider = _provider(model)
+    if provider == "anthropic":
         async with _client(model).messages.stream(
             model=model, system=system_prompt, messages=history, max_tokens=max_tokens
         ) as stream:
             async for text in stream.text_stream:
                 yield text
-    elif model.startswith("gemini"):
+    elif provider == "gemini":
         stream = await _client(model).aio.models.generate_content_stream(
             model=model,
             contents=_gemini_contents(history),
@@ -97,7 +110,7 @@ async def stream_llm(
                 yield chunk.choices[0].delta.content
 
 
-def _openai_tools(tools: list[dict]) -> list[dict]:
+def _openai_tools(tools: list[ToolSpec]) -> list[dict[str, Any]]:
     """`tools` as chat completions takes them: each one a function whose parameters are the inputSchema."""
     return [
         {
@@ -108,7 +121,7 @@ def _openai_tools(tools: list[dict]) -> list[dict]:
     ]
 
 
-def _anthropic_tools(tools: list[dict]) -> list[dict]:
+def _anthropic_tools(tools: list[ToolSpec]) -> list[dict[str, Any]]:
     """`tools` as the Messages API takes them: the inputSchema is called input_schema."""
     return [
         {"name": tool["name"], "description": tool.get("description", ""), "input_schema": tool["inputSchema"]}
@@ -116,7 +129,7 @@ def _anthropic_tools(tools: list[dict]) -> list[dict]:
     ]
 
 
-def _gemini_tools(tools: list[dict]) -> list:
+def _gemini_tools(tools: list[ToolSpec]) -> list[Any]:
     """`tools` as one Gemini Tool of function declarations. parameters_json_schema takes the inputSchema as it is."""
     from google.genai import types
 
@@ -132,7 +145,7 @@ def _gemini_tools(tools: list[dict]) -> list:
     ]
 
 
-async def _result(call_tool: _CallTool, name: str, arguments: dict) -> str:
+async def _result(call_tool: _CallTool, name: str, arguments: dict[str, Any]) -> str:
     """The text `call_tool` returns for this call, awaited when call_tool is a coroutine function."""
     result = call_tool(name, arguments)
     return await result if inspect.isawaitable(result) else result
@@ -144,7 +157,7 @@ def _stopped(max_rounds: int) -> str:
 
 
 async def _ask_openai(
-    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[dict], call_tool: _CallTool, max_rounds: int
+    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[ToolSpec], call_tool: _CallTool, max_rounds: int
 ) -> str:
     """The OpenAI tool loop: the final text, or the stopped sentence."""
     client = _client(model)
@@ -186,7 +199,7 @@ async def _ask_openai(
 
 
 async def _ask_anthropic(
-    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[dict], call_tool: _CallTool, max_rounds: int
+    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[ToolSpec], call_tool: _CallTool, max_rounds: int
 ) -> str:
     """The Anthropic tool loop: the final text, or the stopped sentence."""
     client = _client(model)
@@ -216,13 +229,13 @@ async def _ask_anthropic(
 
 
 async def _ask_gemini(
-    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[dict], call_tool: _CallTool, max_rounds: int
+    system_prompt: str, history: list[dict[str, str]], model: str, tools: list[ToolSpec], call_tool: _CallTool, max_rounds: int
 ) -> str:
     """The Gemini tool loop: the final text, or the stopped sentence."""
     from google.genai import types
 
     client = _client(model)
-    contents = _gemini_contents(history)
+    contents: list[Any] = _gemini_contents(history)
     config = {
         "system_instruction": system_prompt,
         "max_output_tokens": _MAX_TOKENS,
@@ -248,9 +261,9 @@ async def _ask_gemini(
 
 async def answer_with_tools(
     system_prompt: str,
-    messages: Iterable[ChatMessage | dict],
+    messages: Iterable[ChatMessage | dict[str, Any]],
     model: str,
-    tools: list[dict],
+    tools: list[ToolSpec],
     call_tool: _CallTool,
     max_rounds: int = 5,
 ) -> AsyncIterator[str]:
@@ -270,5 +283,5 @@ async def answer_with_tools(
         async for text in stream_llm(system_prompt, messages, model):
             yield text
         return
-    ask = _ask_anthropic if model.startswith("claude") else _ask_gemini if model.startswith("gemini") else _ask_openai
+    ask = {"anthropic": _ask_anthropic, "gemini": _ask_gemini, "openai": _ask_openai}[_provider(model)]
     yield await ask(system_prompt, _history(messages), model, tools, call_tool, max_rounds)

@@ -7,7 +7,8 @@ app = marimo.App(width="columns", app_title="Redis Iris basics")
 @app.cell(column=0, hide_code=True)
 def prologue(CAST, mo):
     mo.md(f"""
-    # Cairn Outfitters: a support assistant, one Redis Iris service at a time
+    # Learn Redis Iris
+    ## by launching a new support assistant at Cairn Outfitters
 
     Cairn Outfitters, a made-up outdoor-gear shop, is launching an AI support assistant. You build it in four chapters. Each chapter adds a Redis Iris service, and the gap it leaves is what the next one fixes.
 
@@ -46,19 +47,18 @@ def imports():
 
     # Notebook-local data support, typing information, or internal machinery.
     from cairn_support.sample_data import CAST
-    from cairn_support.sessions import json_request, json_session, recording
-    from cairn_support.types import ChatMessage, ChatTurn, Reply
+    from cairn_support.schema import ChatMessage, ChatTurn, Reply
+    from cairn_support.http import JsonSession, recording
 
     return (
         CAST,
         ChatMessage,
         ChatTurn,
+        JsonSession,
         Reply,
         asyncio,
         dt,
         json,
-        json_request,
-        json_session,
         mo,
         recording,
         time,
@@ -345,7 +345,7 @@ def rs_search_fn(
     shlex,
 ):
     # Search. Names the index and the articles, and defines the one function every later chapter calls (the KNN query, written as text the way redis-cli takes it). Create, in the hidden cell above, does the work.
-    from cairn_support.redis_search_replies import ft_search_rows  # reads an FT.SEARCH reply, RESP2 or RESP3, as one dict per hit
+    from cairn_support.redis_search_replies import parse_search_reply  # total and one dict per hit, from a RESP2 list or a RESP3 map
     from cairn_support.sample_data import HELP_ARTICLES
 
 
@@ -368,16 +368,36 @@ def rs_search_fn(
              PARAMS  2  vector
         """
         reply = REDIS_CLIENT.execute_command(*shlex.split(command), rss_vector(question))
-        return ft_search_rows(reply)[1]
+        return parse_search_reply(reply).hits
 
     return (
         HELP_ARTICLES,
         RS_IDX_NAME,
         RS_KEY_PREFIX,
-        ft_search_rows,
+        parse_search_reply,
         rss_search,
         rss_vector,
     )
+
+
+@app.cell(hide_code=True)
+def rs_render(mo):
+    from html import escape
+
+    from cairn_support.redis_search_replies import format_search_table
+
+
+    def rss_text(text: str) -> mo.Html:
+        """Text as the model gets it, in a code block. mo.md would add a blank line before every list item."""
+        return mo.Html(f'<span class="markdown prose dark:prose-invert contents"><div class="language-text codehilite"><pre><span></span><code>{escape(text)}</code></pre></div></span>')
+
+
+    def rss_table(rows: list[dict], caption: str = "") -> mo.Html:
+        """The hits as a markdown table (title, category, year, vector_score) under a one-line caption with the hit count."""
+        table = format_search_table(rows) if rows else "_No article._"
+        return mo.md(f"**Hits: {len(rows)}.** {caption}\n\n{table}")
+
+    return rss_table, rss_text
 
 
 @app.cell(hide_code=True)
@@ -513,8 +533,8 @@ def rs_floor_md(EMBEDDING_MODEL, RS_IDX_NAME, mo):
 def rs_floor(
     REDIS_CLIENT,
     RS_IDX_NAME,
-    ft_search_rows,
     mo,
+    parse_search_reply,
     redis,
     rs_floor_slider,
     rs_meaning_pick,
@@ -535,13 +555,13 @@ def rs_floor(
          PARAMS  4  radius  {_radius}  vector
     """
     try:
-        _indexed = ft_search_rows(REDIS_CLIENT.execute_command("FT.SEARCH", RS_IDX_NAME, "*", "LIMIT", 0, 0))[0]  # a live count: rss_index_info only changes on Create
+        _indexed = parse_search_reply(REDIS_CLIENT.execute_command("FT.SEARCH", RS_IDX_NAME, "*", "LIMIT", 0, 0)).total  # a live count: rss_index_info only changes on Create
         mo.stop(not _indexed, mo.md("_No articles came back. They expire an hour after Create, so press **Create** again in step 1._"))
         _reply = REDIS_CLIENT.execute_command(*shlex.split(_command), rss_vector(rs_meaning_pick.value))
     except redis.ResponseError as _error:  # Clean up everything dropped the index, and rss_index_info doesn't know yet
         mo.stop("index" in str(_error).lower(), _hint)
         raise
-    rss_table(ft_search_rows(_reply)[1], f"`VECTOR_RANGE` for *{rs_meaning_pick.value}*, floor {rs_floor_slider.value:.2f}, radius {_radius:.2f}")
+    rss_table(parse_search_reply(_reply).hits, f"`VECTOR_RANGE` for *{rs_meaning_pick.value}*, floor {rs_floor_slider.value:.2f}, radius {_radius:.2f}")
     return
 
 
@@ -640,26 +660,6 @@ def rs_ends(mo):
     return
 
 
-@app.cell(hide_code=True)
-def rs_render(mo):
-    from html import escape
-
-    from cairn_support.redis_search_replies import ft_search_markdown_table
-
-
-    def rss_text(text: str) -> mo.Html:
-        """Text as the model gets it, in a code block. mo.md would add a blank line before every list item."""
-        return mo.Html(f'<span class="markdown prose dark:prose-invert contents"><div class="language-text codehilite"><pre><span></span><code>{escape(text)}</code></pre></div></span>')
-
-
-    def rss_table(rows: list[dict], caption: str = "") -> mo.Html:
-        """The hits as a markdown table (title, category, year, vector_score) under a one-line caption with the hit count."""
-        table = ft_search_markdown_table(rows) if rows else "_No article._"
-        return mo.md(f"**Hits: {len(rows)}.** {caption}\n\n{table}")
-
-    return rss_table, rss_text
-
-
 @app.cell(column=2, hide_code=True)
 def lc_title(mo):
     _intro = mo.md("""
@@ -737,7 +737,7 @@ def lc_title(mo):
 
     _try_it = mo.callout(
         mo.md("""
-    Ask the four questions in order with **Ask**, at 0.85 unless a step says otherwise. Each miss stores its answer, so asking a question twice hits it. Press **Clear** to start again: it deletes the entries this notebook stored, and any others expire after 15 minutes. **Ask** runs `lcs_answer`, the code shown below the results.
+    Ask the four questions in order with **Ask**, at 0.85 unless a step says otherwise. Each miss stores its answer, so asking a question twice hits it. Press **Clear** to start again: it deletes the entries this notebook stored, and any others expire after 15 minutes. **Ask** runs `lcs_answer` from the cell just above the results.
 
     1. Question 1, Tom's. It misses: the cache is empty, so the assistant searches the help center, the model writes the answer from the articles, and the app stores it. Read the system prompt: the app decides what the model sees. Note the total time.
     2. Question 2, another customer's. It hits at about 0.905 with no model call, though it says *launder* where the stored prompt says *wash*. Compare its total with the one you noted for question 1.
@@ -782,6 +782,94 @@ def lc_title(mo):
         gap=0.75,
     )
     return lcs_ask, lcs_clear, lcs_go
+
+
+@app.cell
+def lc_connect(JsonSession, Reply, os):
+    # Client. One session that carries the Bearer token, the two request bodies, and a ledger of the entries this kernel stored.
+    _host = os.environ["LANGCACHE_HOST"].strip().rstrip("/")  # the Connectivity page's URL, with or without https://
+    lcs_session = JsonSession(
+        f"{_host if '://' in _host else 'https://' + _host}/v1/caches/{os.environ['LANGCACHE_CACHE_ID'].strip()}",
+        {"Authorization": f"Bearer {os.environ['LANGCACHE_API_KEY']}"},  # the one credential, read here and bound to nothing
+    )
+
+    # Entries can't be listed, so the app keeps the id of each one it stores: entryId -> prompt. Clear deletes by these ids.
+    lcs_entries: dict[str, str] = {}
+
+
+    def lcs_call(method: str, path: str, body: dict | None = None) -> Reply:
+        """One request to the cache, with no retry: the HTTP status, the JSON object (None when the body is empty or not JSON), and the milliseconds it took."""
+        return lcs_session.request(method, path, body)
+
+
+    def lcs_request(prompt: str, threshold: float) -> dict:
+        """The search body. `similarityThreshold` is Chapter 1's similarity floor: an entry at or above it is a hit."""
+        return {"prompt": prompt, "similarityThreshold": round(threshold, 2)}
+
+
+    def lcs_entry(prompt: str, response: str) -> dict:
+        """The store body. `ttlMillis` goes with every entry, because a new cache never expires entries unless you send it."""
+        return {"prompt": prompt, "response": response, "ttlMillis": 900_000}
+
+
+    def lcs_forget() -> tuple[int, int]:
+        """Delete every ledger entry by id with `DELETE /entries/{entryId}`, never the whole cache. Returns how many answered 204 (deleted) and 404 (expired already). Anything else stays in the ledger."""
+        counts = {204: 0, 404: 0}
+        for entry_id in list(lcs_entries):
+            status, _, _ = lcs_call("DELETE", f"/entries/{entry_id}")
+            if status in counts:
+                counts[status] += 1
+                del lcs_entries[entry_id]
+        return counts[204], counts[404]
+
+    return lcs_call, lcs_entries, lcs_entry, lcs_forget, lcs_request
+
+
+@app.cell
+def lc_answer_fn(
+    AI_MODEL,
+    lcs_call,
+    lcs_entries: dict[str, str],
+    lcs_entry,
+    lcs_request,
+    rss_search,
+    stream_llm,
+):
+    # Assistant. The cache comes first. On a miss the app decides what the model sees: the articles Chapter 1's search finds.
+    def lcs_system(articles: list[dict]) -> str:
+        """The assistant's base prompt: answer in two or three sentences, from these help articles."""
+        return (
+            "You are the Cairn Outfitters support assistant. Answer in two or three sentences. "
+            "Use the help articles below; if they don't answer the question, say so and say what the customer can do next.\n\n"
+            "Help articles:\n" + "\n".join(f"- {a['title']}: {a['body']}" for a in articles)
+        )
+
+
+    async def lcs_answer(question: str, threshold: float) -> str:
+        """Cache-aside: serve a stored answer when one is close enough, else answer from the help center and store that answer."""
+        # Search the cache before the model. A miss is 200 with data: [], never a 404.
+        status, payload, _ = lcs_call("POST", "/entries/search", lcs_request(question, threshold))
+        if status != 200:
+            raise RuntimeError(f"LangCache answered {status} ({(payload or {}).get('type', 'no JSON object')}) to the search")
+
+        # A hit serves the best stored answer, and the model is never called.
+        hits = payload["data"]
+        if hits:
+            return hits[0]["response"]
+
+        # A miss: search the help center, and let the model answer from those articles. It never learns who is asking, because the stored answer goes to everyone.
+        articles = rss_search(question)
+        if not articles:  # they expire an hour after Create, and an answer without them would be stored for everyone
+            raise RuntimeError("the help center holds no articles, so press Create in Chapter 1 again")
+        answer = "".join([text async for text in stream_llm(lcs_system(articles), [{"role": "user", "content": question}], AI_MODEL)])
+
+        # Store after the model, with the TTL. A 201 returns the entryId, which the ledger keeps so Clear can delete it.
+        status, stored, _ = lcs_call("POST", "/entries", lcs_entry(question, answer))
+        if status == 201:
+            lcs_entries[stored["entryId"]] = question
+        return answer
+
+    return lcs_answer, lcs_system
 
 
 @app.cell(hide_code=True)
@@ -873,94 +961,6 @@ async def lc_ask(
         gap=0.75,
     )
     return
-
-
-@app.cell
-def lc_connect(Reply, json_request, json_session, os):
-    # Client. One session that carries the Bearer token, the two request bodies, and a ledger of the entries this kernel stored.
-    _host = os.environ["LANGCACHE_HOST"].strip().rstrip("/")  # the Connectivity page's URL, with or without https://
-    lcs_session = json_session(
-        f"{_host if '://' in _host else 'https://' + _host}/v1/caches/{os.environ['LANGCACHE_CACHE_ID'].strip()}",
-        {"Authorization": f"Bearer {os.environ['LANGCACHE_API_KEY']}"},  # the one credential, read here and bound to nothing
-    )
-
-    # Entries can't be listed, so the app keeps the id of each one it stores: entryId -> prompt. Clear deletes by these ids.
-    lcs_entries: dict[str, str] = {}
-
-
-    def lcs_call(method: str, path: str, body: dict | None = None) -> Reply:
-        """One request to the cache, with no retry: the HTTP status, the reply as a dict (None on a 204), and the milliseconds it took."""
-        return json_request(lcs_session, method, path, body)
-
-
-    def lcs_request(prompt: str, threshold: float) -> dict:
-        """The search body. `similarityThreshold` is Chapter 1's similarity floor: an entry at or above it is a hit."""
-        return {"prompt": prompt, "similarityThreshold": round(threshold, 2)}
-
-
-    def lcs_entry(prompt: str, response: str) -> dict:
-        """The store body. `ttlMillis` goes with every entry, because a new cache never expires entries unless you send it."""
-        return {"prompt": prompt, "response": response, "ttlMillis": 900_000}
-
-
-    def lcs_forget() -> tuple[int, int]:
-        """Delete every ledger entry by id with `DELETE /entries/{entryId}`, never the whole cache. Returns how many answered 204 (deleted) and 404 (expired already). Anything else stays in the ledger."""
-        counts = {204: 0, 404: 0}
-        for entry_id in list(lcs_entries):
-            status, _, _ = lcs_call("DELETE", f"/entries/{entry_id}")
-            if status in counts:
-                counts[status] += 1
-                del lcs_entries[entry_id]
-        return counts[204], counts[404]
-
-    return lcs_call, lcs_entries, lcs_entry, lcs_forget, lcs_request
-
-
-@app.cell
-def lc_answer_fn(
-    AI_MODEL,
-    lcs_call,
-    lcs_entries: dict[str, str],
-    lcs_entry,
-    lcs_request,
-    rss_search,
-    stream_llm,
-):
-    # Assistant. The cache comes first. On a miss the app decides what the model sees: the articles Chapter 1's search finds.
-    def lcs_system(articles: list[dict]) -> str:
-        """The assistant's base prompt: answer in two or three sentences, from these help articles."""
-        return (
-            "You are the Cairn Outfitters support assistant. Answer in two or three sentences. "
-            "Use the help articles below; if they don't answer the question, say so and say what the customer can do next.\n\n"
-            "Help articles:\n" + "\n".join(f"- {a['title']}: {a['body']}" for a in articles)
-        )
-
-
-    async def lcs_answer(question: str, threshold: float) -> str:
-        """Cache-aside: serve a stored answer when one is close enough, else answer from the help center and store that answer."""
-        # Search the cache before the model. A miss is 200 with data: [], never a 404.
-        status, payload, _ = lcs_call("POST", "/entries/search", lcs_request(question, threshold))
-        if status != 200:
-            raise RuntimeError(f"LangCache answered {status} ({(payload or {}).get('type', 'no body')}) to the search")
-
-        # A hit serves the best stored answer, and the model is never called.
-        hits = payload["data"]
-        if hits:
-            return hits[0]["response"]
-
-        # A miss: search the help center, and let the model answer from those articles. It never learns who is asking, because the stored answer goes to everyone.
-        articles = rss_search(question)
-        if not articles:  # they expire an hour after Create, and an answer without them would be stored for everyone
-            raise RuntimeError("the help center holds no articles, so press Create in Chapter 1 again")
-        answer = "".join([text async for text in stream_llm(lcs_system(articles), [{"role": "user", "content": question}], AI_MODEL)])
-
-        # Store after the model, with the TTL. A 201 returns the entryId, which the ledger keeps so Clear can delete it.
-        status, stored, _ = lcs_call("POST", "/entries", lcs_entry(question, answer))
-        if status == 201:
-            lcs_entries[stored["entryId"]] = question
-        return answer
-
-    return lcs_answer, lcs_system
 
 
 @app.cell(hide_code=True)
@@ -1164,25 +1164,24 @@ def cr_create(
 @app.cell
 def cr_connect(
     CAIRN_SCOPE,
+    JsonSession,
     REDIS_CLIENT,
     Reply,
     SHOP_RECORDS,
     crs_data_model,
     crs_models,
     crs_record_keys,
-    json_request,
-    json_session,
     os,
     redis,
 ):
     # Admin side. Every call here carries the admin key from .env: it makes the surface, the agent key, and the records. An agent never sees it.
     crs_surface_name = f"cairn-{CAIRN_SCOPE}"
-    crs_admin_session = json_session(os.environ.get("CTX_API_URL", "https://cloud.redis.io/context-surfaces") + "/api/v1", {"X-API-Key": os.environ["CTX_ADMIN_KEY"]}, timeout=(5, 60))
+    crs_admin_session = JsonSession(os.environ.get("CTX_API_URL", "https://cloud.redis.io/context-surfaces") + "/api/v1", {"X-API-Key": os.environ["CTX_ADMIN_KEY"]}, timeout=(5, 60))
 
 
     def crs_admin(method: str, path: str, body: dict | None = None, ok: tuple = (200, 201)) -> Reply:
         """One admin request. A status outside `ok` raises with the reply's detail and never the request, which can hold the database password."""
-        reply = json_request(crs_admin_session, method, path, body)
+        reply = crs_admin_session.request(method, path, body)
         if reply.status not in ok:
             error = reply.payload if isinstance(reply.payload, dict) else {}
             raise RuntimeError(f"{method} {path} answered {reply.status}. {error.get('detail') or error.get('message') or error.get('error') or error.get('type') or ''}".strip())
@@ -1314,30 +1313,29 @@ def cr_answer_fn(
     CAST,
     ChatMessage,
     ChatTurn,
+    JsonSession,
     answer_with_tools,
     crs_surface,
     json,
-    json_request,
-    json_session,
     lcs_system,
     rss_search,
 ):
     # Agent side. Every call here carries the agent key and nothing else: no admin key, no database password.
-    _sessions = {}  # one session per agent key, so every call after the first reuses its connection
+    _sessions: dict[str, JsonSession] = {}  # one session per agent key, so every call after the first reuses its connection
 
 
     def _mcp(surface: dict, method: str, params: dict):
-        """One JSON-RPC POST to the surface's mcp_url, with the agent key. json_request lets recording() see it."""
+        """One JSON-RPC POST to the surface's mcp_url, with the agent key. recording() lists it when the call runs inside that block."""
         key = surface["agent_key"]
         if key not in _sessions:
-            _sessions[key] = json_session(headers={"X-API-Key": key}, timeout=(5, 60))  # no base URL: mcp_url is absolute
-        return json_request(_sessions[key], "POST", surface["mcp_url"], {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            _sessions[key] = JsonSession(headers={"X-API-Key": key}, timeout=(5, 60))  # no base URL: mcp_url is absolute
+        return _sessions[key].request("POST", surface["mcp_url"], {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 
 
     def crs_list_tools(surface: dict) -> list[dict]:
         """tools/list with the agent key: every tool the data model generated, each with a name, a description, and an inputSchema."""
         reply = _mcp(surface, "tools/list", {})
-        if reply.status != 200 or "error" in reply.payload:
+        if reply.status != 200 or reply.payload is None or "error" in reply.payload:
             raise RuntimeError(f"tools/list answered {reply.status}. If the agent key has expired, press Clean up, then Create.")
         return reply.payload["result"]["tools"]
 
@@ -1551,29 +1549,6 @@ def am_title(ams_client, mo):
     return ams_refresh_button, ams_seed_button
 
 
-@app.cell(hide_code=True)
-async def am_store(
-    CAST,
-    ams_memories,
-    ams_refresh_button,
-    ams_seed,
-    ams_seed_button,
-    mo,
-):
-    # Seed writes the memories. Every run, for any reason, then lists what the store holds for each customer.
-    _note = f"**Seed** sent {len(await ams_seed())} memories." if ams_seed_button.value else ""
-    _ = ams_refresh_button.value  # a Refresh press reruns this cell, to list memories extracted in the background
-
-    _tables = []
-    for _name, _owner in CAST.items():
-        _found = await ams_memories(_owner)
-        _rows = [f"| {_m.text.replace('|', '&#124;')} | {_m.memory_type} |" for _m in _found]
-        _tables.append(mo.md("\n".join([f"**{_name}**, `ownerId` {_owner} ({len(_found)})", "", "| memory | type |", "|:--|:--|", *_rows])))
-
-    mo.vstack([mo.md(_note), mo.hstack(_tables, widths="equal", align="start")])
-    return
-
-
 @app.cell
 def am_connect(os):
     # Client. Three settings from .env, and one object for every Agent Memory call in this chapter. The steps name the HTTP request behind each call, and this SDK sends it for you.
@@ -1639,6 +1614,29 @@ def am_store_fns(CAST, ams_client, asyncio, models):
 
 
 @app.cell(hide_code=True)
+async def am_store(
+    CAST,
+    ams_memories,
+    ams_refresh_button,
+    ams_seed,
+    ams_seed_button,
+    mo,
+):
+    # Seed writes the memories. Every run, for any reason, then lists what the store holds for each customer.
+    _note = f"**Seed** sent {len(await ams_seed())} memories." if ams_seed_button.value else ""
+    _ = ams_refresh_button.value  # a Refresh press reruns this cell, to list memories extracted in the background
+
+    _tables = []
+    for _name, _owner in CAST.items():
+        _found = await ams_memories(_owner)
+        _rows = [f"| {_m.text.replace('|', '&#124;')} | {_m.memory_type} |" for _m in _found]
+        _tables.append(mo.md("\n".join([f"**{_name}**, `ownerId` {_owner} ({len(_found)})", "", "| memory | type |", "|:--|:--|", *_rows])))
+
+    mo.vstack([mo.md(_note), mo.hstack(_tables, widths="equal", align="start")])
+    return
+
+
+@app.cell(hide_code=True)
 def am_chat_md(CAST, mo):
     ams_owner = mo.ui.dropdown(options=CAST, value="Priya", label="Chat as")  # shown beside the chat, and read by am_turn_fn, so a switch starts a new session
 
@@ -1659,7 +1657,7 @@ def am_chat_md(CAST, mo):
 
     Reading it piece by piece:
 
-    - `sessionId` is the app's, one per chat. Switching **Chat as** to another customer starts a new one.
+    - `sessionId` is the app's, one per chat. In Step 4 you'll pick the customer with **Chat as**; switching to another customer starts a new session.
     - `actorId` is the customer's id. A session takes its `ownerId` from its first event, so the memories the service extracts from it are hers.
     - `role` is `USER`: the app writes the customer's messages, not the assistant's replies.
     - `content` holds the message as typed, and `createdAt` says when, by the app's clock.

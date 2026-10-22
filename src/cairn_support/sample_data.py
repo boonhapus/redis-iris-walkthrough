@@ -13,6 +13,8 @@ The examples rely on a few constraints in this data:
   avoids down, and the down bag is the warmer one, so "I always sleep cold" pulls the other way.
 """
 
+from cairn_support.schema import HelpArticle, ShopRecords
+
 # ---- The cast ----
 
 # The two customers every chapter follows. Their ids are the record keys in Context Retriever
@@ -24,7 +26,7 @@ CAST: dict[str, str] = {"Priya": "C001", "Tom": "C002"}
 # 37 short articles: six in each of five categories (shipping, returns, sizing, orders,
 # warranty) and seven in care, because washing a synthetic sleeping bag has its own article.
 # The boot guide answers "trail shoes feel cramped" without using any of those words.
-HELP_ARTICLES: list[dict] = [
+HELP_ARTICLES: list[HelpArticle] = [
     {
         "id": "ship-times",
         "title": "How long does delivery take?",
@@ -401,7 +403,7 @@ HELP_ARTICLES: list[dict] = [
 
 # 6 customers, 8 products and 8 orders, by entity name. Every id is letters plus digits with no
 # hyphen. Each of AMER, EMEA and APAC has 2 customers; AMER has 4 orders and the others 2 each.
-SHOP_RECORDS: dict[str, list[dict]] = {
+SHOP_RECORDS: ShopRecords = {
     "Customer": [
         {"customer_id": "C001", "name": "Priya Shah", "tier": "gold", "region": "amer", "lifetime_value": 4200.0},
         {"customer_id": "C002", "name": "Tom Becker", "tier": "gold", "region": "amer", "lifetime_value": 3900.0},

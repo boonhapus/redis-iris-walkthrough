@@ -1,10 +1,7 @@
-from cairn_support.redis_search_replies import (
-    ft_search_markdown_table,
-    ft_search_rows,
-)
+from cairn_support.redis_search_replies import format_search_table, parse_search_reply
 
 
-def test_ft_search_resp3():
+def test_parse_resp3_map() -> None:
     reply = {
         "total_results": 1,
         "results": [
@@ -21,23 +18,31 @@ def test_ft_search_resp3():
         ],
         "warning": [],
     }
-    total, rows = ft_search_rows(reply)
-    assert total == 1
-    assert rows[0]["title"] == "T"
+    results = parse_search_reply(reply)
+    assert results.total == 1
+    assert results.hits[0]["key"] == "cairn:run:help:1"
+    assert results.hits[0]["title"] == "T"
 
 
-def test_ft_search_resp2():
+def test_parse_resp2_list() -> None:
     reply = [
         1,
         "cairn:run:help:1",
         ["title", "T", "vector_score", "0.12"],
     ]
-    total, rows = ft_search_rows(reply)
-    assert total == 1
-    assert rows[0]["vector_score"] == "0.12"
+    results = parse_search_reply(reply)
+    assert results.total == 1
+    assert results.hits[0]["key"] == "cairn:run:help:1"
+    assert results.hits[0]["vector_score"] == "0.12"
 
 
-def test_ft_search_markdown_table():
+def test_parse_map_without_results() -> None:
+    results = parse_search_reply({"total_results": 4})
+    assert results.total == 4
+    assert results.hits == []
+
+
+def test_format_search_table() -> None:
     rows = [
         {
             "title": "A | B",
@@ -46,7 +51,7 @@ def test_ft_search_markdown_table():
             "vector_score": "0.12345",
         }
     ]
-    table = ft_search_markdown_table(rows)
+    table = format_search_table(rows)
     assert "&#124;" in table
     assert "0.1235" in table
     assert "| title | category | year | vector_score |" in table
