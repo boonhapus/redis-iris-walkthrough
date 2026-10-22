@@ -14,43 +14,41 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from model2vec import StaticModel
 
-EMBEDDING_MODEL_NAME = "minishlab/potion-base-8M"
-EMBEDDING_MODEL_FILES = ["config.json", "model.safetensors", "tokenizer.json"]
 
+def load_embedding_model(model_name: str = "minishlab/potion-base-8M") -> StaticModel:
+    """Load a model2vec static embedder from the Hugging Face cache.
 
-def load_embedding_model() -> "StaticModel":
-    """Load potion-base-8M from the Hugging Face cache, downloading about 30 MB the first time.
-
-    Tries snapshot_download(..., local_files_only=True) with allow_patterns=EMBEDDING_MODEL_FILES
-    first, so a warm machine never touches the network, then the online call, then
-    StaticModel.from_pretrained(<local path>). Raises RuntimeError with a one-sentence cause when
-    neither works. There is no degraded fallback: a word-hashing embedder would make the
-    paraphrase examples lie.
+    Defaults to potion-base-8M (about 30 MB the first time). Tries
+    snapshot_download(..., local_files_only=True) with
+    allow_patterns=["config.json", "model.safetensors", "tokenizer.json"] first, so a warm
+    machine never touches the network, then the online call, then
+    StaticModel.from_pretrained(<local path>). Raises RuntimeError with a one-sentence cause
+    when neither works.
     """
+    embedding_model_files = ["config.json", "model.safetensors", "tokenizer.json"]
+
     try:
         model_path = snapshot_download(
-            EMBEDDING_MODEL_NAME, allow_patterns=EMBEDDING_MODEL_FILES, local_files_only=True
+            model_name, allow_patterns=embedding_model_files, local_files_only=True
         )
     except Exception:
         try:
-            model_path = snapshot_download(
-                EMBEDDING_MODEL_NAME, allow_patterns=EMBEDDING_MODEL_FILES
-            )
+            model_path = snapshot_download(model_name, allow_patterns=embedding_model_files)
         except Exception as error:
             raise RuntimeError(
-                f"{EMBEDDING_MODEL_NAME} is not in the Hugging Face cache and the download "
+                f"{model_name} is not in the Hugging Face cache and the download "
                 f"failed with {type(error).__name__}."
             ) from error
     try:
         return StaticModel.from_pretrained(model_path)
     except Exception as error:
         raise RuntimeError(
-            f"{EMBEDDING_MODEL_NAME} is on disk at {model_path} but model2vec could not load it "
+            f"{model_name} is on disk at {model_path} but model2vec could not load it "
             f"({type(error).__name__})."
         ) from error
 
 
-def embed_texts(model, texts: list[str]) -> "np.ndarray":
+def embed_texts(model: StaticModel, texts: list[str]) -> np.ndarray[tuple[int, int], np.dtype[np.float32]]:
     """Encode texts to a (len(texts), model.dim) float32 array of unit-length vectors."""
     vectors = np.asarray(model.encode(list(texts)), dtype=np.float32).reshape(len(texts), -1)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
