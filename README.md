@@ -51,3 +51,19 @@ You need:
    ```
 
 Fill in your .env prior to launching, or press **Restart kernel** in the first column.
+
+---
+
+## Want to explore with an Agent?
+
+The chapters are one path through the notebook. This notebook includes a way to coordinate with an AI Agent if you want to explore ad-hoc using [marimo-pair](.agents/skills/marimo-pair/SKILL.md).
+
+- Ask why a result came out the way it did?
+- Try a question the chapter never asks.
+- Explain the notebook controls.
+
+Point your agent at the downloaded repository and continue to explore.
+
+```text
+/marimo-pair The notebook is at http://localhost:2718. Why did Priya's synthetic-bag question get the down-bag answer?
+```
