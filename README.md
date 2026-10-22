@@ -14,7 +14,7 @@ You need:
 
 [Redis Search](https://redis.io/docs/latest/develop/ai/search-and-query/) runs in your database. You'll also set up three services, each with its own key in `.env`:
 
-- [Redis LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/): for semantic caching. Use a service of your own, because a cache is shared by everything that points at it.
+- [Redis LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/): for semantic caching
 - [Redis Context Retriever](https://redis.io/docs/latest/develop/ai/context-engine/context-retriever/): for centralized, fresh context from Redis
 - [Redis Agent Memory](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/): an LLM-agnostic short-term and long-term memory layer
 
